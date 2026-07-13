@@ -1,0 +1,20 @@
+{
+  "default": "ask",
+  "rules": [
+    {
+      "tool": "write_file",
+      "path": "secrets/*",
+      "action": "deny"
+    },
+    {
+      "tool": "write_file",
+      "path": "docs/*",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__*",
+      "path": "*",
+      "action": "ask"
+    }
+  ]
+}

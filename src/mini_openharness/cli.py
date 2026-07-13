@@ -1,0 +1,305 @@
+"""CLI for agent runs, trace inspection/replay, and evaluations."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from mini_openharness.compaction import ArtifactStore, ContextCompactor
+from mini_openharness.engine import AgentEvent, AgentLoop
+from mini_openharness.evals import run_evals
+from mini_openharness.mcp import McpManager
+from mini_openharness.memory import MemoryStore, RememberTool, SearchMemoryTool
+from mini_openharness.permissions import PermissionPolicy
+from mini_openharness.provider import DemoProvider, OpenAICompatibleProvider
+from mini_openharness.session import SessionStore
+from mini_openharness.skills import LoadSkillTool, SkillCatalog
+from mini_openharness.tools import default_tools
+from mini_openharness.trace import TraceStore, TraceWriter
+
+
+def build_run_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="mini-oh", description="A tiny coding-agent harness")
+    parser.add_argument("prompt", nargs="?", help="Task for the coding agent")
+    parser.add_argument("--demo", action="store_true", help="Run offline deterministic tool demo")
+    parser.add_argument("--workspace", default=".", help="Agent workspace boundary")
+    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
+    parser.add_argument(
+        "--base-url", default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    )
+    parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY", ""))
+    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--allow-write", action="store_true", help="Allow mutating tools")
+    parser.add_argument("--yes", action="store_true", help="Approve every ask decision")
+    parser.add_argument("--permission-config", help="JSON allow/deny/ask rules")
+    parser.add_argument("--max-steps", type=int, default=12)
+    parser.add_argument("--context-threshold", type=int, default=12_000)
+    parser.add_argument("--keep-recent", type=int, default=6)
+    parser.add_argument("--max-inline-output", type=int, default=8_000)
+    parser.add_argument("--input-cost", type=float, default=0.0, help="USD per million tokens")
+    parser.add_argument("--output-cost", type=float, default=0.0, help="USD per million tokens")
+    parser.add_argument("--session", help="JSON file used to resume and persist history")
+    parser.add_argument("--skills-dir", help="Directory containing <name>/SKILL.md skills")
+    parser.add_argument("--mcp-config", help="JSON file containing stdio mcpServers")
+    parser.add_argument("--memory", help="Durable memory JSON path")
+    parser.add_argument("--trace-dir", help="JSONL trace directory")
+    parser.add_argument("--no-trace", action="store_true", help="Disable run tracing")
+    return parser
+
+
+def build_trace_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="mini-oh trace", description="Inspect run traces")
+    parser.add_argument("action", choices=("list", "show", "replay"))
+    parser.add_argument("run_id", nargs="?")
+    parser.add_argument("--trace-dir", default=".mini-oh/traces")
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_eval_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="mini-oh eval", description="Run harness evaluations")
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+async def _run(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    prompt = args.prompt or "Inspect this project and summarize its architecture."
+    skills = SkillCatalog(args.skills_dir or workspace / "skills")
+    memory = MemoryStore(args.memory or workspace / ".mini-oh" / "memory.json")
+    relevant_memories = memory.search(prompt)
+    system_parts = ["You are a concise coding assistant. Inspect before editing."]
+    skill_prompt = skills.prompt()
+    memory_prompt = memory.prompt(prompt)
+    if skill_prompt:
+        system_parts.append(skill_prompt)
+    if memory_prompt:
+        system_parts.append(memory_prompt)
+
+    if args.demo:
+        provider = DemoProvider()
+        provider_name = "demo"
+    else:
+        if not args.api_key:
+            raise SystemExit("OPENAI_API_KEY is required unless --demo is used")
+        provider = OpenAICompatibleProvider(
+            api_key=args.api_key,
+            model=args.model,
+            base_url=args.base_url,
+            timeout=args.timeout,
+            max_retries=args.max_retries,
+        )
+        provider_name = "openai-compatible"
+
+    trace_dir = Path(args.trace_dir or workspace / ".mini-oh" / "traces")
+    tracer = None
+    if not args.no_trace:
+        tracer = TraceWriter(
+            trace_dir,
+            metadata={
+                "prompt": prompt,
+                "workspace": str(workspace),
+                "provider": provider_name,
+                "model": args.model if not args.demo else "demo",
+                "memory_hits": [item.text for item in relevant_memories],
+            },
+        )
+
+    store = SessionStore(args.session) if args.session else None
+    messages = store.load() if store else None
+    tools = default_tools()
+    if skills.list():
+        tools.register(LoadSkillTool(skills))
+    tools.register(RememberTool(memory))
+    tools.register(SearchMemoryTool(memory))
+    mcp_manager = McpManager.from_file(args.mcp_config) if args.mcp_config else None
+    policy = _permission_policy(args)
+    approval = _approval_callback(args)
+    loop = None
+    try:
+        if mcp_manager:
+            registered = await mcp_manager.connect_and_register(tools)
+            print(f"connected MCP tools: {', '.join(registered) or '(none)'}")
+        loop = AgentLoop(
+            provider=provider,
+            tools=tools,
+            workspace=workspace,
+            system_prompt="\n\n".join(system_parts),
+            max_steps=args.max_steps,
+            allow_write=args.allow_write,
+            permission_policy=policy,
+            approval_callback=approval,
+            tracer=tracer,
+            compactor=ContextCompactor(
+                threshold_tokens=args.context_threshold,
+                keep_recent_units=args.keep_recent,
+            ),
+            artifact_store=ArtifactStore(
+                workspace / ".mini-oh" / "artifacts",
+                max_inline_chars=args.max_inline_output,
+            ),
+            input_cost_per_million=args.input_cost,
+            output_cost_per_million=args.output_cost,
+            messages=messages or None,
+        )
+        async for event in loop.run(prompt):
+            _print_event(event)
+    except KeyboardInterrupt:
+        if loop:
+            loop.cancel()
+        return 130
+    except asyncio.CancelledError:
+        if loop:
+            loop.cancel()
+        if tracer:
+            tracer.finish(status="cancelled", data={"reason": "CLI task cancelled"})
+        raise
+    finally:
+        if store and loop:
+            store.save(loop.messages)
+        if mcp_manager:
+            await mcp_manager.close()
+        close = getattr(provider, "close", None)
+        if close is not None:
+            await close()
+    if tracer:
+        print(f"trace: {tracer.path}")
+    return 0
+
+
+def _permission_policy(args: argparse.Namespace) -> PermissionPolicy:
+    if args.permission_config:
+        configured = PermissionPolicy.from_file(args.permission_config)
+        if args.allow_write:
+            return PermissionPolicy(configured.rules, default_mutation="allow")
+        return configured
+    return PermissionPolicy(default_mutation="allow" if args.allow_write else "ask")
+
+
+def _approval_callback(args: argparse.Namespace):
+    if args.yes:
+
+        async def approve_all(tool: str, reason: str) -> bool:
+            del tool, reason
+            return True
+
+        return approve_all
+    if not sys.stdin.isatty():
+        return None
+
+    async def ask(tool: str, reason: str) -> bool:
+        answer = await asyncio.to_thread(input, f"Approve {tool}? {reason} [y/N] ")
+        return answer.strip().lower() in {"y", "yes"}
+
+    return ask
+
+
+def _trace_command(args: argparse.Namespace) -> int:
+    store = TraceStore(args.trace_dir)
+    if args.action == "list":
+        summaries = store.list()
+        if args.json:
+            print(
+                json.dumps(
+                    [asdict(item) | {"path": str(item.path)} for item in summaries], indent=2
+                )
+            )
+        else:
+            for item in summaries:
+                print(
+                    f"{item.run_id:26} {item.status:10} {item.elapsed_ms:7}ms "
+                    f"{item.event_count:4} events  {item.prompt[:60]}"
+                )
+        return 0
+    if not args.run_id:
+        raise SystemExit(f"trace {args.action} requires <run-id>")
+    if args.action == "show":
+        events = [asdict(event) for event in store.read(args.run_id)]
+        print(json.dumps(events, ensure_ascii=False, indent=2))
+    else:
+        print("safe replay: recorded events only; providers and tools are not executed")
+        for line in store.replay(args.run_id):
+            print(line)
+    return 0
+
+
+async def _eval_command(args: argparse.Namespace) -> int:
+    results = await run_evals()
+    if args.json:
+        print(json.dumps([result.to_dict() for result in results], ensure_ascii=False, indent=2))
+    else:
+        for result in results:
+            status = "PASS" if result.passed else "FAIL"
+            tools = ",".join(result.tools) or "-"
+            print(
+                f"{result.name:24} {status:4} {result.duration_ms:6}ms "
+                f"steps={result.steps:<2}/{result.max_steps:<2} "
+                f"tokens={result.input_tokens + result.output_tokens:<4} "
+                f"tools={tools}  {result.detail}"
+            )
+    return 0 if all(result.passed for result in results) else 1
+
+
+def _print_event(event: AgentEvent) -> None:
+    if event.kind == "assistant_delta":
+        print(event.message, end="", flush=True)
+    elif event.kind == "assistant":
+        if event.data.get("streamed"):
+            print()
+        else:
+            print(event.message)
+    elif event.kind == "provider_retry":
+        print(
+            f"retrying provider in {event.data['delay_seconds']:.1f}s: {event.message}",
+            file=sys.stderr,
+        )
+    elif event.kind == "tool_start":
+        print(f"→ {event.data['name']} {event.data['input']}")
+    elif event.kind == "tool_end":
+        marker = "✗" if event.data["is_error"] else "✓"
+        preview = event.message.replace("\n", " ")[:100]
+        print(f"{marker} {event.data['name']} ({event.data['elapsed_ms']}ms): {preview}")
+    elif event.kind == "compact":
+        print(
+            f"compacted context: {event.data['before_tokens']} → "
+            f"{event.data['after_tokens']} estimated tokens"
+        )
+    elif event.kind in {"error", "cancelled"}:
+        print(f"{event.kind}: {event.message}", file=sys.stderr)
+    elif event.kind == "done":
+        print(
+            f"done in {event.data['steps']} model step(s), "
+            f"tokens={event.data['input_tokens'] + event.data['output_tokens']}, "
+            f"estimated_cost=${event.data['estimated_cost']:.6f}"
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    _load_environment()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if arguments and arguments[0] == "trace":
+            return _trace_command(build_trace_parser().parse_args(arguments[1:]))
+        if arguments and arguments[0] == "eval":
+            return asyncio.run(_eval_command(build_eval_parser().parse_args(arguments[1:])))
+        return asyncio.run(_run(build_run_parser().parse_args(arguments)))
+    except KeyboardInterrupt:
+        print("cancelled", file=sys.stderr)
+        return 130
+
+
+def _load_environment() -> None:
+    """Load a local .env without overriding explicit shell variables."""
+    load_dotenv(Path.cwd() / ".env", override=False)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

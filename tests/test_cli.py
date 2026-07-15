@@ -31,6 +31,12 @@ def test_cli_defaults_to_responses_and_sandbox_shell_is_opt_in(monkeypatch):
     assert sandboxed.sandbox_shell is True
 
 
+def test_cli_accepts_hook_configuration():
+    args = build_run_parser().parse_args(["--hooks-config", "hooks.json"])
+
+    assert args.hooks_config == "hooks.json"
+
+
 def test_cli_provider_error_returns_nonzero_and_hints_on_responses_404(
     tmp_path, monkeypatch, capsys
 ):

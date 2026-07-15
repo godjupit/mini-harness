@@ -2,12 +2,12 @@
 
 ## 60 秒项目介绍
 
-“Mini OpenHarness 是我从完整 coding-agent 系统中提炼出的可验证运行时。核心是受控状态机：OpenAI Responses 或 Chat Provider 产生 tool calls，权限策略做 allow/deny/ask，resource-aware 读写锁只串行冲突副作用，再按 call order 回填 observations。每个工具有 timeout 和重复调用熔断。stdio/HTTP MCP 走同一 schema、OAuth、权限和脱敏 Trace 链路；shell 只在无网络、只读 rootfs、资源受限的 disposable Docker 中执行，绝不回退宿主机。最后用安全 Replay、自动 Eval、真实 HTTP MCP 和真实 Docker 集成测试证明行为。”
+“Mini OpenHarness 是我从完整 coding-agent 系统中提炼出的可验证运行时。核心是受控状态机：OpenAI Responses 或 Chat Provider 产生 tool calls，可扩展 Hook 执行输入、工具前后和完成策略，权限层做 allow/deny/ask，resource-aware 读写锁只串行冲突副作用，再按 call order 回填 observations。`stop` Verification Gate 保证测试通过才能成功。stdio/HTTP MCP 复用同一 schema、权限和 Trace 链路；shell 只在受限 Docker 中执行。最后用 Replay、自动 Eval 和真实集成测试证明行为。”
 
 ## 5 分钟白板顺序
 
 1. 画 `prompt → model → permission → tools → observations → model` 闭环。
-2. 标出 Tool Registry 是所有副作用的唯一 capability boundary。
+2. 标出 Hook 是模型不可绕过的 control plane，Tool Registry 是所有副作用的 capability boundary。
 3. 展示 Skills、Memory 和 MCP 如何复用同一 loop，而不是各自旁路。
 4. 解释 `tool_call_id` 配对，以及 compaction 为什么按 atomic unit 工作。
 5. 展示 Trace 覆盖 model/permission/tool/cost/final state，Replay 不执行副作用。
@@ -17,6 +17,7 @@
 
 ```bash
 mini-oh --demo --workspace . "介绍项目"
+mini-oh --hooks-config examples/hooks-verification.json --yes "修复一个测试"
 mini-oh trace list
 mini-oh trace replay <run-id>
 mini-oh eval
@@ -33,6 +34,22 @@ pytest -q
 ### Tool 错误为什么不直接终止？
 
 文件不存在、参数错误和未知工具通常是可恢复 observation。把错误返回模型允许其换工具或参数；Provider invariant、取消和最大步数才属于 runtime 终止条件。
+
+### Hook、Tool 和 Permission 有什么区别？
+
+Tool 是模型可以选择调用的 capability；Permission 决定某个具体 effect 是否获得授权；Hook 是模型不能跳过的 runtime 生命周期策略。比如 `write_file` 是 Tool，allow/deny/ask 是 Permission，而“写入前检查路径、完成前强制跑测试”属于 Hook。改写后的 tool 参数仍会重新计算资源锁、做 schema 和权限校验。
+
+### 为什么 Verification Gate 放在 `stop` Hook？
+
+只提示模型“请运行测试”不能构成保证，模型可能忘记、误读或提前宣布完成。Runtime 在 `done` 前强制执行 `stop` Hook：命令退出 0 才成功；失败输出回填模型让它继续修复，最终仍由 `max_steps` 防止无限循环。这把“自我报告已验证”变成可审计的系统不变量。
+
+### Hook 系统为什么算可扩展？
+
+Executor 只依赖 `Hook` Protocol，不按实现类型写分支。内置 callback 和 command 只是两个 adapter；未来 HTTP、OPA 或消息队列实现同一 `run(context)` 即可注册。Registry 还统一提供事件、glob matcher、稳定优先级、timeout、短路阻断、payload chaining 和 Trace。
+
+### Hook 失败应该 fail-open 还是 fail-closed？
+
+安全策略和 Verification Gate 用 `block`，因为策略服务故障时不能假装通过；通知、metrics 等非关键 Hook 可用 `continue`，避免可观测性故障拖垮任务。两种模式都记录失败原因和耗时。Python/命令 Hook 是受信任代码，不可信脚本还需要 Docker 等进程隔离。
 
 ### 并发工具有哪些坑？现在如何处理？
 

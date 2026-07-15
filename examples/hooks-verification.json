@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "stop": [
+      {
+        "name": "pytest-verification-gate",
+        "type": "command",
+        "command": ["{python}", "-m", "pytest", "-q"],
+        "timeout_seconds": 120,
+        "failure_mode": "block"
+      }
+    ]
+  }
+}

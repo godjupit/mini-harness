@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from mini_openharness.compaction import ArtifactStore, ContextCompactor
 from mini_openharness.engine import AgentEvent, AgentLoop, MaxStepsExceeded
 from mini_openharness.evals import run_evals
+from mini_openharness.hooks import load_hook_registry
 from mini_openharness.mcp import McpManager
 from mini_openharness.memory import MemoryStore, RememberTool, SearchMemoryTool
 from mini_openharness.permissions import PermissionPolicy
@@ -55,6 +56,7 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-write", action="store_true", help="Allow mutating tools")
     parser.add_argument("--yes", action="store_true", help="Approve every ask decision")
     parser.add_argument("--permission-config", help="JSON allow/deny/ask rules")
+    parser.add_argument("--hooks-config", help="JSON lifecycle command hooks")
     parser.add_argument("--max-steps", type=int, default=12)
     parser.add_argument("--tool-timeout", type=float, default=30.0)
     parser.add_argument("--max-repeated-tool-batches", type=int, default=3)
@@ -168,6 +170,7 @@ async def _run(args: argparse.Namespace) -> int:
     tools.register(SearchMemoryTool(memory))
     mcp_manager = McpManager.from_file(args.mcp_config) if args.mcp_config else None
     policy = _permission_policy(args)
+    hooks = load_hook_registry(args.hooks_config) if args.hooks_config else None
     approval = _approval_callback(args)
     loop = None
     exit_code = 1
@@ -197,6 +200,7 @@ async def _run(args: argparse.Namespace) -> int:
             output_cost_per_million=args.output_cost,
             tool_timeout_seconds=args.tool_timeout,
             max_repeated_tool_batches=args.max_repeated_tool_batches,
+            hooks=hooks,
             messages=messages or None,
         )
         async for event in loop.run(prompt):
@@ -342,6 +346,11 @@ def _print_event(event: AgentEvent) -> None:
         )
     elif event.kind == "loop_guard":
         print(f"loop guard: {event.message}", file=sys.stderr)
+    elif event.kind == "hook_blocked":
+        print(
+            f"hook blocked {event.data.get('event', 'event')}: {event.message}",
+            file=sys.stderr,
+        )
     elif event.kind in {"error", "cancelled"}:
         print(f"{event.kind}: {event.message}", file=sys.stderr)
     elif event.kind == "done":

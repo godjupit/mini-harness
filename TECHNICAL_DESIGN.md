@@ -1,4 +1,4 @@
-# Mini OpenHarness 0.4 技术设计
+# Mini OpenHarness 0.5 技术设计
 
 本文记录 2026-07-16 这一轮维护的依据、实现和取舍。目标不是复制完整 OpenHarness，而是保留最能体现 Agent Runtime 能力、面试时可以白板推导、并能自动验证的机制。
 
@@ -117,14 +117,39 @@ Trace 是 append-only 审计证据，同时也是高敏感数据。`TraceWriter`
 
 默认安全、显式降级：只有 CLI 参数 `--unsafe-trace-secrets` 才关闭。该实现是 best effort，不可能识别所有业务秘密，因此 Trace 仍需最小文件权限、加密、TTL 和访问审计。
 
-## 8. 可验证证据
+## 8. 可扩展 Hook 与完成验证
+
+Hook 位于模型不可绕过的 runtime control plane。Mini 选择结构化 `Hook` Protocol，而不是在 Executor 中按 callback/command 类型写分支：任意扩展只要提供 `name`、`priority`、`matcher`、`timeout_seconds`、`failure_mode` 和异步 `run(context)`，就能被 Registry 调度。这使 HTTP、消息队列或策略引擎 Hook 可以独立增加，而不修改 AgentLoop。
+
+生命周期顺序如下：
+
+```text
+user_prompt_submit
+        ↓
+model → pre_tool_use → resource lock → permission → tool → post_tool_use → model
+  │
+  └─ no tool calls → stop ─ allow → done
+                         └─ block → verification feedback → model
+```
+
+Registry 按 priority 降序稳定执行。每个 Hook 接收前一个 Hook 合并后的 payload，所以输入改写是确定性的；阻断后立即短路，避免低优先级 Hook 继续产生副作用。同一 tool batch 仍可并发，因此 Hook 实现若共享状态必须自行同步。
+
+Command Hook 使用 argv + `create_subprocess_exec`，不解释 shell 元字符，cwd 固定为 workspace。结构化请求写入 stdin；退出码表达操作成功，严格 JSON 模式还能返回 allow/block 和 payload update。Executor 统一施加 wall-clock timeout，取消时杀死并回收子进程。默认子进程只获得 PATH、locale、临时目录和 Python 环境等最小变量，不继承 API key；显式 `inherit_environment` 属于信任边界升级。
+
+异常与超时不是隐式吞掉：`failure_mode=block` 时 fail-closed，`continue` 时 fail-open，二者都会记录 `hook_start/hook_end`、failed、reason、elapsed 和 update。显式 `HookResult(blocked=True)` 永远阻断，不受 operational failure 策略影响。
+
+`stop` 是 Verification Gate。Agent 产生无 tool-call 的最终回答后，Runtime 先执行测试/lint/扫描命令；失败不会伪造 `done`，而是把可信失败原因追加为新 observation，让模型修复并再次验证。它仍受 `max_steps` 硬上限约束，避免验证失败造成无限循环。
+
+Hook 与 Permission 分层：Permission 是 capability/effect 授权，Hook 是组织级生命周期策略。`pre_tool_use` 在 resource resolution 和 Permission 之前运行，因此改写后的真实参数仍会重新计算资源锁、校验 schema 并接受权限判断，不会借参数改写绕过安全链路。
+
+## 9. 可验证证据
 
 ```bash
 pytest -q
 mini-oh eval
 ```
 
-测试覆盖：Responses typed Items/SSE contract、同资源串行/异资源 mutation 并发、loop guard、Trace redaction、真实 stdio 与真实 Streamable HTTP MCP、OAuth token mode/loopback/PKCE 拒绝路径，以及真实 Docker 容器的 workspace 写入、只读 rootfs、无网络和退出清理。
+测试覆盖：Hook priority/matcher、payload 改写、fail-open/fail-closed、命令协议、完成验证恢复；Responses typed Items/SSE contract、同资源串行/异资源 mutation 并发、loop guard、Trace redaction、真实 stdio 与真实 Streamable HTTP MCP、OAuth token mode/loopback/PKCE 拒绝路径，以及真实 Docker 容器的 workspace 写入、只读 rootfs、无网络和退出清理。
 
 关键不变量：
 
@@ -134,9 +159,10 @@ mini-oh eval
 4. Provider failure、取消和 max steps 才终止 runtime。
 5. Trace replay 永不执行模型或工具。
 
-## 9. 仍然明确的边界
+## 10. 仍然明确的边界
 
 1. Docker shell 是单机开发隔离，不是恶意多租户平台；Docker daemon 与镜像供应链仍是 trusted computing base。
 2. OAuth token 静态文件没有操作系统 keychain 加密，但权限为 `0600` 且不会记录进 Trace。
 3. HTTP MCP 当前只有全开或全关的网络能力；域名级 egress policy 应由宿主防火墙/代理实现。
 4. Resource lock 在单 AgentLoop 进程内生效；跨进程并发写需要文件锁或外部 lock service。
+5. Python Hook 与 Command Hook 都是受信任代码，不提供多租户隔离；不可信 Hook 应使用独立容器、最小挂载和受控网络。

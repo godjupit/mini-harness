@@ -14,6 +14,7 @@ import httpx
 
 from mini_openharness.compaction import ContextCompactor
 from mini_openharness.engine import AgentEvent, AgentLoop
+from mini_openharness.hooks import CallbackHook, HookEvent, HookRegistry, HookResult
 from mini_openharness.mcp import McpManager
 from mini_openharness.memory import MemoryStore
 from mini_openharness.models import Message, ModelReply, ToolCall
@@ -57,6 +58,7 @@ async def run_evals() -> list[EvalResult]:
         ("memory_recall", _memory_recall),
         ("mcp_tool_call", _mcp_tool_call),
         ("permission_block", _permission_block),
+        ("verification_gate", _verification_gate),
         ("context_compaction", _context_compaction),
         ("provider_retry_stream", _provider_retry_stream),
         ("loop_guard", _loop_guard),
@@ -269,6 +271,45 @@ async def _permission_block() -> EvalResult:
         )
         return _result(
             "permission_block", passed, "denied write caused no side effect", loop, events
+        )
+
+
+async def _verification_gate() -> EvalResult:
+    attempts = 0
+
+    def verify(context):
+        nonlocal attempts
+        del context
+        attempts += 1
+        if attempts == 1:
+            return HookResult(blocked=True, reason="tests failed")
+        return HookResult(output="tests passed")
+
+    with tempfile.TemporaryDirectory() as raw:
+        hooks = HookRegistry()
+        hooks.register(HookEvent.STOP, CallbackHook("verification-gate", verify))
+        provider = ScriptedProvider(
+            [ModelReply(content="Premature completion."), ModelReply(content="Verified.")]
+        )
+        loop = AgentLoop(
+            provider=provider,
+            tools=default_tools(),
+            workspace=raw,
+            hooks=hooks,
+        )
+        events = await _collect(loop, "Finish only after verification")
+        passed = (
+            attempts == 2
+            and any(event.kind == "hook_blocked" for event in events)
+            and events[-1].kind == "done"
+            and "tests failed" in provider.requests[1][-1].content
+        )
+        return _result(
+            "verification_gate",
+            passed,
+            "failed verification blocked done until the agent recovered",
+            loop,
+            events,
         )
 
 

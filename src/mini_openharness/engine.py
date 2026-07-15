@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 from mini_openharness.compaction import ArtifactStore, ContextCompactor
-from mini_openharness.models import Message, ModelReply
+from mini_openharness.hooks import HookEvent, HookExecutor, HookRegistry
+from mini_openharness.models import Message, ModelReply, ToolCall
 from mini_openharness.permissions import ApprovalCallback, PermissionPolicy
 from mini_openharness.provider import (
     ModelProvider,
@@ -33,6 +34,7 @@ EventKind = Literal[
     "tool_start",
     "tool_end",
     "compact",
+    "hook_blocked",
     "loop_guard",
     "error",
     "cancelled",
@@ -72,6 +74,7 @@ class AgentLoop:
         output_cost_per_million: float = 0.0,
         tool_timeout_seconds: float = 30.0,
         max_repeated_tool_batches: int = 3,
+        hooks: HookRegistry | None = None,
         messages: list[Message] | None = None,
     ) -> None:
         if max_steps < 1:
@@ -94,6 +97,12 @@ class AgentLoop:
         self.output_cost_per_million = output_cost_per_million
         self.tool_timeout_seconds = tool_timeout_seconds
         self.max_repeated_tool_batches = max_repeated_tool_batches
+        self.hooks = hooks if hooks is not None else HookRegistry()
+        self.hook_executor = HookExecutor(
+            self.hooks,
+            workspace=self.workspace,
+            tracer=self.tracer,
+        )
         self.cancel_event = asyncio.Event()
         if messages:
             self.messages = list(messages)
@@ -127,6 +136,19 @@ class AgentLoop:
         self._resource_locks = ResourceLockManager()
         self._last_tool_batch = None
         self._repeated_tool_batches = 0
+        prompt_hooks = await self.hook_executor.execute(
+            HookEvent.USER_PROMPT_SUBMIT,
+            {"prompt": prompt},
+        )
+        if prompt_hooks.blocked:
+            reason = prompt_hooks.reason or "user prompt rejected by hook"
+            data = {"event": HookEvent.USER_PROMPT_SUBMIT.value, "reason": reason}
+            if self.tracer:
+                self.tracer.finish(status="failed", data=data)
+            yield AgentEvent("hook_blocked", reason, data)
+            yield AgentEvent("error", f"Hook blocked prompt: {reason}", data)
+            return
+        prompt = str(prompt_hooks.payload.get("prompt", prompt))
         self.messages.append(Message("user", prompt))
         context = ToolContext(
             self.workspace,
@@ -230,6 +252,28 @@ class AgentLoop:
                     "output_tokens": self.output_tokens,
                     "estimated_cost": self.estimated_cost,
                 }
+                stop_hooks = await self.hook_executor.execute(
+                    HookEvent.STOP,
+                    {"response": reply.content, **data},
+                )
+                if stop_hooks.blocked:
+                    reason = stop_hooks.reason or "completion rejected by hook"
+                    hook_data = {
+                        "event": HookEvent.STOP.value,
+                        "reason": reason,
+                        "step": step,
+                    }
+                    if self.tracer:
+                        self.tracer.emit("hook_blocked", hook_data)
+                    yield AgentEvent("hook_blocked", reason, hook_data)
+                    self.messages.append(
+                        Message(
+                            "user",
+                            "Completion was rejected by a trusted verification hook: "
+                            f"{reason}\nFix the issue, verify it, and try to finish again.",
+                        )
+                    )
+                    continue
                 if self.tracer:
                     self.tracer.finish(status="completed", data=data)
                 yield AgentEvent("done", data=data)
@@ -307,11 +351,42 @@ class AgentLoop:
 
     async def _execute_timed(
         self,
-        name: str,
-        arguments: dict[str, Any],
+        call: ToolCall,
         context: ToolContext,
     ) -> tuple[ToolResult, int]:
         started = time.monotonic()
+        name = call.name
+        arguments = call.arguments
+        pre_hooks = await self.hook_executor.execute(
+            HookEvent.PRE_TOOL_USE,
+            {
+                "tool_call_id": call.id,
+                "tool_name": name,
+                "tool_input": arguments,
+                "tool_source": self.tools.source(name),
+            },
+        )
+        if pre_hooks.blocked:
+            reason = pre_hooks.reason or "tool call rejected by hook"
+            return (
+                ToolResult(
+                    f"Hook blocked {name}: {reason}",
+                    is_error=True,
+                    metadata={"hook_blocked": True, "hook_event": HookEvent.PRE_TOOL_USE.value},
+                ),
+                int((time.monotonic() - started) * 1000),
+            )
+        arguments = pre_hooks.payload.get("tool_input", arguments)
+        if not isinstance(arguments, dict):
+            return (
+                ToolResult(
+                    f"Hook produced invalid tool_input for {name}: expected an object",
+                    is_error=True,
+                    metadata={"hook_invalid_payload": True},
+                ),
+                int((time.monotonic() - started) * 1000),
+            )
+        lock_started = time.monotonic()
         resources = self.tools.resources(name, arguments, context)
         resource_data = [
             {"key": item.key, "mode": item.mode, "tree": item.tree}
@@ -333,7 +408,7 @@ class AgentLoop:
                     {
                         "tool": name,
                         "resources": resource_data,
-                        "waited_ms": int((acquired - started) * 1000),
+                        "waited_ms": int((acquired - lock_started) * 1000),
                     },
                 )
             try:
@@ -348,6 +423,50 @@ class AgentLoop:
                             "held_ms": int((time.monotonic() - acquired) * 1000),
                         },
                     )
+        if arguments != call.arguments:
+            result = ToolResult(
+                result.output,
+                result.is_error,
+                {**result.metadata, "hook_modified_input": True, "executed_input": arguments},
+            )
+        post_hooks = await self.hook_executor.execute(
+            HookEvent.POST_TOOL_USE,
+            {
+                "tool_call_id": call.id,
+                "tool_name": name,
+                "tool_input": arguments,
+                "tool_source": self.tools.source(name),
+                "tool_output": result.output,
+                "is_error": result.is_error,
+                "metadata": result.metadata,
+            },
+        )
+        if post_hooks.blocked:
+            reason = post_hooks.reason or "tool result rejected by hook"
+            result = ToolResult(
+                f"Hook blocked result from {name}: {reason}",
+                is_error=True,
+                metadata={
+                    **result.metadata,
+                    "hook_blocked": True,
+                    "hook_event": HookEvent.POST_TOOL_USE.value,
+                },
+            )
+        else:
+            payload = post_hooks.payload
+            output = payload.get("tool_output", result.output)
+            metadata = payload.get("metadata", result.metadata)
+            is_error = payload.get("is_error", result.is_error)
+            if not isinstance(output, str) or not isinstance(metadata, dict) or not isinstance(
+                is_error, bool
+            ):
+                result = ToolResult(
+                    f"Hook produced an invalid post_tool_use payload for {name}",
+                    is_error=True,
+                    metadata={"hook_invalid_payload": True},
+                )
+            else:
+                result = ToolResult(output, is_error, dict(metadata))
         return result, int((time.monotonic() - started) * 1000)
 
     async def _execute_all(self, calls, context):
@@ -355,7 +474,7 @@ class AgentLoop:
             # Every call starts concurrently; hierarchical read/write resource locks
             # serialize only conflicting effects while gather preserves result order.
             return await asyncio.gather(
-                *(self._execute_timed(call.name, call.arguments, context) for call in calls)
+                *(self._execute_timed(call, context) for call in calls)
             )
 
         gather_task = asyncio.create_task(execute_batch())

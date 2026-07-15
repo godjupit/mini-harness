@@ -1,11 +1,12 @@
 # Mini OpenHarness
 
-一个可以在面试中讲清楚、现场跑通、用证据验证的 coding-agent runtime。它保留了完整 Harness 最有价值的设计：Agent Loop、Skills、MCP、Memory、权限审批、effect-aware 工具调度、上下文压缩、流式 Provider、Trace/Replay 和自动 Eval。
+一个可以在面试中讲清楚、现场跑通、用证据验证的 coding-agent runtime。它保留了完整 Harness 最有价值的设计：Agent Loop、可扩展 Hooks、Skills、MCP、Memory、权限审批、effect-aware 工具调度、上下文压缩、流式 Provider、Trace/Replay 和自动 Eval。
 
 ```text
 Skills catalog ─┐
 Relevant memory ├──→ AgentLoop ───→ Streaming ModelProvider
 Session history ┘        ↑                    │
+HookRegistry ─────────────┤ prompt / pre-tool / post-tool / stop
                          │              text / tool calls
                          │                    ↓
                   observations ← PermissionPolicy
@@ -15,7 +16,7 @@ Session history ┘        ↑                    │
                          │
                   artifacts + compaction
 
-TraceWriter observes model, permission, tool, memory, MCP, cost and final state.
+TraceWriter observes model, hooks, permission, tool, memory, MCP, cost and final state.
 ```
 
 ## 30 秒运行
@@ -59,6 +60,7 @@ mini-oh --api-mode chat --base-url https://compatible.example/v1 "分析架构"
 - resource wait/acquire/release，以及 `waited_ms`、`held_ms`；
 - skill 加载、memory 命中/写入、MCP server（start/end 均保留归因）；
 - permission 决策与人工审批结果；
+- hook start/end、阻断、失败、耗时和 payload 改写；
 - compaction 前后 token 估算；
 - token usage、估算费用及最终成功/失败/取消原因。
 
@@ -112,7 +114,76 @@ mini-oh --allow-write --permission-config examples/permissions.json "执行任�
 }
 ```
 
-## 3. Context Compaction 与 Artifacts
+## 3. 可扩展 Hook 与 Verification Gate
+
+Hook 是 Agent 生命周期上的受信任扩展点，和模型工具不同：模型不能选择跳过 Hook。Mini 暴露四个稳定事件：
+
+| 事件 | 时机 | 典型用途 |
+|---|---|---|
+| `user_prompt_submit` | prompt 进入 history 前 | 输入规范化、任务策略拒绝 |
+| `pre_tool_use` | 权限判断和真实工具执行前 | 参数改写、敏感操作拦截 |
+| `post_tool_use` | 工具完成后、结果回填模型前 | 输出审计、脱敏、结果拒绝 |
+| `stop` | Agent 准备返回成功前 | 强制测试、lint、安全扫描 |
+
+命令 Hook 通过 JSON 配置启用，`matcher` 使用 glob，`priority` 越大越先运行，同优先级保持注册顺序：
+
+```bash
+mini-oh --hooks-config examples/hooks-verification.json \
+  --yes --workspace . "实现功能并运行测试"
+```
+
+示例 `stop` Hook 会执行当前 Python 环境中的 `pytest -q`。退出码为 0 才允许 `done`；失败时 Agent 收到测试输出，继续修复并再次申请完成：
+
+```json
+{
+  "hooks": {
+    "stop": [
+      {
+        "name": "pytest-verification-gate",
+        "type": "command",
+        "command": ["{python}", "-m", "pytest", "-q"],
+        "timeout_seconds": 120,
+        "failure_mode": "block"
+      }
+    ]
+  }
+}
+```
+
+命令不经过 shell，工作目录固定为 workspace。Runtime 将 `{"event": ..., "payload": ...}` 写入 stdin；普通命令只需以退出码表达成功/失败。需要改写 payload 时设置 `expect_json: true`，stdout 返回：
+
+```json
+{
+  "decision": "allow",
+  "updated_payload": {"tool_input": {"path": "safe.txt"}},
+  "output": "optional audit detail"
+}
+```
+
+`decision` 也可为 `block` 并带 `reason`。Hook 异常、无效 JSON 或超时由 `failure_mode` 决定：`block` 是 fail-closed，`continue` 是 fail-open。默认不会继承 API key 等完整宿主环境；确实需要时可显式设置 `inherit_environment: true`，因此 Hook 配置和脚本必须按受信任代码管理。
+
+Python 扩展只需实现 `Hook` Protocol；最常用方式是注册同步或异步 callback，不需要修改 Executor 的类型分支：
+
+```python
+from mini_openharness.hooks import CallbackHook, HookEvent, HookRegistry, HookResult
+
+hooks = HookRegistry()
+hooks.register(
+    HookEvent.PRE_TOOL_USE,
+    CallbackHook(
+        "protect-secrets",
+        lambda ctx: HookResult(blocked=True, reason="protected path"),
+        matcher="write_file",
+        priority=100,
+    ),
+)
+
+loop = AgentLoop(..., hooks=hooks)
+```
+
+Permission 回答“这个 capability 是否允许执行”，Hook 回答“在这个业务生命周期点还要执行什么组织策略”；两者都不能互相替代。Hook 的每次开始、结束、耗时、失败和改写都会进入 Trace。
+
+## 4. Context Compaction 与 Artifacts
 
 每次模型调用前估算 context token。超过阈值后：
 
@@ -127,7 +198,7 @@ mini-oh --context-threshold 12000 --keep-recent 6 --max-inline-output 8000 "长�
 
 当前 summary 是确定性、低成本实现。生产版可以替换为 LLM summarizer，而无需改变 AgentLoop 接口。
 
-## 4. Provider 可靠性
+## 5. Provider 可靠性
 
 Provider boundary 同时实现 OpenAI Responses 与 Chat Completions-compatible 协议：
 
@@ -141,7 +212,7 @@ Provider boundary 同时实现 OpenAI Responses 与 Chat Completions-compatible 
 
 为了避免内容重复，如果连接已经输出 token 后才失败，本轮不会自动重试。
 
-## 5. Effect-aware 工具调度与熔断
+## 6. Effect-aware 工具调度与熔断
 
 模型可在一轮返回多个 tool calls。Runtime 为调用解析层级 `ResourceAccess`，再通过 async read/write lock 调度：
 
@@ -157,7 +228,7 @@ Provider boundary 同时实现 OpenAI Responses 与 Chat Completions-compatible 
 mini-oh --tool-timeout 20 --max-repeated-tool-batches 2 "检查并修改项目"
 ```
 
-## 6. 自动 Eval
+## 7. 自动 Eval
 
 ```bash
 mini-oh eval
@@ -173,6 +244,7 @@ mini-oh eval --json
 | `memory_recall` | 相关长期记忆注入新任务 |
 | `mcp_tool_call` | 真实 stdio MCP tools/list + tools/call |
 | `permission_block` | 被拒绝写入没有文件副作用 |
+| `verification_gate` | `stop` Hook 失败阻止 done，模型修复后再次验证 |
 | `context_compaction` | 旧上下文被压缩 |
 | `provider_retry_stream` | 429 后重试并继续 SSE 输出 |
 | `loop_guard` | 重复 tool batch 被熔断，模型收到 observation 后恢复 |
@@ -233,6 +305,7 @@ mini-oh --sandbox-shell --yes --workspace . \
 | `provider.py` | Responses/Chat streaming provider | typed Items、SSE、重试、错误分类 |
 | `tools.py` | schema、resource lock 与统一执行 | capability/effect boundary |
 | `permissions.py` | allow/deny/ask 规则 | 最小权限、人工介入 |
+| `hooks.py` | Hook Protocol、Registry、Executor 与命令配置 | 生命周期扩展、fail-open/closed、Verification Gate |
 | `trace.py` | JSONL trace/replay | 可观测、审计、无副作用回放 |
 | `compaction.py` | summary 与 artifacts | 协议不变量、context 成本 |
 | `evals.py` | 自动行为评测 | 可重复证据，而非只看最终文本 |
@@ -244,6 +317,8 @@ mini-oh --sandbox-shell --yes --workspace . \
 ## 安全边界与非目标
 
 普通文件工具依赖 workspace containment；只有 `sandbox_shell` 运行在 OS/Docker 隔离中。Docker boundary 包含默认 seccomp、只读 rootfs、无网络、capability/资源限制，但仍不应把 Docker daemon socket 暴露给容器，也不能把它当作恶意多租户执行平台。HTTP MCP 会访问远端开放世界，必须结合权限规则、可信 server 清单和最小 OAuth scope。
+
+Python callback 与命令 Hook 都是受信任扩展代码：前者与 Agent 同进程，后者可在 workspace 中启动进程；它们不是安全沙箱。命令默认使用最小环境且不经过 shell，但若 Hook 本身不可信，仍应放入 Docker 或更强的隔离执行器。
 
 项目有意不实现 TUI、插件市场和多 Agent，以保持面试主线集中在 runtime 的可靠性与可验证性。
 

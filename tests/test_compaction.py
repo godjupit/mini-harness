@@ -37,3 +37,22 @@ def test_large_output_is_fully_preserved_as_artifact(tmp_path):
     assert path.read_text(encoding="utf-8") == output
     assert "offloaded" in inline
     assert len(inline) < len(output)
+
+
+def test_forced_compaction_ignores_threshold_but_preserves_recent_units():
+    messages = [Message("system", "system")]
+    for index in range(5):
+        messages.extend(
+            [
+                Message("user", f"request {index}"),
+                Message("assistant", f"answer {index}"),
+            ]
+        )
+    compactor = ContextCompactor(threshold_tokens=1_000_000, keep_recent_units=2)
+
+    normal = compactor.compact(messages)
+    forced = compactor.compact(messages, force=True)
+
+    assert not normal.compacted
+    assert forced.compacted
+    assert forced.messages[-2:] == messages[-2:]

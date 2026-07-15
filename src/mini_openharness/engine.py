@@ -18,6 +18,7 @@ from mini_openharness.provider import (
     ModelProvider,
     ProviderCancelledError,
     ProviderComplete,
+    ProviderContextWindowError,
     ProviderError,
     ProviderRetry,
     ProviderTextDelta,
@@ -158,6 +159,7 @@ class AgentLoop:
             tracer=self.tracer,
             tool_timeout_seconds=self.tool_timeout_seconds,
         )
+        reactive_context_retry_attempted = False
 
         for step in range(1, self.max_steps + 1):
             if self.cancel_event.is_set():
@@ -167,55 +169,89 @@ class AgentLoop:
             if compact_event is not None:
                 yield compact_event
 
-            yield AgentEvent("model_start", data={"step": step})
-            if self.tracer:
-                self.tracer.emit(
-                    "model_request",
-                    {
-                        "step": step,
-                        "messages": [message.to_dict() for message in self.messages],
-                        "tools": self.tools.schemas(),
-                    },
-                )
-
-            reply: ModelReply | None = None
-            streamed = False
-            try:
-                stream_method = getattr(self.provider, "stream", None)
-                if callable(stream_method):
-                    async for provider_event in stream_method(
-                        self.messages,
-                        self.tools.schemas(),
-                        cancel_event=self.cancel_event,
-                    ):
-                        if isinstance(provider_event, ProviderTextDelta):
-                            streamed = True
-                            if self.tracer:
-                                self.tracer.emit("assistant_delta", {"text": provider_event.text})
-                            yield AgentEvent("assistant_delta", provider_event.text, {"step": step})
-                        elif isinstance(provider_event, ProviderRetry):
-                            data = {
-                                "attempt": provider_event.attempt,
-                                "delay_seconds": provider_event.delay_seconds,
-                                "error": provider_event.error,
-                            }
-                            if self.tracer:
-                                self.tracer.emit("provider_retry", data)
-                            yield AgentEvent("provider_retry", provider_event.error, data)
-                        elif isinstance(provider_event, ProviderComplete):
-                            reply = provider_event.reply
-                else:
-                    reply = await self.provider.complete(self.messages, self.tools.schemas())
-            except ProviderCancelledError as exc:
-                yield self._cancelled_event(str(exc))
-                return
-            except ProviderError as exc:
-                data = {"type": type(exc).__name__, "message": str(exc), "step": step}
+            model_attempt = 0
+            while True:
+                model_attempt += 1
+                yield AgentEvent("model_start", data={"step": step, "attempt": model_attempt})
                 if self.tracer:
-                    self.tracer.emit("provider_error", data)
-                    self.tracer.finish(status="failed", data={"reason": str(exc)})
-                yield AgentEvent("error", str(exc), data)
-                return
+                    self.tracer.emit(
+                        "model_request",
+                        {
+                            "step": step,
+                            "attempt": model_attempt,
+                            "messages": [message.to_dict() for message in self.messages],
+                            "tools": self.tools.schemas(),
+                        },
+                    )
+
+                reply: ModelReply | None = None
+                streamed = False
+                try:
+                    stream_method = getattr(self.provider, "stream", None)
+                    if callable(stream_method):
+                        async for provider_event in stream_method(
+                            self.messages,
+                            self.tools.schemas(),
+                            cancel_event=self.cancel_event,
+                        ):
+                            if isinstance(provider_event, ProviderTextDelta):
+                                streamed = True
+                                if self.tracer:
+                                    self.tracer.emit(
+                                        "assistant_delta", {"text": provider_event.text}
+                                    )
+                                yield AgentEvent(
+                                    "assistant_delta", provider_event.text, {"step": step}
+                                )
+                            elif isinstance(provider_event, ProviderRetry):
+                                data = {
+                                    "attempt": provider_event.attempt,
+                                    "delay_seconds": provider_event.delay_seconds,
+                                    "error": provider_event.error,
+                                }
+                                if self.tracer:
+                                    self.tracer.emit("provider_retry", data)
+                                yield AgentEvent("provider_retry", provider_event.error, data)
+                            elif isinstance(provider_event, ProviderComplete):
+                                reply = provider_event.reply
+                    else:
+                        reply = await self.provider.complete(self.messages, self.tools.schemas())
+                except ProviderCancelledError as exc:
+                    yield self._cancelled_event(str(exc))
+                    return
+                except ProviderContextWindowError as exc:
+                    compact_event = None
+                    if not reactive_context_retry_attempted:
+                        reactive_context_retry_attempted = True
+                        compact_event = self._compact_if_needed(
+                            force=True,
+                            trigger="reactive",
+                        )
+                    if compact_event is not None:
+                        data = {
+                            "step": step,
+                            "attempt": model_attempt,
+                            "reason": str(exc),
+                            **compact_event.data,
+                        }
+                        if self.tracer:
+                            self.tracer.emit("context_retry", data)
+                        yield compact_event
+                        continue
+                    data = {"type": type(exc).__name__, "message": str(exc), "step": step}
+                    if self.tracer:
+                        self.tracer.emit("provider_error", data)
+                        self.tracer.finish(status="failed", data={"reason": str(exc)})
+                    yield AgentEvent("error", str(exc), data)
+                    return
+                except ProviderError as exc:
+                    data = {"type": type(exc).__name__, "message": str(exc), "step": step}
+                    if self.tracer:
+                        self.tracer.emit("provider_error", data)
+                        self.tracer.finish(status="failed", data={"reason": str(exc)})
+                    yield AgentEvent("error", str(exc), data)
+                    return
+                break
 
             if reply is None:
                 error = "Provider finished without a response"
@@ -389,8 +425,7 @@ class AgentLoop:
         lock_started = time.monotonic()
         resources = self.tools.resources(name, arguments, context)
         resource_data = [
-            {"key": item.key, "mode": item.mode, "tree": item.tree}
-            for item in resources
+            {"key": item.key, "mode": item.mode, "tree": item.tree} for item in resources
         ]
         if self.tracer:
             self.tracer.emit(
@@ -457,8 +492,10 @@ class AgentLoop:
             output = payload.get("tool_output", result.output)
             metadata = payload.get("metadata", result.metadata)
             is_error = payload.get("is_error", result.is_error)
-            if not isinstance(output, str) or not isinstance(metadata, dict) or not isinstance(
-                is_error, bool
+            if (
+                not isinstance(output, str)
+                or not isinstance(metadata, dict)
+                or not isinstance(is_error, bool)
             ):
                 result = ToolResult(
                     f"Hook produced an invalid post_tool_use payload for {name}",
@@ -473,9 +510,7 @@ class AgentLoop:
         async def execute_batch():
             # Every call starts concurrently; hierarchical read/write resource locks
             # serialize only conflicting effects while gather preserves result order.
-            return await asyncio.gather(
-                *(self._execute_timed(call, context) for call in calls)
-            )
+            return await asyncio.gather(*(self._execute_timed(call, context) for call in calls))
 
         gather_task = asyncio.create_task(execute_batch())
         cancel_task = asyncio.create_task(self.cancel_event.wait())
@@ -512,10 +547,15 @@ class AgentLoop:
         run_id = self.tracer.run_id if self.tracer else "untraced"
         return self.artifact_store.offload(run_id=run_id, tool_call_id=call_id, output=output)
 
-    def _compact_if_needed(self) -> AgentEvent | None:
+    def _compact_if_needed(
+        self,
+        *,
+        force: bool = False,
+        trigger: str = "threshold",
+    ) -> AgentEvent | None:
         if self.compactor is None:
             return None
-        result = self.compactor.compact(self.messages)
+        result = self.compactor.compact(self.messages, force=force)
         if not result.compacted:
             return None
         self.messages = result.messages
@@ -523,6 +563,7 @@ class AgentLoop:
             "before_tokens": result.before_tokens,
             "after_tokens": result.after_tokens,
             "summarized_messages": result.summarized_messages,
+            "trigger": trigger,
         }
         if self.tracer:
             self.tracer.emit("context_compacted", data)

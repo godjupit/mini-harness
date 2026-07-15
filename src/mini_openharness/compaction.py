@@ -35,9 +35,9 @@ class ContextCompactor:
         self.threshold_tokens = threshold_tokens
         self.keep_recent_units = max(1, keep_recent_units)
 
-    def compact(self, messages: list[Message]) -> CompactionResult:
+    def compact(self, messages: list[Message], *, force: bool = False) -> CompactionResult:
         before = estimate_tokens(messages)
-        if before <= self.threshold_tokens or len(messages) < 4:
+        if (not force and before <= self.threshold_tokens) or len(messages) < 4:
             return CompactionResult(list(messages), False, before, before)
 
         system = messages[0] if messages and messages[0].role == "system" else None

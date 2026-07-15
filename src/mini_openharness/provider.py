@@ -36,8 +36,16 @@ class ProviderServerError(ProviderError):
     pass
 
 
+class ProviderContextWindowError(ProviderError):
+    """The request input exceeded the provider context window."""
+
+
 class ProviderInvalidResponseError(ProviderError):
     pass
+
+
+class ProviderOutputTruncatedError(ProviderInvalidResponseError):
+    """The provider stopped before producing a complete assistant turn."""
 
 
 class ProviderCancelledError(ProviderError):
@@ -163,6 +171,7 @@ class OpenAICompatibleProvider:
         tool_parts: dict[int, dict[str, str]] = {}
         input_tokens = 0
         output_tokens = 0
+        finish_reasons: set[str] = set()
         try:
             async with self._client.stream("POST", "chat/completions", json=payload) as response:
                 if response.status_code >= 400:
@@ -188,6 +197,9 @@ class OpenAICompatibleProvider:
                         usage.get("completion_tokens", output_tokens) or output_tokens
                     )
                     for choice in chunk.get("choices") or []:
+                        finish_reason = choice.get("finish_reason")
+                        if finish_reason:
+                            finish_reasons.add(str(finish_reason))
                         delta = choice.get("delta") or {}
                         text = delta.get("content")
                         if text:
@@ -211,6 +223,14 @@ class OpenAICompatibleProvider:
         except asyncio.CancelledError as exc:
             raise ProviderCancelledError("Provider request cancelled") from exc
 
+        if "length" in finish_reasons:
+            raise ProviderOutputTruncatedError(
+                "Chat completion was truncated with finish_reason=length"
+            )
+        if "content_filter" in finish_reasons:
+            raise ProviderInvalidResponseError(
+                "Chat completion was stopped by the provider content filter"
+            )
         calls = tuple(
             _tool_call_from_parts(index, part) for index, part in sorted(tool_parts.items())
         )
@@ -289,10 +309,15 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
                             }
                     elif event_type == "response.function_call_arguments.delta":
                         index = int(event.get("output_index", 0))
-                        part = tool_parts.setdefault(
-                            index, {"id": "", "name": "", "arguments": ""}
-                        )
+                        part = tool_parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
                         part["arguments"] += str(event.get("delta") or "")
+                    elif event_type == "response.function_call_arguments.done":
+                        index = int(event.get("output_index", 0))
+                        part = tool_parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                        # The documented done event contains item_id, not call_id;
+                        # preserve the call_id collected from output_item.added.
+                        part["name"] = str(event.get("name") or part["name"])
+                        part["arguments"] = str(event.get("arguments") or "{}")
                     elif event_type == "response.output_item.done":
                         item = event.get("item") or {}
                         if item.get("type") == "function_call":
@@ -307,7 +332,18 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
                         usage = (event.get("response") or {}).get("usage") or {}
                         input_tokens = int(usage.get("input_tokens", 0) or 0)
                         output_tokens = int(usage.get("output_tokens", 0) or 0)
-                    elif event_type in {"error", "response.failed", "response.incomplete"}:
+                    elif event_type == "response.incomplete":
+                        response_data = event.get("response") or {}
+                        details = response_data.get("incomplete_details") or {}
+                        reason = str(details.get("reason") or "unknown")
+                        if reason == "max_output_tokens":
+                            raise ProviderOutputTruncatedError(
+                                "Responses API response incomplete: max_output_tokens"
+                            )
+                        raise ProviderInvalidResponseError(
+                            f"Responses API response.incomplete: {details or event}"
+                        )
+                    elif event_type in {"error", "response.failed"}:
                         detail = event.get("error") or (event.get("response") or {}).get("error")
                         raise ProviderInvalidResponseError(
                             f"Responses API {event_type}: {detail or event}"
@@ -347,18 +383,20 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
         if instructions:
             payload["instructions"] = instructions
         if tools:
-            payload["tools"] = [
-                {
+            payload["tools"] = []
+            for tool in tools:
+                definition = {
                     "type": "function",
                     "name": tool["name"],
                     "description": tool["description"],
                     "parameters": tool["parameters"],
-                    # Runtime validation remains authoritative for compatible schemas
-                    # containing optional fields that cannot use strict mode.
-                    "strict": False,
                 }
-                for tool in tools
-            ]
+                if _strict_schema_compatible(tool["parameters"]):
+                    definition["strict"] = True
+                # For incompatible schemas, omit strict. Current Responses API
+                # attempts normalization and falls back to best-effort calling;
+                # explicit false would disable that behavior.
+                payload["tools"].append(definition)
             payload["tool_choice"] = "auto"
         return payload
 
@@ -376,9 +414,22 @@ def _status_error(status: int, body: str) -> ProviderError:
         return ProviderAuthenticationError(detail)
     if status == 429:
         return ProviderRateLimitError(detail)
+    if status in {400, 413} and _is_context_window_error(body):
+        return ProviderContextWindowError(detail)
     if status >= 500:
         return ProviderServerError(detail)
     return ProviderError(detail)
+
+
+def _is_context_window_error(body: str) -> bool:
+    lowered = body.lower()
+    if "context_length_exceeded" in lowered or "maximum context length" in lowered:
+        return True
+    if "prompt is too long" in lowered or "too many tokens" in lowered:
+        return True
+    return "context window" in lowered and any(
+        marker in lowered for marker in ("exceed", "maximum", "too long", "limit")
+    )
 
 
 def _tool_call_from_parts(index: int, part: dict[str, str]) -> ToolCall:
@@ -396,6 +447,32 @@ def _tool_call_from_parts(index: int, part: dict[str, str]) -> ToolCall:
         name=part["name"],
         arguments=arguments,
     )
+
+
+def _strict_schema_compatible(schema: Any) -> bool:
+    """Conservatively detect the documented strict function-schema subset."""
+    if not isinstance(schema, dict) or "default" in schema:
+        return False
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        non_null_types = [item for item in schema_type if item != "null"]
+        return len(non_null_types) == 1 and _strict_schema_compatible(
+            {**schema, "type": non_null_types[0]}
+        )
+    if schema_type == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if (
+            not isinstance(properties, dict)
+            or not isinstance(required, list)
+            or schema.get("additionalProperties") is not False
+            or set(required) != set(properties)
+        ):
+            return False
+        return all(_strict_schema_compatible(value) for value in properties.values())
+    if schema_type == "array":
+        return _strict_schema_compatible(schema.get("items"))
+    return schema_type in {"string", "integer", "number", "boolean", "null"}
 
 
 def _to_openai_message(message: Message) -> dict[str, Any]:

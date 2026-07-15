@@ -198,13 +198,17 @@ mini-oh --context-threshold 12000 --keep-recent 6 --max-inline-output 8000 "长�
 
 当前 summary 是确定性、低成本实现。生产版可以替换为 LLM summarizer，而无需改变 AgentLoop 接口。
 
+若 Provider 明确返回 context-window 超限，Runtime 会忽略普通阈值强制压缩一次，并在同一个逻辑 model step 重试；无法压缩或第二次仍失败则终止。该恢复只接受 typed `ProviderContextWindowError`，不会把任意 HTTP 400 当成可重试错误。
+
 ## 5. Provider 可靠性
 
 Provider boundary 同时实现 OpenAI Responses 与 Chat Completions-compatible 协议：
 
 - SSE token streaming；
-- Responses typed Items、`function_call_output.call_id` 与分片 arguments 重组；
+- Responses typed Items、`function_call_output.call_id`，以及 arguments delta/done 重组；
+- 对符合官方严格子集的 function schema 启用 `strict: true`；不兼容 schema 省略该字段，由 Responses 自动规范化或回退，runtime 仍再次校验；
 - Chat Completions message/tool-call 兼容路径；
+- Chat `finish_reason=length` 和 Responses `response.incomplete` 不会被误报为成功；
 - 429、5xx、timeout、network error 指数退避；
 - 认证、限流、超时、网络、无效响应和取消的统一错误类型；
 - `Ctrl-C`/cancel event；
@@ -246,6 +250,7 @@ mini-oh eval --json
 | `permission_block` | 被拒绝写入没有文件副作用 |
 | `verification_gate` | `stop` Hook 失败阻止 done，模型修复后再次验证 |
 | `context_compaction` | 旧上下文被压缩 |
+| `reactive_compaction` | context-window 错误触发一次同 step 强制压缩与重试 |
 | `provider_retry_stream` | 429 后重试并继续 SSE 输出 |
 | `loop_guard` | 重复 tool batch 被熔断，模型收到 observation 后恢复 |
 

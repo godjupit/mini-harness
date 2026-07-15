@@ -12,6 +12,8 @@ from mini_openharness.provider import (
     ProviderAuthenticationError,
     ProviderCancelledError,
     ProviderComplete,
+    ProviderContextWindowError,
+    ProviderOutputTruncatedError,
     ProviderRetry,
     ProviderTextDelta,
 )
@@ -128,6 +130,120 @@ def test_responses_stream_uses_typed_items_call_id_and_usage():
     assert (reply.input_tokens, reply.output_tokens) == (11, 4)
 
 
+def test_responses_function_arguments_done_is_authoritative():
+    body = (
+        'data: {"type":"response.output_item.added","output_index":0,'
+        '"item":{"type":"function_call","call_id":"call-1",'
+        '"name":"read_file","arguments":""}}\n\n'
+        'data: {"type":"response.function_call_arguments.delta","output_index":0,'
+        '"delta":"{\\"path\\":\\"partial"}\n\n'
+        'data: {"type":"response.function_call_arguments.done","output_index":0,'
+        '"item_id":"fc-1","name":"read_file",'
+        '"arguments":"{\\"path\\":\\"README.md\\"}"}\n\n'
+        'data: {"type":"response.completed","response":{"usage":'
+        '{"input_tokens":3,"output_tokens":2}}}\n\n'
+    )
+    provider = OpenAIResponsesProvider(
+        api_key="test",
+        model="test",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+    )
+    try:
+        events = collect(provider)
+    finally:
+        asyncio.run(provider.close())
+
+    reply = next(event.reply for event in events if isinstance(event, ProviderComplete))
+    assert reply.tool_calls == (ToolCall("call-1", "read_file", {"path": "README.md"}),)
+
+
+def test_responses_enables_strict_only_for_compatible_function_schemas():
+    captured = {}
+    body = (
+        'data: {"type":"response.completed","response":{"usage":'
+        '{"input_tokens":1,"output_tokens":1}}}\n\n'
+    )
+
+    def handler(request):
+        captured["payload"] = __import__("json").loads(request.content)
+        return httpx.Response(200, text=body)
+
+    provider = OpenAIResponsesProvider(
+        api_key="test",
+        model="test",
+        transport=httpx.MockTransport(handler),
+    )
+    tools = [
+        {
+            "name": "read_file",
+            "description": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "list_files",
+            "description": "list",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "default": "."}},
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+    async def run():
+        return [event async for event in provider.stream([Message("user", "inspect")], tools)]
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(provider.close())
+
+    strict_tool, fallback_tool = captured["payload"]["tools"]
+    assert strict_tool["strict"] is True
+    assert "strict" not in fallback_tool
+
+
+def test_chat_length_finish_reason_never_becomes_success():
+    body = (
+        'data: {"choices":[{"delta":{"content":"partial"},'
+        '"finish_reason":"length"}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="test",
+        model="test",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+    )
+    try:
+        with pytest.raises(ProviderOutputTruncatedError, match="finish_reason=length"):
+            collect(provider)
+    finally:
+        asyncio.run(provider.close())
+
+
+def test_responses_incomplete_max_output_tokens_never_becomes_success():
+    body = (
+        'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+        'data: {"type":"response.incomplete","response":'
+        '{"incomplete_details":{"reason":"max_output_tokens"}}}\n\n'
+    )
+    provider = OpenAIResponsesProvider(
+        api_key="test",
+        model="test",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+    )
+    try:
+        with pytest.raises(ProviderOutputTruncatedError, match="max_output_tokens"):
+            collect(provider)
+    finally:
+        asyncio.run(provider.close())
+
+
 def test_authentication_error_is_normalized_without_retry():
     attempts = 0
 
@@ -152,6 +268,28 @@ def test_authentication_error_is_normalized_without_retry():
     finally:
         asyncio.run(provider.close())
     assert attempts == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"error":{"code":"context_length_exceeded","message":"too large"}}',
+        '{"error":{"message":"maximum context length exceeded"}}',
+        '{"error":{"message":"prompt is too long for this context window"}}',
+    ],
+)
+def test_context_window_http_errors_are_typed_for_runtime_recovery(body):
+    provider = OpenAIResponsesProvider(
+        api_key="test",
+        model="test",
+        max_retries=0,
+        transport=httpx.MockTransport(lambda request: httpx.Response(400, text=body)),
+    )
+    try:
+        with pytest.raises(ProviderContextWindowError):
+            collect(provider)
+    finally:
+        asyncio.run(provider.close())
 
 
 def test_pre_cancelled_request_never_reaches_network():

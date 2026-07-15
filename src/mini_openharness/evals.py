@@ -19,7 +19,7 @@ from mini_openharness.mcp import McpManager
 from mini_openharness.memory import MemoryStore
 from mini_openharness.models import Message, ModelReply, ToolCall
 from mini_openharness.permissions import PermissionPolicy
-from mini_openharness.provider import OpenAICompatibleProvider
+from mini_openharness.provider import OpenAICompatibleProvider, ProviderContextWindowError
 from mini_openharness.skills import LoadSkillTool, SkillCatalog
 from mini_openharness.tools import ToolRegistry, ToolResult, default_tools
 
@@ -60,6 +60,7 @@ async def run_evals() -> list[EvalResult]:
         ("permission_block", _permission_block),
         ("verification_gate", _verification_gate),
         ("context_compaction", _context_compaction),
+        ("reactive_compaction", _reactive_compaction),
         ("provider_retry_stream", _provider_retry_stream),
         ("loop_guard", _loop_guard),
     ]
@@ -337,6 +338,55 @@ async def _context_compaction() -> EvalResult:
             event.kind == "assistant" and event.message == "compacted" for event in events
         )
         return _result("context_compaction", compacted, "old context summarized", loop, events)
+
+
+async def _reactive_compaction() -> EvalResult:
+    class ContextLimitedProvider:
+        def __init__(self) -> None:
+            self.requests: list[list[Message]] = []
+
+        async def complete(self, messages, tools):
+            del tools
+            self.requests.append(list(messages))
+            if len(self.requests) == 1:
+                raise ProviderContextWindowError("maximum context length exceeded")
+            return ModelReply(content="Recovered after reactive compaction.")
+
+    with tempfile.TemporaryDirectory() as raw:
+        history = [Message("system", "system")]
+        for index in range(6):
+            history.extend(
+                [
+                    Message("user", f"old request {index}"),
+                    Message("assistant", f"old answer {index}"),
+                ]
+            )
+        provider = ContextLimitedProvider()
+        loop = AgentLoop(
+            provider=provider,
+            tools=default_tools(),
+            workspace=raw,
+            messages=history,
+            compactor=ContextCompactor(threshold_tokens=1_000_000, keep_recent_units=2),
+        )
+        events = await _collect(loop, "continue")
+        compact = next((event for event in events if event.kind == "compact"), None)
+        done = next((event for event in reversed(events) if event.kind == "done"), None)
+        passed = (
+            compact is not None
+            and compact.data.get("trigger") == "reactive"
+            and len(provider.requests) == 2
+            and len(provider.requests[1]) < len(provider.requests[0])
+            and done is not None
+            and done.data["steps"] == 1
+        )
+        return _result(
+            "reactive_compaction",
+            passed,
+            "typed context error forced one same-step compaction retry",
+            loop,
+            events,
+        )
 
 
 async def _provider_retry_stream() -> EvalResult:

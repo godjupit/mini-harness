@@ -9,10 +9,11 @@ from mini_openharness.models import Message, ModelReply, ToolCall
 from mini_openharness.provider import (
     ProviderAuthenticationError,
     ProviderComplete,
+    ProviderContextWindowError,
     ProviderRetry,
     ProviderTextDelta,
 )
-from mini_openharness.compaction import ArtifactStore
+from mini_openharness.compaction import ArtifactStore, ContextCompactor
 from mini_openharness.tools import (
     ResourceAccess,
     ToolContext,
@@ -162,9 +163,7 @@ def test_non_conflicting_mutations_run_in_parallel(tmp_path):
         read_only = False
 
         def resources(self, arguments, context):
-            return (
-                ResourceAccess(f"fs:{context.workspace / arguments['path']}", "write"),
-            )
+            return (ResourceAccess(f"fs:{context.workspace / arguments['path']}", "write"),)
 
         async def run(self, arguments, context):
             nonlocal active, max_active
@@ -340,9 +339,7 @@ def test_mcp_server_is_attributed_on_tool_start_and_end(tmp_path):
     tools.register(McpEchoTool())
     provider = ScriptedProvider(
         [
-            ModelReply(
-                tool_calls=(ToolCall("mcp-1", "mcp__remote__echo", {"text": "ok"}),)
-            ),
+            ModelReply(tool_calls=(ToolCall("mcp-1", "mcp__remote__echo", {"text": "ok"}),)),
             ModelReply(content="done"),
         ]
     )
@@ -456,3 +453,69 @@ def test_stream_deltas_retries_and_provider_failure_are_traced(tmp_path):
     trace_events = list(TraceStore(tmp_path / "traces").read("failed"))
     assert events[-1].kind == "error"
     assert trace_events[-1].data["status"] == "failed"
+
+
+def test_context_error_forces_one_compaction_and_retries_same_model_step(tmp_path):
+    class ContextLimitedProvider:
+        def __init__(self):
+            self.requests = []
+
+        async def complete(self, messages, tools):
+            del tools
+            self.requests.append(list(messages))
+            if len(self.requests) == 1:
+                raise ProviderContextWindowError("maximum context length exceeded")
+            return ModelReply(content="recovered")
+
+    history = [Message("system", "system")]
+    for index in range(6):
+        history.extend(
+            [
+                Message("user", f"old request {index}"),
+                Message("assistant", f"old answer {index}"),
+            ]
+        )
+    provider = ContextLimitedProvider()
+    tracer = TraceWriter(tmp_path / "traces", run_id="reactive-compact")
+    loop = AgentLoop(
+        provider=provider,
+        tools=default_tools(),
+        workspace=tmp_path,
+        messages=history,
+        compactor=ContextCompactor(threshold_tokens=1_000_000, keep_recent_units=2),
+        tracer=tracer,
+    )
+
+    events = collect(loop, "continue")
+
+    compact = next(event for event in events if event.kind == "compact")
+    done = next(event for event in events if event.kind == "done")
+    assert compact.data["trigger"] == "reactive"
+    assert len(provider.requests) == 2
+    assert len(provider.requests[1]) < len(provider.requests[0])
+    assert done.data["steps"] == 1
+    trace = list(TraceStore(tmp_path / "traces").read("reactive-compact"))
+    assert any(event.kind == "context_retry" for event in trace)
+
+
+def test_context_error_without_compactable_history_fails_without_looping(tmp_path):
+    class AlwaysTooLarge:
+        calls = 0
+
+        async def complete(self, messages, tools):
+            del messages, tools
+            self.calls += 1
+            raise ProviderContextWindowError("prompt is too long")
+
+    provider = AlwaysTooLarge()
+    loop = AgentLoop(
+        provider=provider,
+        tools=default_tools(),
+        workspace=tmp_path,
+        compactor=ContextCompactor(threshold_tokens=1_000_000),
+    )
+
+    events = collect(loop, "short prompt")
+
+    assert provider.calls == 1
+    assert events[-1].kind == "error"

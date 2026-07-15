@@ -1,4 +1,4 @@
-"""CLI for agent runs, trace inspection/replay, and evaluations."""
+"""CLI for agent runs and trace inspection/replay."""
 
 from __future__ import annotations
 
@@ -14,10 +14,8 @@ from dotenv import load_dotenv
 
 from mini_openharness.compaction import ArtifactStore, ContextCompactor
 from mini_openharness.engine import AgentEvent, AgentLoop, MaxStepsExceeded
-from mini_openharness.evals import run_evals
 from mini_openharness.hooks import load_hook_registry
 from mini_openharness.mcp import McpManager
-from mini_openharness.memory import MemoryStore, RememberTool, SearchMemoryTool
 from mini_openharness.permissions import PermissionPolicy
 from mini_openharness.provider import (
     DemoProvider,
@@ -29,7 +27,6 @@ from mini_openharness.sandbox import (
     DockerSandboxConfig,
     SandboxedShellTool,
 )
-from mini_openharness.session import SessionStore
 from mini_openharness.skills import LoadSkillTool, SkillCatalog
 from mini_openharness.tools import default_tools
 from mini_openharness.trace import TraceStore, TraceWriter
@@ -74,10 +71,8 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-inline-output", type=int, default=8_000)
     parser.add_argument("--input-cost", type=float, default=0.0, help="USD per million tokens")
     parser.add_argument("--output-cost", type=float, default=0.0, help="USD per million tokens")
-    parser.add_argument("--session", help="JSON file used to resume and persist history")
     parser.add_argument("--skills-dir", help="Directory containing <name>/SKILL.md skills")
     parser.add_argument("--mcp-config", help="JSON file containing stdio/HTTP mcpServers")
-    parser.add_argument("--memory", help="Durable memory JSON path")
     parser.add_argument("--trace-dir", help="JSONL trace directory")
     parser.add_argument("--no-trace", action="store_true", help="Disable run tracing")
     parser.add_argument(
@@ -97,25 +92,14 @@ def build_trace_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_eval_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mini-oh eval", description="Run harness evaluations")
-    parser.add_argument("--json", action="store_true")
-    return parser
-
-
 async def _run(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     prompt = args.prompt or "Inspect this project and summarize its architecture."
     skills = SkillCatalog(args.skills_dir or workspace / "skills")
-    memory = MemoryStore(args.memory or workspace / ".mini-oh" / "memory.json")
-    relevant_memories = memory.search(prompt)
     system_parts = ["You are a concise coding assistant. Inspect before editing."]
     skill_prompt = skills.prompt()
-    memory_prompt = memory.prompt(prompt)
     if skill_prompt:
         system_parts.append(skill_prompt)
-    if memory_prompt:
-        system_parts.append(memory_prompt)
 
     if args.demo:
         provider = DemoProvider()
@@ -146,12 +130,9 @@ async def _run(args: argparse.Namespace) -> int:
                 "workspace": str(workspace),
                 "provider": provider_name,
                 "model": args.model if not args.demo else "demo",
-                "memory_hits": [item.text for item in relevant_memories],
             },
         )
 
-    store = SessionStore(args.session) if args.session else None
-    messages = store.load() if store else None
     tools = default_tools()
     if args.sandbox_shell:
         sandbox = DockerSandbox(
@@ -166,8 +147,6 @@ async def _run(args: argparse.Namespace) -> int:
         tools.register(SandboxedShellTool(sandbox))
     if skills.list():
         tools.register(LoadSkillTool(skills))
-    tools.register(RememberTool(memory))
-    tools.register(SearchMemoryTool(memory))
     mcp_manager = McpManager.from_file(args.mcp_config) if args.mcp_config else None
     policy = _permission_policy(args)
     hooks = load_hook_registry(args.hooks_config) if args.hooks_config else None
@@ -201,7 +180,6 @@ async def _run(args: argparse.Namespace) -> int:
             tool_timeout_seconds=args.tool_timeout,
             max_repeated_tool_batches=args.max_repeated_tool_batches,
             hooks=hooks,
-            messages=messages or None,
         )
         async for event in loop.run(prompt):
             _print_event(event)
@@ -226,8 +204,6 @@ async def _run(args: argparse.Namespace) -> int:
             tracer.finish(status="cancelled", data={"reason": "CLI task cancelled"})
         raise
     finally:
-        if store and loop:
-            store.save(loop.messages)
         if mcp_manager:
             await mcp_manager.close()
         close = getattr(provider, "close", None)
@@ -303,23 +279,6 @@ def _trace_command(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _eval_command(args: argparse.Namespace) -> int:
-    results = await run_evals()
-    if args.json:
-        print(json.dumps([result.to_dict() for result in results], ensure_ascii=False, indent=2))
-    else:
-        for result in results:
-            status = "PASS" if result.passed else "FAIL"
-            tools = ",".join(result.tools) or "-"
-            print(
-                f"{result.name:24} {status:4} {result.duration_ms:6}ms "
-                f"steps={result.steps:<2}/{result.max_steps:<2} "
-                f"tokens={result.input_tokens + result.output_tokens:<4} "
-                f"tools={tools}  {result.detail}"
-            )
-    return 0 if all(result.passed for result in results) else 1
-
-
 def _print_event(event: AgentEvent) -> None:
     if event.kind == "assistant_delta":
         print(event.message, end="", flush=True)
@@ -367,8 +326,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments and arguments[0] == "trace":
             return _trace_command(build_trace_parser().parse_args(arguments[1:]))
-        if arguments and arguments[0] == "eval":
-            return asyncio.run(_eval_command(build_eval_parser().parse_args(arguments[1:])))
         return asyncio.run(_run(build_run_parser().parse_args(arguments)))
     except KeyboardInterrupt:
         print("cancelled", file=sys.stderr)

@@ -371,13 +371,6 @@ class AgentLoop:
                     self.tracer.emit("tool_end", data)
                     if call.name == "load_skill" and not stored_result.is_error:
                         self.tracer.emit("skill_loaded", {"name": call.arguments.get("name")})
-                    elif call.name == "search_memory":
-                        self.tracer.emit(
-                            "memory_search",
-                            {"query": call.arguments.get("query"), "output": stored_result.output},
-                        )
-                    elif call.name == "remember" and not stored_result.is_error:
-                        self.tracer.emit("memory_write", {"text": call.arguments.get("text")})
                 yield AgentEvent("tool_end", stored_result.output, data)
 
         error = f"Agent did not finish within {self.max_steps} steps"

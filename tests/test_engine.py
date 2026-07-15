@@ -272,16 +272,16 @@ def test_max_steps_is_a_hard_guard(tmp_path):
         collect(loop, "loop forever")
 
 
-def test_resumed_session_refreshes_runtime_context(tmp_path):
+def test_preloaded_history_refreshes_runtime_context(tmp_path):
     loop = AgentLoop(
         provider=ScriptedProvider([ModelReply(content="done")]),
         tools=default_tools(),
         workspace=tmp_path,
-        system_prompt="new skills and relevant memories",
+        system_prompt="new runtime context",
         messages=[Message("system", "old context"), Message("user", "earlier turn")],
     )
 
-    assert loop.messages[0].content == "new skills and relevant memories"
+    assert loop.messages[0].content == "new runtime context"
 
 
 def test_agent_loop_trace_covers_model_tool_permission_usage_and_finish(tmp_path):

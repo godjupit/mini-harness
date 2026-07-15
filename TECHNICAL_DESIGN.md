@@ -1,6 +1,6 @@
 # Mini OpenHarness 0.6 技术设计
 
-本文记录 2026-07-16 这一轮维护的依据、实现和取舍。目标不是复制完整 OpenHarness，而是保留最能体现 Agent Runtime 能力、面试时可以白板推导、并能自动验证的机制。
+本文记录精简分支的依据、实现和取舍。目标不是复制完整 OpenHarness，而是保留最能体现 Agent Runtime 能力、面试时可以白板推导、并能用测试验证的机制。
 
 ## 1. 规范与项目依据
 
@@ -19,16 +19,16 @@
 | 能力 | 主项目核心实现 | Mini 对应实现 | 对齐结论 |
 |---|---|---|---|
 | Agent Loop | `src/openharness/engine/query.py::run_query` | `engine.py::AgentLoop.run` | 都维持 model → tools → observations → model，并保证 tool call/result 配对；Mini 用较小的事件模型保留主状态机 |
-| Provider boundary | `src/openharness/api/` 的统一 stream events | `provider.py` 的 Responses/Chat adapters | 都把供应商协议收敛为内部消息；Mini 额外用真实 Provider Contract Matrix 验证协议而不是只 mock HTTP |
+| Provider boundary | `src/openharness/api/` 的统一 stream events | `provider.py` 的 Responses/Chat adapters | 都把供应商协议收敛为内部消息；Mini 用协议级单元测试覆盖流式事件和 Tool Call |
 | 工具输入与权限 | Pydantic input model + `PermissionChecker` | JSON Schema + `PermissionPolicy` | 都在执行副作用前重新验证模型参数，并把 ask/deny 结果转成可恢复 observation |
 | 并行工具 | `gather(return_exceptions=True)` 保证每个 call 有 result | `gather` + hierarchical read/write resource locks | Mini 保留配对不变量，并进一步只串行有资源冲突的调用 |
 | Hook | `hooks/` 中 command/http/prompt/agent adapters | `Hook` Protocol + callback/command adapters | 生命周期和 matcher/priority/timeout 对齐；Mini Executor 依赖 Protocol，新增 adapter 不需要修改类型分支，且 `stop` 可真正阻止 done |
 | Context | microcompact + LLM summary + prompt-too-long reactive retry | deterministic atomic-unit summary + artifacts + typed reactive retry | 工具消息原子性和一次性恢复语义已对齐；Mini 有意保留确定性 summary，避免压缩本身再次调用模型 |
 | MCP | stdio/HTTP、schema 和 OAuth | stdio/Streamable HTTP、input/output schema、OAuth | Mini 保留 transport、trust annotation、PKCE/state/resource audience 等核心边界 |
 | Sandbox | Docker backend 与 shell policy | Docker-only disposable shell | 都 fail-closed；Mini 有意不提供 host fallback，并将 secret path 做双层遮蔽 |
-| 可观测与验证 | runtime events、carryover、项目测试 | JSONL Trace/Replay、Eval、Provider Matrix、Verification Gate | Mini 强调可重复证据；Replay 保证不重新执行副作用 |
+| 可观测与验证 | runtime events、carryover、项目测试 | JSONL Trace/Replay、pytest、Verification Gate | Mini 只保留一套测试入口；Replay 保证不重新执行副作用 |
 
-本轮审计发现并修复了三个 Provider 契约偏差：
+本轮审计发现并修复了四个 Provider 契约偏差：
 
 1. 旧实现对所有 Responses function 固定发送 `strict: false`，等于主动退出官方当前的 schema 规范化；现在兼容 schema 发送 `strict: true`，不兼容 schema 省略字段，让 Responses 自动规范化或回退。
 2. 旧实现依赖 `response.output_item.done` 收口函数参数，却没有消费官方独立定义的 `response.function_call_arguments.done`；现在 final arguments event 是权威值。
@@ -54,7 +54,7 @@ tool calls ─→ resolve ResourceAccess(key, read/write, exact/tree)
                                               gather keeps call order
 ```
 
-文件使用规范化绝对路径作为 `fs:` key；目录读取和 shell 使用 tree lock，能与所有子路径冲突。Memory 使用其 JSON 文件 key，MCP 使用 server key。锁规则为 read/read 兼容，read/write 和 write/write 冲突；两个不同文件的 mutation 可以并发。未知工具或 resource resolver 失败时申请全局 tree write lock，采用 fail-closed。
+文件使用规范化绝对路径作为 `fs:` key；目录读取和 shell 使用 tree lock，能与所有子路径冲突，MCP 使用 server key。锁规则为 read/read 兼容，read/write 和 write/write 冲突；两个不同文件的 mutation 可以并发。未知工具或 resource resolver 失败时申请全局 tree write lock，采用 fail-closed。
 
 `asyncio.gather` 只负责保持 result 顺序；真正的并发安全由 `ResourceLockManager` 的 condition + active lock set 保证。多个资源先稳定排序，避免未来一个调用声明多资源时产生锁序死锁。
 
@@ -70,11 +70,9 @@ Responses 与 Chat Completions 的核心差异不是 URL，而是协议模型。
 
 流结束也属于协议契约。`response.function_call_arguments.done` 的 final arguments 覆盖 delta 累积值，但 `call_id` 必须继续来自 function-call item，不能误用 event 的 `item_id`。Chat `finish_reason=length` 和 Responses `response.incomplete` 都是非完整终态；即使已经收到部分文本也抛出 typed truncation error，防止 Agent 把部分答案当成功交付。
 
-Provider 最终仍产出统一 `ModelReply`，因此 AgentLoop、compaction、Session、Trace 和 Eval 不感知 API 差异。官方 OpenAI 默认走 `--api-mode responses`；第三方兼容端点可显式使用 `--api-mode chat`。
+Provider 最终仍产出统一 `ModelReply`，因此 AgentLoop、compaction 和 Trace 不感知 API 差异。官方 OpenAI 默认走 `--api-mode responses`；第三方兼容端点可显式使用 `--api-mode chat`。
 
 Responses endpoint 返回 HTTP 404 时，CLI 不自动重放到另一协议，避免产生隐式重复请求；它会提示 `--api-mode chat` 并返回退出码 1。正常完成、失败和取消分别返回 0、1、130。
-
-CI Provider Contract Matrix 不直接探测 HTTP endpoint，而是通过真实两轮 `AgentLoop` 验证完整行为契约：SSE delta、tool-call arguments 重组、tool result 回填、多轮历史和 usage。每个 case 输出版本化 JSON，最终聚合成 Markdown；缺少 secret 明确标为 skipped，协议或行为断言失败则 job 失败。
 
 ## 5. Timeout 与重复调用熔断
 
@@ -181,20 +179,13 @@ Hook 与 Permission 分层：Permission 是 capability/effect 授权，Hook 是�
 
 ```bash
 pytest -q
-mini-oh eval
 ```
 
 测试覆盖：Hook priority/matcher、payload 改写、fail-open/fail-closed、命令协议、完成验证恢复；Responses strict eligibility、typed Items、arguments delta/done、非完整终态与 SSE contract；同资源串行/异资源 mutation 并发、loop guard、Trace redaction、真实 stdio 与真实 Streamable HTTP MCP、OAuth token mode/loopback/PKCE 拒绝路径，以及真实 Docker 容器的 workspace 写入、只读 rootfs、无网络和退出清理。
 
-独立 `Mini OpenHarness CI` 在 Python 3.10/3.12 上执行 Ruff、全量 pytest 和行为 Eval。真实 Provider 因为需要 secrets 和会产生费用，继续由单独的定时/手动 Provider Contract Matrix 承担，避免普通 PR CI 隐式调用外部模型。
+独立 `Mini OpenHarness CI` 只在 Python 3.12 上执行 Ruff 和全量 pytest，不包含版本矩阵，也不会隐式调用收费的真实 Provider。需要联调时直接用 `mini-oh` 和本地 `.env` 手动 smoke test。
 
-### 本轮验证快照（2026-07-16）
-
-- Ruff check 与本轮 Python 文件 format check 通过；
-- 90 个 pytest 全部通过；
-- 10 个行为 Eval 全部通过，其中 `reactive_compaction` 证明一次强制压缩在同一 model step 内恢复；
-- 在临时克隆的 `pallets/itsdangerous` 陌生仓库上，DeepSeek Chat 真实两轮契约通过：实际执行 `write_file`/`read_file`，8 项 contract checks 全为 true，观察到 18 个 streaming text delta，usage 为 2154 input / 250 output tokens；
-- 本地没有 OpenAI Responses key，因此没有把 mock 结果伪装成 live evidence；OpenAI Responses 的 strict/done 契约由官方 schema、单元测试和 CI secret matrix 三层覆盖，最终 live 结论以 CI artifact 为准。
+CI 与本地验证共用同一个 pytest 入口。Provider 单元测试覆盖 Responses strict/done 和 Chat-compatible 流式契约；真实 API 只在明确需要时手动执行，避免把 secret、外部网络和费用引入普通提交检查。
 
 关键不变量：
 

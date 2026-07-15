@@ -1,22 +1,21 @@
 # Mini OpenHarness
 
-一个可以在面试中讲清楚、现场跑通、用证据验证的 coding-agent runtime。它保留了完整 Harness 最有价值的设计：Agent Loop、可扩展 Hooks、Skills、MCP、Memory、权限审批、effect-aware 工具调度、上下文压缩、流式 Provider、Trace/Replay 和自动 Eval。
+一个可以在面试中讲清楚、现场跑通的精简 coding-agent runtime。它保留 Agent Loop、Hooks、Skills、MCP、权限审批、effect-aware 工具调度、上下文压缩、流式 Provider、Trace/Replay 和 Docker 自测。
 
 ```text
-Skills catalog ─┐
-Relevant memory ├──→ AgentLoop ───→ Streaming ModelProvider
-Session history ┘        ↑                    │
+Skills catalog ─────→ AgentLoop ───→ Streaming ModelProvider
+                         ↑                    │
 HookRegistry ─────────────┤ prompt / pre-tool / post-tool / stop
                          │              text / tool calls
                          │                    ↓
                   observations ← PermissionPolicy
                          ↑          allow / deny / ask
                          │                    ↓
-                  ToolRegistry ← local / skill / memory / MCP
+                  ToolRegistry ← local / skill / MCP
                          │
                   artifacts + compaction
 
-TraceWriter observes model, hooks, permission, tool, memory, MCP, cost and final state.
+TraceWriter observes model, hooks, permission, tool, MCP, cost and final state.
 ```
 
 ## 30 秒运行
@@ -29,14 +28,11 @@ python -m venv .venv
 cp .env.example .env
 # 编辑 .env，填入 OPENAI_API_KEY
 .venv/bin/mini-oh --demo --workspace . "解释这个项目"
-.venv/bin/mini-oh eval
 ```
 
 CLI 会自动读取当前目录的 `.env`，但不会覆盖 shell 中已经设置的环境变量。真实 `.env` 已被 Git 忽略。
 
-`--demo` 不需要 API Key，但真实经过 Agent Loop、skill 渐进加载、文件工具调用、结果回填、Trace 和最终回答。`mini-oh eval` 还会启动一个真实 MCP stdio server。
-
-真实 Provider CI 会分别验证 OpenAI Responses、OpenAI Chat 和 DeepSeek Chat，并上传 model/protocol/tool/stream usage 契约结果；配置方法见 [PROVIDER_CONTRACTS.md](PROVIDER_CONTRACTS.md)。
+`--demo` 不需要 API Key，但真实经过 Agent Loop、skill 渐进加载、文件工具调用、结果回填、Trace 和最终回答。
 
 官方 OpenAI 默认使用 Responses API；兼容端点可切回 Chat Completions：
 
@@ -58,7 +54,7 @@ mini-oh --api-mode chat --base-url https://compatible.example/v1 "分析架构"
 - model request/response 与流式 token delta；
 - tool 参数、来源、耗时、输出与错误；
 - resource wait/acquire/release，以及 `waited_ms`、`held_ms`；
-- skill 加载、memory 命中/写入、MCP server（start/end 均保留归因）；
+- skill 加载和 MCP server（start/end 均保留归因）；
 - permission 决策与人工审批结果；
 - hook start/end、阻断、失败、耗时和 payload 改写；
 - compaction 前后 token 估算；
@@ -81,7 +77,7 @@ mini-oh trace replay <run-id>
 默认行为：
 
 - read-only 工具自动允许；
-- 文件写入、memory 写入默认询问；
+- 文件写入默认询问；
 - MCP 工具因为远端副作用未知，默认询问；
 - 非交互环境无法询问时安全拒绝。
 
@@ -232,34 +228,10 @@ Provider boundary 同时实现 OpenAI Responses 与 Chat Completions-compatible 
 mini-oh --tool-timeout 20 --max-repeated-tool-batches 2 "检查并修改项目"
 ```
 
-## 7. 自动 Eval
-
-```bash
-mini-oh eval
-mini-oh eval --json
-```
-
-内置场景同时检查最终答案、工具 trace、步骤/token/耗时和副作用：
-
-| 场景 | 验证内容 |
-|---|---|
-| `tool_recovery` | 未知工具变成 observation，模型继续恢复 |
-| `skill_loading` | skill 正文按需加载 |
-| `memory_recall` | 相关长期记忆注入新任务 |
-| `mcp_tool_call` | 真实 stdio MCP tools/list + tools/call |
-| `permission_block` | 被拒绝写入没有文件副作用 |
-| `verification_gate` | `stop` Hook 失败阻止 done，模型修复后再次验证 |
-| `context_compaction` | 旧上下文被压缩 |
-| `reactive_compaction` | context-window 错误触发一次同 step 强制压缩与重试 |
-| `provider_retry_stream` | 429 后重试并继续 SSE 输出 |
-| `loop_guard` | 重复 tool batch 被熔断，模型收到 observation 后恢复 |
-
-## Skills、MCP、Memory
+## 7. Skills 与 MCP
 
 - Skills：启动时只注入 name/description，模型调用 `load_skill` 后正文才进入 history。
 - MCP：同时支持 stdio 与 Streamable HTTP。远程 input/output schema 被校验，structured content 被保留。HTTP OAuth 使用 SDK discovery、动态注册/Client Metadata URL、PKCE S256、state、RFC 8707 resource audience、refresh token 与 scope step-up；token 以 `0600` 原子文件保存。远端 `readOnlyHint` 默认不受信任。
-- Memory：稳定事实存入 `.mini-oh/memory.json`；`remember` 写入，`search_memory` 查询，CLI 自动召回相关内容。
-- Session：`--session` 保存逐字消息协议，用于继续同一次对话；Memory 用于跨新会话保存少量稳定事实。
 
 真实 MCP 示例：
 
@@ -286,7 +258,7 @@ Streamable HTTP + OAuth 示例：
 }
 ```
 
-首次收到 401 时会启动 loopback callback 并打开授权 URL。Authorization server metadata 未声明 PKCE `S256` 时拒绝继续。CI 中已有 bearer token 可通过 `headersEnv` 从环境变量注入，避免把 secret 写进配置。
+首次收到 401 时会启动 loopback callback 并打开授权 URL。Authorization server metadata 未声明 PKCE `S256` 时拒绝继续。已有 bearer token 可通过 `headersEnv` 从环境变量注入，避免把 secret 写进配置。
 
 ## Docker sandbox shell
 
@@ -313,10 +285,8 @@ mini-oh --sandbox-shell --yes --workspace . \
 | `hooks.py` | Hook Protocol、Registry、Executor 与命令配置 | 生命周期扩展、fail-open/closed、Verification Gate |
 | `trace.py` | JSONL trace/replay | 可观测、审计、无副作用回放 |
 | `compaction.py` | summary 与 artifacts | 协议不变量、context 成本 |
-| `evals.py` | 自动行为评测 | 可重复证据，而非只看最终文本 |
 | `skills.py` | skill 渐进加载 | progressive disclosure |
 | `mcp.py` / `mcp_auth.py` | stdio/HTTP MCP 与 OAuth | PKCE、audience、token storage |
-| `memory.py` | 持久事实与检索 | session/memory 分层 |
 | `sandbox.py` | Docker-only shell | OS 隔离、fail-closed、资源限制 |
 
 ## 安全边界与非目标
@@ -327,4 +297,4 @@ Python callback 与命令 Hook 都是受信任扩展代码：前者与 Agent 同
 
 项目有意不实现 TUI、插件市场和多 Agent，以保持面试主线集中在 runtime 的可靠性与可验证性。
 
-实现依据和设计取舍见 [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md)，面试讲法见 [INTERVIEW.md](INTERVIEW.md)。
+实现依据、设计取舍和验证方法统一记录在 [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md)。

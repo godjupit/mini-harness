@@ -126,8 +126,6 @@ class ToolRegistry:
             return "mcp"
         if name == "load_skill":
             return "skill"
-        if name in {"remember", "search_memory"}:
-            return "memory"
         return "local"
 
     def is_read_only(self, name: str) -> bool:

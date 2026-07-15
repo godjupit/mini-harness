@@ -10,19 +10,28 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+import httpx
+from jsonschema import ValidationError, validate
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
 
+from mini_openharness.mcp_auth import McpOAuthConfig, build_oauth_provider
 from mini_openharness.tools import ToolContext, ToolRegistry, ToolResult
 
 
 @dataclass(frozen=True)
 class McpServerConfig:
-    command: str
+    command: str | None = None
     args: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
+    url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    oauth: McpOAuthConfig | None = None
+    trust_tool_annotations: bool = False
 
 
 class McpManager:
@@ -40,14 +49,44 @@ class McpManager:
         raw_servers = data.get("mcpServers", data)
         configs: dict[str, McpServerConfig] = {}
         for name, raw in raw_servers.items():
+            server_name = str(name)
             cwd = raw.get("cwd")
             if cwd and not Path(cwd).is_absolute():
                 cwd = str((config_path.parent / cwd).resolve())
-            configs[str(name)] = McpServerConfig(
-                command=str(raw["command"]).replace("{python}", sys.executable),
+            command = raw.get("command")
+            url = raw.get("url")
+            if bool(command) == bool(url):
+                raise ValueError(
+                    f"MCP server {server_name!r} must configure exactly one of command or url"
+                )
+            headers = {str(key): str(value) for key, value in raw.get("headers", {}).items()}
+            for header, env_name in raw.get("headersEnv", {}).items():
+                value = os.environ.get(str(env_name))
+                if value is None:
+                    raise ValueError(
+                        f"MCP server {server_name!r} requires environment variable {env_name}"
+                    )
+                headers[str(header)] = value
+            oauth = _oauth_config(
+                raw.get("oauth"),
+                config_path=config_path,
+                server_name=server_name,
+            )
+            if oauth is not None:
+                if not url:
+                    raise ValueError(f"MCP server {server_name!r} OAuth requires an HTTP url")
+                _validate_oauth_server_url(str(url), server_name)
+            configs[server_name] = McpServerConfig(
+                command=(
+                    str(command).replace("{python}", sys.executable) if command else None
+                ),
                 args=tuple(str(item) for item in raw.get("args", ())),
                 env={str(key): str(value) for key, value in raw.get("env", {}).items()},
                 cwd=cwd,
+                url=str(url) if url else None,
+                headers=headers,
+                oauth=oauth,
+                trust_tool_annotations=bool(raw.get("trustToolAnnotations", False)),
             )
         return cls(configs)
 
@@ -56,16 +95,33 @@ class McpManager:
         for server_name, config in self.configs.items():
             stack = AsyncExitStack()
             try:
-                read_stream, write_stream = await stack.enter_async_context(
-                    stdio_client(
-                        StdioServerParameters(
-                            command=config.command,
-                            args=list(config.args),
-                            env={**os.environ, **config.env},
-                            cwd=config.cwd,
+                if config.url:
+                    auth = build_oauth_provider(config.url, config.oauth) if config.oauth else None
+                    http_client = await stack.enter_async_context(
+                        httpx.AsyncClient(
+                            headers=config.headers,
+                            auth=auth,
+                            timeout=httpx.Timeout(30, read=300),
                         )
                     )
-                )
+                    read_stream, write_stream, _ = await stack.enter_async_context(
+                        streamable_http_client(
+                            config.url,
+                            http_client=http_client,
+                        )
+                    )
+                else:
+                    assert config.command is not None
+                    read_stream, write_stream = await stack.enter_async_context(
+                        stdio_client(
+                            StdioServerParameters(
+                                command=config.command,
+                                args=list(config.args),
+                                env={**os.environ, **config.env},
+                                cwd=config.cwd,
+                            )
+                        )
+                    )
                 session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
                 await session.initialize()
                 for tool in (await session.list_tools()).tools:
@@ -74,6 +130,14 @@ class McpManager:
                         remote_name=tool.name,
                         description=tool.description or f"MCP tool {tool.name}",
                         parameters=dict(tool.inputSchema or {"type": "object"}),
+                        output_schema=(
+                            dict(tool.outputSchema) if tool.outputSchema is not None else None
+                        ),
+                        read_only=bool(
+                            config.trust_tool_annotations
+                            and tool.annotations is not None
+                            and tool.annotations.readOnlyHint is True
+                        ),
                         session=session,
                     )
                     registry.register(adapter)
@@ -94,8 +158,6 @@ class McpManager:
 class McpTool:
     """Adapt one remote MCP tool to the Mini OpenHarness Tool protocol."""
 
-    read_only = False
-
     def __init__(
         self,
         *,
@@ -103,6 +165,8 @@ class McpTool:
         remote_name: str,
         description: str,
         parameters: dict[str, Any],
+        output_schema: dict[str, Any] | None = None,
+        read_only: bool = False,
         session: ClientSession,
     ) -> None:
         self.server_name = server_name
@@ -110,7 +174,18 @@ class McpTool:
         self.name = f"mcp__{_segment(server_name)}__{_segment(remote_name)}"
         self.description = description
         self.parameters = parameters
+        self.output_schema = output_schema
+        # MCP annotations are only hints. The manager honors readOnlyHint solely
+        # when the server is explicitly configured as trusted.
+        self.read_only = read_only
         self.session = session
+
+    def resources(self, arguments: dict[str, Any], context: ToolContext):
+        del arguments, context
+        from mini_openharness.tools import ResourceAccess
+
+        mode = "read" if self.read_only else "write"
+        return (ResourceAccess(f"mcp:{self.server_name}", mode, tree=True),)
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         del context
@@ -122,11 +197,70 @@ class McpTool:
             else:
                 parts.append(item.model_dump_json())
         structured = getattr(result, "structuredContent", None)
+        if self.output_schema is not None:
+            try:
+                validate(instance=structured, schema=self.output_schema)
+            except ValidationError as exc:
+                return ToolResult(
+                    f"MCP tool {self.remote_name} returned invalid structured output: "
+                    f"{exc.message}",
+                    is_error=True,
+                    metadata={"output_schema_valid": False},
+                )
         if structured is not None and not parts:
             parts.append(json.dumps(structured, ensure_ascii=False))
-        return ToolResult("\n".join(parts) or "(no output)", is_error=bool(result.isError))
+        metadata: dict[str, Any] = {}
+        if structured is not None:
+            metadata["structured_content"] = structured
+        if self.output_schema is not None:
+            metadata["output_schema_valid"] = True
+        return ToolResult(
+            "\n".join(parts) or "(no output)",
+            is_error=bool(result.isError),
+            metadata=metadata,
+        )
 
 
 def _segment(value: str) -> str:
     result = re.sub(r"[^A-Za-z0-9_-]", "_", value)
     return result if result and result[0].isalpha() else f"tool_{result or 'unnamed'}"
+
+
+def _oauth_config(
+    raw: Any,
+    *,
+    config_path: Path,
+    server_name: str,
+) -> McpOAuthConfig | None:
+    if not raw:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"MCP server {server_name!r} oauth must be an object")
+    token_file = Path(
+        str(raw.get("tokenFile", f".mini-oh/oauth/{_segment(server_name)}.json"))
+    )
+    if not token_file.is_absolute():
+        token_file = (config_path.parent / token_file).resolve()
+    return McpOAuthConfig(
+        token_file=token_file,
+        redirect_uri=str(raw.get("redirectUri", "http://127.0.0.1:8765/callback")),
+        scopes=str(raw["scopes"]) if raw.get("scopes") else None,
+        client_name=str(raw.get("clientName", "Mini OpenHarness")),
+        client_metadata_url=(
+            str(raw["clientMetadataUrl"]) if raw.get("clientMetadataUrl") else None
+        ),
+        open_browser=bool(raw.get("openBrowser", True)),
+        timeout_seconds=float(raw.get("timeoutSeconds", 300.0)),
+    )
+
+
+def _validate_oauth_server_url(url: str, server_name: str) -> None:
+    parsed = urlparse(url)
+    loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+    if not parsed.hostname or parsed.fragment or (
+        parsed.scheme != "https" and not (parsed.scheme == "http" and loopback)
+    ):
+        raise ValueError(
+            f"MCP server {server_name!r} OAuth url must be HTTPS or HTTP loopback "
+            "without a fragment"
+        )

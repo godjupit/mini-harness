@@ -239,6 +239,130 @@ class OpenAICompatibleProvider:
         await self._client.aclose()
 
 
+class OpenAIResponsesProvider(OpenAICompatibleProvider):
+    """OpenAI Responses API adapter using typed Items and streaming events."""
+
+    async def _stream_once(
+        self,
+        payload: dict[str, Any],
+        *,
+        cancel_event: asyncio.Event | None,
+    ) -> AsyncIterator[ProviderEvent]:
+        content_parts: list[str] = []
+        tool_parts: dict[int, dict[str, str]] = {}
+        input_tokens = 0
+        output_tokens = 0
+        completed = False
+        try:
+            async with self._client.stream("POST", "responses", json=payload) as response:
+                if response.status_code >= 400:
+                    body = (await response.aread()).decode("utf-8", errors="replace")
+                    raise _status_error(response.status_code, body)
+                async for line in response.aiter_lines():
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ProviderCancelledError("Provider request cancelled")
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise ProviderInvalidResponseError(
+                            f"Invalid Responses SSE JSON: {raw[:200]}"
+                        ) from exc
+                    event_type = str(event.get("type", ""))
+                    if event_type == "response.output_text.delta":
+                        text = str(event.get("delta") or "")
+                        if text:
+                            content_parts.append(text)
+                            yield ProviderTextDelta(text)
+                    elif event_type == "response.output_item.added":
+                        item = event.get("item") or {}
+                        if item.get("type") == "function_call":
+                            index = int(event.get("output_index", 0))
+                            tool_parts[index] = {
+                                "id": str(item.get("call_id") or item.get("id") or ""),
+                                "name": str(item.get("name") or ""),
+                                "arguments": str(item.get("arguments") or ""),
+                            }
+                    elif event_type == "response.function_call_arguments.delta":
+                        index = int(event.get("output_index", 0))
+                        part = tool_parts.setdefault(
+                            index, {"id": "", "name": "", "arguments": ""}
+                        )
+                        part["arguments"] += str(event.get("delta") or "")
+                    elif event_type == "response.output_item.done":
+                        item = event.get("item") or {}
+                        if item.get("type") == "function_call":
+                            index = int(event.get("output_index", 0))
+                            tool_parts[index] = {
+                                "id": str(item.get("call_id") or item.get("id") or ""),
+                                "name": str(item.get("name") or ""),
+                                "arguments": str(item.get("arguments") or "{}"),
+                            }
+                    elif event_type == "response.completed":
+                        completed = True
+                        usage = (event.get("response") or {}).get("usage") or {}
+                        input_tokens = int(usage.get("input_tokens", 0) or 0)
+                        output_tokens = int(usage.get("output_tokens", 0) or 0)
+                    elif event_type in {"error", "response.failed", "response.incomplete"}:
+                        detail = event.get("error") or (event.get("response") or {}).get("error")
+                        raise ProviderInvalidResponseError(
+                            f"Responses API {event_type}: {detail or event}"
+                        )
+        except ProviderError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeoutError(str(exc) or "Provider request timed out") from exc
+        except httpx.NetworkError as exc:
+            raise ProviderNetworkError(str(exc) or "Provider network error") from exc
+        except asyncio.CancelledError as exc:
+            raise ProviderCancelledError("Provider request cancelled") from exc
+
+        if not completed:
+            raise ProviderInvalidResponseError("Responses stream ended before response.completed")
+        calls = tuple(
+            _tool_call_from_parts(index, part) for index, part in sorted(tool_parts.items())
+        )
+        yield ProviderComplete(
+            ModelReply(
+                content="".join(content_parts),
+                tool_calls=calls,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        )
+
+    def _payload(self, messages: list[Message], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        instructions = "\n\n".join(
+            message.content for message in messages if message.role == "system" and message.content
+        )
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": _to_responses_items(messages),
+            "stream": True,
+        }
+        if instructions:
+            payload["instructions"] = instructions
+        if tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["parameters"],
+                    # Runtime validation remains authoritative for compatible schemas
+                    # containing optional fields that cannot use strict mode.
+                    "strict": False,
+                }
+                for tool in tools
+            ]
+            payload["tool_choice"] = "auto"
+        return payload
+
+
 def _retryable(exc: ProviderError) -> bool:
     return isinstance(
         exc,
@@ -293,6 +417,36 @@ def _to_openai_message(message: Message) -> dict[str, Any]:
     if message.name:
         result["name"] = message.name
     return result
+
+
+def _to_responses_items(messages: list[Message]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        if message.role == "system":
+            continue
+        if message.role in {"user", "assistant"} and message.content:
+            items.append({"role": message.role, "content": message.content})
+        if message.role == "assistant":
+            items.extend(
+                {
+                    "type": "function_call",
+                    "call_id": call.id,
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                }
+                for call in message.tool_calls
+            )
+        elif message.role == "tool":
+            if not message.tool_call_id:
+                raise ProviderInvalidResponseError("Tool result is missing tool_call_id")
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id,
+                    "output": message.content,
+                }
+            )
+    return items
 
 
 class DemoProvider:

@@ -2,7 +2,7 @@
 
 ## 60 秒项目介绍
 
-“Mini OpenHarness 是我从完整 coding-agent 系统中提炼出的可验证运行时。核心是受控状态机：模型根据历史产生 tool calls，权限策略做 allow/deny/ask 决策，runtime 并发执行工具并回填 observations，直到最终答案。Skills 使用渐进披露；本地与 MCP 工具走同一条 schema、权限和 Trace 链路；Session 与长期 Memory 分层。长上下文会协议安全地压缩，大输出落 artifact。Provider 支持 SSE、重试、取消和费用统计。最后不是靠截图证明可用，而是用 JSONL Trace、安全 Replay 和七个自动 Eval 场景验证。”
+“Mini OpenHarness 是我从完整 coding-agent 系统中提炼出的可验证运行时。核心是受控状态机：OpenAI Responses 或 Chat Provider 产生 tool calls，权限策略做 allow/deny/ask，resource-aware 读写锁只串行冲突副作用，再按 call order 回填 observations。每个工具有 timeout 和重复调用熔断。stdio/HTTP MCP 走同一 schema、OAuth、权限和脱敏 Trace 链路；shell 只在无网络、只读 rootfs、资源受限的 disposable Docker 中执行，绝不回退宿主机。最后用安全 Replay、自动 Eval、真实 HTTP MCP 和真实 Docker 集成测试证明行为。”
 
 ## 5 分钟白板顺序
 
@@ -11,7 +11,7 @@
 3. 展示 Skills、Memory 和 MCP 如何复用同一 loop，而不是各自旁路。
 4. 解释 `tool_call_id` 配对，以及 compaction 为什么按 atomic unit 工作。
 5. 展示 Trace 覆盖 model/permission/tool/cost/final state，Replay 不执行副作用。
-6. 运行 `mini-oh eval`，重点指出 MCP 是真实 stdio 调用，权限场景验证文件未生成。
+6. 运行 `mini-oh eval` 和集成测试，指出 MCP stdio/HTTP 与 Docker 隔离都是真实进程，不是 mock。
 
 ## 推荐现场 Demo
 
@@ -20,6 +20,7 @@ mini-oh --demo --workspace . "介绍项目"
 mini-oh trace list
 mini-oh trace replay <run-id>
 mini-oh eval
+pytest -q tests/test_sandbox.py -s
 pytest -q
 ```
 
@@ -33,9 +34,21 @@ pytest -q
 
 文件不存在、参数错误和未知工具通常是可恢复 observation。把错误返回模型允许其换工具或参数；Provider invariant、取消和最大步数才属于 runtime 终止条件。
 
-### 并发工具有哪些坑？
+### 并发工具有哪些坑？现在如何处理？
 
-每个 call 无论成功失败都必须产生相同 `tool_call_id` 的 result，且结果顺序保持稳定。当前并发所有已批准调用；生产版还应分析多个写工具之间的资源冲突。
+每个 call 无论成功失败都必须产生相同 `tool_call_id` 的 result，且结果顺序保持稳定。当前每次调用声明 exact/tree resource read/write lock：同资源冲突串行，不同文件 mutation 并发，未知 effect 获取全局写锁。`gather` 保持返回顺序，lock manager 决定实际执行并发度。
+
+### Responses API 为什么不能只把 endpoint 改成 `/responses`？
+
+它使用 typed Items，不是 Chat message 数组。assistant function call、tool output 分别是 `function_call` 和 `function_call_output`，靠 `call_id` 关联；流式事件也是 `response.output_text.delta` 等类型。Mini 在 Provider boundary 做双向映射，AgentLoop 保持协议中立。
+
+### 为什么熔断后不直接终止 Agent？
+
+重复调用通常是模型策略错误，不一定是 runtime 崩溃。熔断器阻止真实副作用并生成带 `loop_guard` 元数据的 error observation，模型还能改参数、换工具或给出解释；`max_steps` 仍是最终硬上限。
+
+### 超时应该放 Tool 内还是 Runtime 内？
+
+两层都可存在。Runtime 的统一超时保证任何第三方/MCP 工具都不会无限占用 loop；工具内部超时更了解子进程清理或网络语义。这里用 `asyncio.wait_for` 提供统一上限，具体工具仍应在取消时释放资源。
 
 ### Replay 为什么不重新执行工具？
 
@@ -59,18 +72,30 @@ Session 是逐字协议记录，用于继续当前对话；Memory 是经过选�
 
 ### Trace 会不会泄露敏感信息？
 
-Trace 包含 prompt、tool 参数和输出，因此应视为敏感本地数据。当前支持 `--no-trace`；生产化会进一步加入字段级 redaction、加密、保留期限和访问控制。
+Trace 包含 prompt、tool 参数和输出，因此始终应视为敏感本地数据。当前默认做字段级和常见 credential pattern 脱敏，也支持 `--no-trace`。生产化仍需加密、保留期限、访问控制和组织级 DLP；脱敏不是完整的数据安全边界。
+
+### 为什么不直接相信 MCP 的 `readOnlyHint`？
+
+MCP 规范把 tool annotations 定义为提示，并要求来自不可信 server 时不能据此做安全决策。Mini 默认把 MCP tool 当 mutation；只有配置 `trustToolAnnotations` 的 server 才能用 `readOnlyHint` 进入并行只读路径。权限规则仍独立执行。
+
+### HTTP MCP OAuth 做了哪些安全约束？
+
+使用 Authorization Code + PKCE，发现 protected resource 和 authorization server，token request 带 RFC 8707 resource audience，校验随机 state，并支持 refresh/scope step-up。Mini 额外拒绝未声明 PKCE S256 的 server，只监听 loopback callback，token 原子保存为 `0600`，也不允许 token passthrough。
+
+### Docker shell 为什么算 fail-closed？
+
+工具没有宿主机 subprocess 分支。Docker CLI、daemon或镜像不可用都会报错。容器只有 workspace bind mount，rootfs 只读、network none、capabilities 全移除，并有限制 CPU/memory/PID；timeout/cancel 会按随机 container name 强制删除。
 
 ### 当前安全性够生产吗？
 
-还不够。已有 workspace containment、规则审批和审计，但没有 OS sandbox。加入 shell 前必须补进程、文件系统、网络和资源隔离。
+用于本地 coding agent 已形成明确分层：普通文件工具有 workspace containment，shell 有 Docker 隔离，远端 MCP 有 OAuth 与审批。但还不是恶意多租户执行平台：Docker daemon/镜像供应链、跨进程锁、token keychain 加密和域名级 egress 仍需要部署层解决。
 
 ## 可继续扩展但不建议抢主线
 
 - OpenTelemetry exporter；
 - LLM/embedding compaction summarizer；
 - 加密 Trace 和 Memory；
-- sandboxed shell tool；
+- OpenTelemetry trace context exporter；
 - 基于录制 trace 的回归数据集。
 
 TUI、插件市场和多 Agent 应排在这些可靠性能力之后。

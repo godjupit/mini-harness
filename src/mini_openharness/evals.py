@@ -20,7 +20,7 @@ from mini_openharness.models import Message, ModelReply, ToolCall
 from mini_openharness.permissions import PermissionPolicy
 from mini_openharness.provider import OpenAICompatibleProvider
 from mini_openharness.skills import LoadSkillTool, SkillCatalog
-from mini_openharness.tools import default_tools
+from mini_openharness.tools import ToolRegistry, ToolResult, default_tools
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,7 @@ async def run_evals() -> list[EvalResult]:
         ("permission_block", _permission_block),
         ("context_compaction", _context_compaction),
         ("provider_retry_stream", _provider_retry_stream),
+        ("loop_guard", _loop_guard),
     ]
     results = []
     for name, scenario in scenarios:
@@ -342,3 +343,46 @@ async def _provider_retry_stream() -> EvalResult:
             )
     finally:
         await provider.close()
+
+
+async def _loop_guard() -> EvalResult:
+    calls = 0
+
+    class CountingTool:
+        name = "count"
+        description = "Count actual executions."
+        parameters = {"type": "object", "additionalProperties": False}
+        read_only = True
+
+        async def run(self, arguments, context):
+            nonlocal calls
+            del arguments, context
+            calls += 1
+            return ToolResult(str(calls))
+
+    with tempfile.TemporaryDirectory() as raw:
+        tools = ToolRegistry()
+        tools.register(CountingTool())
+        repeated = ModelReply(tool_calls=(ToolCall("same", "count", {}),))
+        provider = ScriptedProvider(
+            [repeated, repeated, repeated, ModelReply(content="Recovered from loop.")]
+        )
+        loop = AgentLoop(
+            provider=provider,
+            tools=tools,
+            workspace=raw,
+            max_repeated_tool_batches=2,
+        )
+        events = await _collect(loop, "Attempt a repeated tool loop")
+        passed = (
+            calls == 2
+            and any(event.kind == "loop_guard" for event in events)
+            and any(event.kind == "assistant" and "Recovered" in event.message for event in events)
+        )
+        return _result(
+            "loop_guard",
+            passed,
+            "identical tool batch was blocked and returned as an observation",
+            loop,
+            events,
+        )

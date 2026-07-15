@@ -13,12 +13,21 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from mini_openharness.compaction import ArtifactStore, ContextCompactor
-from mini_openharness.engine import AgentEvent, AgentLoop
+from mini_openharness.engine import AgentEvent, AgentLoop, MaxStepsExceeded
 from mini_openharness.evals import run_evals
 from mini_openharness.mcp import McpManager
 from mini_openharness.memory import MemoryStore, RememberTool, SearchMemoryTool
 from mini_openharness.permissions import PermissionPolicy
-from mini_openharness.provider import DemoProvider, OpenAICompatibleProvider
+from mini_openharness.provider import (
+    DemoProvider,
+    OpenAICompatibleProvider,
+    OpenAIResponsesProvider,
+)
+from mini_openharness.sandbox import (
+    DockerSandbox,
+    DockerSandboxConfig,
+    SandboxedShellTool,
+)
 from mini_openharness.session import SessionStore
 from mini_openharness.skills import LoadSkillTool, SkillCatalog
 from mini_openharness.tools import default_tools
@@ -32,6 +41,12 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace", default=".", help="Agent workspace boundary")
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
     parser.add_argument(
+        "--api-mode",
+        choices=("responses", "chat"),
+        default=os.getenv("OPENAI_API_MODE", "responses"),
+        help="OpenAI Responses API (default) or compatible Chat Completions",
+    )
+    parser.add_argument(
         "--base-url", default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     )
     parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY", ""))
@@ -41,6 +56,17 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yes", action="store_true", help="Approve every ask decision")
     parser.add_argument("--permission-config", help="JSON allow/deny/ask rules")
     parser.add_argument("--max-steps", type=int, default=12)
+    parser.add_argument("--tool-timeout", type=float, default=30.0)
+    parser.add_argument("--max-repeated-tool-batches", type=int, default=3)
+    parser.add_argument(
+        "--sandbox-shell",
+        action="store_true",
+        help="Enable Docker-only sandbox_shell; never falls back to the host",
+    )
+    parser.add_argument("--sandbox-image", default="alpine:3.20")
+    parser.add_argument("--sandbox-memory", default="512m")
+    parser.add_argument("--sandbox-cpus", type=float, default=1.0)
+    parser.add_argument("--sandbox-pids", type=int, default=128)
     parser.add_argument("--context-threshold", type=int, default=12_000)
     parser.add_argument("--keep-recent", type=int, default=6)
     parser.add_argument("--max-inline-output", type=int, default=8_000)
@@ -48,10 +74,15 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-cost", type=float, default=0.0, help="USD per million tokens")
     parser.add_argument("--session", help="JSON file used to resume and persist history")
     parser.add_argument("--skills-dir", help="Directory containing <name>/SKILL.md skills")
-    parser.add_argument("--mcp-config", help="JSON file containing stdio mcpServers")
+    parser.add_argument("--mcp-config", help="JSON file containing stdio/HTTP mcpServers")
     parser.add_argument("--memory", help="Durable memory JSON path")
     parser.add_argument("--trace-dir", help="JSONL trace directory")
     parser.add_argument("--no-trace", action="store_true", help="Disable run tracing")
+    parser.add_argument(
+        "--unsafe-trace-secrets",
+        action="store_true",
+        help="Disable default secret redaction in local traces",
+    )
     return parser
 
 
@@ -90,20 +121,24 @@ async def _run(args: argparse.Namespace) -> int:
     else:
         if not args.api_key:
             raise SystemExit("OPENAI_API_KEY is required unless --demo is used")
-        provider = OpenAICompatibleProvider(
+        provider_class = (
+            OpenAIResponsesProvider if args.api_mode == "responses" else OpenAICompatibleProvider
+        )
+        provider = provider_class(
             api_key=args.api_key,
             model=args.model,
             base_url=args.base_url,
             timeout=args.timeout,
             max_retries=args.max_retries,
         )
-        provider_name = "openai-compatible"
+        provider_name = f"openai-{args.api_mode}"
 
     trace_dir = Path(args.trace_dir or workspace / ".mini-oh" / "traces")
     tracer = None
     if not args.no_trace:
         tracer = TraceWriter(
             trace_dir,
+            redact_secrets=not args.unsafe_trace_secrets,
             metadata={
                 "prompt": prompt,
                 "workspace": str(workspace),
@@ -116,6 +151,17 @@ async def _run(args: argparse.Namespace) -> int:
     store = SessionStore(args.session) if args.session else None
     messages = store.load() if store else None
     tools = default_tools()
+    if args.sandbox_shell:
+        sandbox = DockerSandbox(
+            DockerSandboxConfig(
+                image=args.sandbox_image,
+                memory=args.sandbox_memory,
+                cpus=args.sandbox_cpus,
+                pids_limit=args.sandbox_pids,
+            )
+        )
+        await sandbox.ensure_available()
+        tools.register(SandboxedShellTool(sandbox))
     if skills.list():
         tools.register(LoadSkillTool(skills))
     tools.register(RememberTool(memory))
@@ -124,6 +170,7 @@ async def _run(args: argparse.Namespace) -> int:
     policy = _permission_policy(args)
     approval = _approval_callback(args)
     loop = None
+    exit_code = 1
     try:
         if mcp_manager:
             registered = await mcp_manager.connect_and_register(tools)
@@ -148,10 +195,22 @@ async def _run(args: argparse.Namespace) -> int:
             ),
             input_cost_per_million=args.input_cost,
             output_cost_per_million=args.output_cost,
+            tool_timeout_seconds=args.tool_timeout,
+            max_repeated_tool_batches=args.max_repeated_tool_batches,
             messages=messages or None,
         )
         async for event in loop.run(prompt):
             _print_event(event)
+            if event.kind == "done":
+                exit_code = 0
+            elif event.kind == "cancelled":
+                exit_code = 130
+            elif event.kind == "error":
+                _print_provider_hint(args, event)
+                exit_code = 1
+    except MaxStepsExceeded as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        exit_code = 1
     except KeyboardInterrupt:
         if loop:
             loop.cancel()
@@ -172,7 +231,16 @@ async def _run(args: argparse.Namespace) -> int:
             await close()
     if tracer:
         print(f"trace: {tracer.path}")
-    return 0
+    return exit_code
+
+
+def _print_provider_hint(args: argparse.Namespace, event: AgentEvent) -> None:
+    if args.api_mode == "responses" and "HTTP 404" in event.message:
+        print(
+            "hint: this endpoint may only support Chat Completions; retry with "
+            "--api-mode chat or set OPENAI_API_MODE=chat",
+            file=sys.stderr,
+        )
 
 
 def _permission_policy(args: argparse.Namespace) -> PermissionPolicy:
@@ -272,6 +340,8 @@ def _print_event(event: AgentEvent) -> None:
             f"compacted context: {event.data['before_tokens']} → "
             f"{event.data['after_tokens']} estimated tokens"
         )
+    elif event.kind == "loop_guard":
+        print(f"loop guard: {event.message}", file=sys.stderr)
     elif event.kind in {"error", "cancelled"}:
         print(f"{event.kind}: {event.message}", file=sys.stderr)
     elif event.kind == "done":

@@ -50,3 +50,27 @@ def test_finish_is_idempotent(tmp_path):
     events = list(TraceStore(tmp_path).read("once"))
     assert [event.kind for event in events].count("run_end") == 1
     assert events[-1].data["status"] == "completed"
+
+
+def test_trace_redacts_secret_keys_and_common_credentials_by_default(tmp_path):
+    writer = TraceWriter(
+        tmp_path,
+        run_id="redacted",
+        metadata={
+            "api_key": "top-secret",
+            "OPENAI_API_KEY": "sk-should-not-survive",
+            "input_tokens": 7,
+        },
+    )
+    writer.emit(
+        "request",
+        {"authorization": "Bearer abc.def", "text": "use sk-abcdefghijklmnop"},
+    )
+
+    events = list(TraceStore(tmp_path).read("redacted"))
+
+    assert events[0].data["api_key"] == "[REDACTED]"
+    assert events[0].data["OPENAI_API_KEY"] == "[REDACTED]"
+    assert events[0].data["input_tokens"] == 7
+    assert events[1].data["authorization"] == "[REDACTED]"
+    assert events[1].data["text"] == "use sk-[REDACTED]"

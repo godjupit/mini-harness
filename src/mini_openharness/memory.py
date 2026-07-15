@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from mini_openharness.tools import ToolContext, ToolResult
+from mini_openharness.tools import ResourceAccess, ToolContext, ToolResult
 
 
 @dataclass(frozen=True)
@@ -106,6 +106,10 @@ class RememberTool:
         memory = self.store.add(str(arguments["text"]), arguments.get("tags", ()))
         return ToolResult(f"Remembered: {memory.text}")
 
+    def resources(self, arguments: dict[str, Any], context: ToolContext):
+        del arguments, context
+        return (ResourceAccess(f"fs:{self.store.path.resolve()}", "write"),)
+
 
 class SearchMemoryTool:
     name = "search_memory"
@@ -125,6 +129,10 @@ class SearchMemoryTool:
         del context
         matches = self.store.search(str(arguments["query"]))
         return ToolResult("\n".join(memory.text for memory in matches) or "No relevant memories.")
+
+    def resources(self, arguments: dict[str, Any], context: ToolContext):
+        del arguments, context
+        return (ResourceAccess(f"fs:{self.store.path.resolve()}", "read"),)
 
 
 def _tokens(text: str) -> set[str]:

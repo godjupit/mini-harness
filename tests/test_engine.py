@@ -13,7 +13,13 @@ from mini_openharness.provider import (
     ProviderTextDelta,
 )
 from mini_openharness.compaction import ArtifactStore
-from mini_openharness.tools import ToolContext, ToolRegistry, ToolResult, default_tools
+from mini_openharness.tools import (
+    ResourceAccess,
+    ToolContext,
+    ToolRegistry,
+    ToolResult,
+    default_tools,
+)
 from mini_openharness.trace import TraceStore, TraceWriter
 
 
@@ -80,6 +86,165 @@ def test_parallel_tool_calls_preserve_result_order(tmp_path):
         ("a", "A"),
         ("b", "B"),
     ]
+
+
+def test_mutating_tool_batch_is_serialized(tmp_path):
+    active = 0
+    max_active = 0
+
+    class MutationTool:
+        name = "mutate"
+        description = "mutate shared state"
+        parameters = {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        }
+        read_only = False
+
+        async def run(self, arguments, context):
+            nonlocal active, max_active
+            del context
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return ToolResult(arguments["value"])
+
+    tools = ToolRegistry()
+    tools.register(MutationTool())
+    provider = ScriptedProvider(
+        [
+            ModelReply(
+                tool_calls=(
+                    ToolCall("a", "mutate", {"value": "A"}),
+                    ToolCall("b", "mutate", {"value": "B"}),
+                )
+            ),
+            ModelReply(content="done"),
+        ]
+    )
+    tracer = TraceWriter(tmp_path / "traces", run_id="locks")
+    loop = AgentLoop(
+        provider=provider,
+        tools=tools,
+        workspace=tmp_path,
+        allow_write=True,
+        tracer=tracer,
+    )
+
+    collect(loop, "mutate")
+
+    assert max_active == 1
+    trace = list(TraceStore(tmp_path / "traces").read("locks"))
+    acquired = [event for event in trace if event.kind == "resource_acquired"]
+    released = [event for event in trace if event.kind == "resource_released"]
+    assert len(acquired) == len(released) == 2
+    assert max(event.data["waited_ms"] for event in acquired) >= 1
+    assert all(event.data["resources"][0]["key"] == "*" for event in acquired)
+    assert all(event.data["held_ms"] >= 1 for event in released)
+
+
+def test_non_conflicting_mutations_run_in_parallel(tmp_path):
+    active = 0
+    max_active = 0
+
+    class PathMutationTool:
+        name = "path_mutate"
+        description = "mutate one path"
+        parameters = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "additionalProperties": False,
+        }
+        read_only = False
+
+        def resources(self, arguments, context):
+            return (
+                ResourceAccess(f"fs:{context.workspace / arguments['path']}", "write"),
+            )
+
+        async def run(self, arguments, context):
+            nonlocal active, max_active
+            del arguments, context
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+            return ToolResult("done")
+
+    tools = ToolRegistry()
+    tools.register(PathMutationTool())
+    provider = ScriptedProvider(
+        [
+            ModelReply(
+                tool_calls=(
+                    ToolCall("a", "path_mutate", {"path": "a.txt"}),
+                    ToolCall("b", "path_mutate", {"path": "b.txt"}),
+                )
+            ),
+            ModelReply(content="done"),
+        ]
+    )
+    loop = AgentLoop(provider=provider, tools=tools, workspace=tmp_path, allow_write=True)
+
+    collect(loop, "mutate separate files")
+
+    assert max_active == 2
+
+
+def test_repeated_tool_batch_is_blocked_but_model_can_recover(tmp_path):
+    calls = 0
+
+    class CountingTool:
+        name = "count"
+        description = "count executions"
+        parameters = {"type": "object", "additionalProperties": False}
+        read_only = True
+
+        async def run(self, arguments, context):
+            nonlocal calls
+            del arguments, context
+            calls += 1
+            return ToolResult(str(calls))
+
+    tools = ToolRegistry()
+    tools.register(CountingTool())
+    repeated = ModelReply(tool_calls=(ToolCall("same", "count", {}),))
+    provider = ScriptedProvider([repeated, repeated, repeated, ModelReply(content="recovered")])
+    loop = AgentLoop(
+        provider=provider,
+        tools=tools,
+        workspace=tmp_path,
+        max_repeated_tool_batches=2,
+    )
+
+    events = collect(loop, "do not loop")
+
+    assert calls == 2
+    assert any(event.kind == "loop_guard" for event in events)
+    assert "Repeated identical" in provider.requests[3][0][-1].content
+
+
+def test_loop_guard_counter_resets_for_each_user_run(tmp_path):
+    tools = default_tools()
+    call = ModelReply(tool_calls=(ToolCall("same", "list_files", {}),))
+    provider = ScriptedProvider(
+        [call, ModelReply(content="first"), call, ModelReply(content="second")]
+    )
+    loop = AgentLoop(
+        provider=provider,
+        tools=tools,
+        workspace=tmp_path,
+        max_repeated_tool_batches=1,
+    )
+
+    first = collect(loop, "first turn")
+    second = collect(loop, "second turn")
+
+    assert not any(event.kind == "loop_guard" for event in first + second)
 
 
 def test_unknown_tool_becomes_observation(tmp_path):
@@ -153,6 +318,42 @@ def test_agent_loop_trace_covers_model_tool_permission_usage_and_finish(tmp_path
     assert events[-1].kind == "run_end"
     assert events[-1].data["status"] == "completed"
     assert events[-1].data["estimated_cost"] == 0.000021
+
+
+def test_mcp_server_is_attributed_on_tool_start_and_end(tmp_path):
+    class McpEchoTool:
+        name = "mcp__remote__echo"
+        description = "echo"
+        parameters = {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        }
+        read_only = True
+
+        async def run(self, arguments, context):
+            del context
+            return ToolResult(arguments["text"])
+
+    tools = ToolRegistry()
+    tools.register(McpEchoTool())
+    provider = ScriptedProvider(
+        [
+            ModelReply(
+                tool_calls=(ToolCall("mcp-1", "mcp__remote__echo", {"text": "ok"}),)
+            ),
+            ModelReply(content="done"),
+        ]
+    )
+    tracer = TraceWriter(tmp_path / "traces", run_id="mcp-attribution")
+    loop = AgentLoop(provider=provider, tools=tools, workspace=tmp_path, tracer=tracer)
+
+    collect(loop, "call mcp")
+
+    trace = list(TraceStore(tmp_path / "traces").read("mcp-attribution"))
+    tool_events = [event for event in trace if event.kind in {"tool_start", "tool_end"}]
+    assert [event.data["mcp_server"] for event in tool_events] == ["remote", "remote"]
 
 
 def test_agent_loop_offloads_large_tool_output_before_next_model_call(tmp_path):

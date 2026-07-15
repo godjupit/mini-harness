@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -30,6 +31,7 @@ class TraceWriter:
         *,
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        redact_secrets: bool = True,
     ) -> None:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -39,6 +41,7 @@ class TraceWriter:
         self._sequence = 0
         self._lock = threading.Lock()
         self._finished_event: TraceEvent | None = None
+        self.redact_secrets = redact_secrets
         self.emit("run_start", {"run_id": self.run_id, **(metadata or {})})
 
     def emit(self, kind: str, data: dict[str, Any] | None = None) -> TraceEvent:
@@ -49,7 +52,11 @@ class TraceWriter:
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 elapsed_ms=int((time.monotonic() - self._started) * 1000),
                 kind=kind,
-                data=_json_safe(data or {}),
+                data=(
+                    _redact(_json_safe(data or {}))
+                    if self.redact_secrets
+                    else _json_safe(data or {})
+                ),
             )
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
@@ -154,3 +161,42 @@ def _json_safe(value: Any) -> Any:
     if hasattr(value, "to_dict"):
         return _json_safe(value.to_dict())
     return str(value)
+
+
+_SENSITIVE_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+    "access_token",
+    "refresh_token",
+    "client_secret",
+}
+_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+
+
+def _redact(value: Any, *, key: str | None = None) -> Any:
+    """Best-effort trace hygiene; permission and storage controls are still required."""
+    if key is not None and _is_sensitive_key(key):
+        return "[REDACTED]"
+    if isinstance(value, str):
+        value = _BEARER_PATTERN.sub("Bearer [REDACTED]", value)
+        return _OPENAI_KEY_PATTERN.sub("sk-[REDACTED]", value)
+    if isinstance(value, dict):
+        return {
+            str(item_key): _redact(item, key=str(item_key))
+            for item_key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    return value
+
+
+def _is_sensitive_key(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
+    return normalized in _SENSITIVE_KEYS or normalized.endswith(
+        ("_api_key", "_password", "_secret", "_access_token", "_refresh_token")
+    )

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from mini_openharness.tools import ToolContext, ToolResult
+from mini_openharness.tools import ResourceAccess, ToolContext, ToolResult
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,10 @@ class SkillCatalog:
             raise ValueError(f"Unknown skill: {name}")
         return skill.path.read_text(encoding="utf-8")
 
+    def path(self, name: str) -> Path | None:
+        skill = self._skills.get(name)
+        return skill.path if skill else None
+
     def prompt(self) -> str:
         if not self._skills:
             return ""
@@ -74,6 +78,13 @@ class LoadSkillTool:
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         del context
         return ToolResult(self.catalog.read(str(arguments["name"])))
+
+    def resources(self, arguments: dict[str, Any], context: ToolContext):
+        del context
+        path = self.catalog.path(str(arguments["name"]))
+        if path is None:
+            return (ResourceAccess(f"fs:{self.catalog.root}", "read", tree=True),)
+        return (ResourceAccess(f"fs:{path}", "read"),)
 
 
 def _frontmatter(content: str) -> dict[str, str]:

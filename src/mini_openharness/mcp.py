@@ -19,7 +19,7 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 from mini_openharness.mcp_auth import McpOAuthConfig, build_oauth_provider
-from mini_openharness.tools import ToolContext, ToolRegistry, ToolResult
+from mini_openharness.tools import ToolContext, ToolDescriptor, ToolRegistry, ToolResult
 
 
 @dataclass(frozen=True)
@@ -178,6 +178,11 @@ class McpTool:
         # MCP annotations are only hints. The manager honors readOnlyHint solely
         # when the server is explicitly configured as trusted.
         self.read_only = read_only
+        self.descriptor = ToolDescriptor(
+            source="mcp",
+            source_id=server_name,
+            effect="read" if read_only else "remote",
+        )
         self.session = session
 
     def resources(self, arguments: dict[str, Any], context: ToolContext):

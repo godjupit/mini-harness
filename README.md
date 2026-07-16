@@ -15,8 +15,36 @@ HookRegistry ─────────────┤ prompt / pre-tool / post
                          │
                   artifacts + compaction
 
-TraceWriter observes model, hooks, permission, tool, MCP, cost and final state.
+TraceSink observes model, hooks, permission, tool, MCP, cost and final state.
 ```
+
+`AgentLoop` 可以按顺序复用为多轮会话：消息和累计 token 保留，每次 `run()` 的取消事件、
+资源锁和重复调用计数则由独立 `RunState` 持有。同一个实例同一时刻只允许一个 active run；
+重叠消费第二个 `run()` 会抛出 `RunAlreadyActiveError`。需要并发会话时应创建不同的
+`AgentLoop` 实例。`cancel()` 只影响当前 active run，没有运行时是幂等 no-op。
+
+工具通过不可变 `ToolDescriptor` 显式声明来源、效应、破坏性和权限路径字段；权限、资源
+fallback、AgentEvent 与 Trace 共用这份元数据，不再由核心循环解析工具名。失败同时保留模型
+可读的 `output` 和机器可读的 `ToolFailure(code, stage, retryable)`：
+
+```python
+from mini_openharness import ToolDescriptor, ToolResult
+
+class PublishTool:
+    name = "publish"
+    description = "Publish one document."
+    parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+    descriptor = ToolDescriptor(
+        source="extension", effect="write", destructive=True, path_argument="path"
+    )
+
+    async def run(self, arguments, context):
+        return ToolResult("published")
+```
+
+没有 descriptor 的旧 Tool 暂时兼容：Registry 会集中推断旧 `read_only`/命名惯例，Trace 标记
+`descriptor_inferred=true`，未知 effect 和 resource resolver 失败仍按 mutation/global write lock
+处理。新扩展应始终声明 descriptor。
 
 ## 30 秒运行
 
@@ -60,15 +88,25 @@ mini-oh --api-mode chat --base-url https://compatible.example/v1 "分析架构"
 - compaction 前后 token 估算；
 - token usage、估算费用及最终成功/失败/取消原因。
 
-Trace 默认递归遮盖 `api_key`、`Authorization`、password/token 等敏感字段，并识别常见 Bearer/OpenAI key 文本。只有明确使用 `--unsafe-trace-secrets` 才会关闭脱敏；这只是本地日志卫生措施，不能替代目录权限、加密和保留策略。
+Trace 默认递归遮盖 `api_key`、`Authorization`、password/token 等敏感字段，并识别常见
+Bearer/OpenAI key 文本。本地 JSONL 以 owner-only `0600` 创建；只有明确使用
+`--unsafe-trace-secrets` 才会关闭脱敏。脱敏与文件权限仍不能替代磁盘加密和合理的保留周期。
 
 ```bash
 mini-oh trace list
 mini-oh trace show <run-id>
 mini-oh trace replay <run-id>
+mini-oh trace prune --older-than 30              # 只预览
+mini-oh trace prune --max-runs 100 --apply       # 明确执行
 ```
 
 `trace replay` 只按时间线渲染已记录事件，绝不重新请求模型或执行工具，因此不会重复写文件或调用远程 MCP 副作用。
+
+Runtime 只依赖 `TraceSink` 协议；默认的 `LocalJsonlTraceSink` 保留 `TraceWriter` 兼容别名，
+也提供不写盘的 `MemoryTraceSink`。交互运行默认采用 best-effort：写盘失败会告警一次并关闭该
+sink，不改变已发生的工具副作用；CI 或审计场景可使用 `--strict-trace`，让写失败抛出
+`TraceWriteError`。`trace prune` 永不删除仍处于 running 状态的 Trace，且没有 `--apply` 时只做
+dry-run。
 
 可用 `--input-cost`、`--output-cost` 设置每百万 token 的美元价格；`--no-trace` 可关闭记录。
 
@@ -223,10 +261,22 @@ Provider boundary 同时实现 OpenAI Responses 与 Chat Completions-compatible 
 - Trace 直接记录锁等待和持有时间，可证明冲突调用确实串行；
 - 每次调用有统一超时（默认 30 秒），超时转换为模型可恢复的 error observation；
 - 连续相同的 tool-call batch 默认最多真实执行 3 次，之后由 loop guard 熔断，但仍把错误回填给模型，让模型有机会换方案。
+- 每轮最多同时执行 8 个工具；`--max-concurrent-tools` 可调整，slot 等待与资源锁等待分别进入 Trace。
 
 ```bash
-mini-oh --tool-timeout 20 --max-repeated-tool-batches 2 "检查并修改项目"
+mini-oh --tool-timeout 20 --max-repeated-tool-batches 2 \
+  --max-concurrent-tools 4 "检查并修改项目"
 ```
+
+### 安全文件编辑
+
+`read_file` 会在本轮 RunState 中记录文件 SHA-256 快照。`edit_file` 只做严格文本替换：默认要求
+old_text 唯一匹配；多匹配必须显式 `replace_all=true`；文件在读取后被编辑器或其他进程修改时
+返回 `file_changed`，绝不覆盖。调用方也可提供 `expected_sha256`，无需依赖本轮 read。
+
+成功编辑通过同目录临时文件写入、flush/fsync、保留原 mode 后 `os.replace`；替换前再次校验
+目标 hash，失败会清理临时文件并保留原内容。这个机制是乐观并发控制，不是跨进程事务锁；
+外部进程仍应避免在同一瞬间写同一文件。
 
 ## 7. Skills 与 MCP
 

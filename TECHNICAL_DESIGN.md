@@ -37,6 +37,38 @@
 
 保留的差异不是遗漏：主项目面向完整产品，包含 TUI、插件、多 Agent 和多 Provider；Mini 面向面试与教学，把复杂度集中在 runtime correctness。主项目用 LLM 生成高质量 summary，Mini 保留确定性 summary，使离线 Demo、测试和错误恢复都不需要嵌套模型调用；未来可以通过 Compactor Protocol 注入 LLM summarizer，而不改变 AgentLoop。
 
+### Run 生命周期隔离
+
+`AgentLoop` 是顺序多轮 conversation owner，但不再把每轮状态散落在实例字段中。
+`ConversationState` 持有 messages 和累计 usage；每次 `run()` 新建 `RunState`，独占
+cancel event、`ResourceLockManager` 和重复 tool-batch 计数。`_execute_timed`、
+`_execute_all` 与 `_record_tool_batch` 显式接收该 state，因此这些 helper 不会读取“最近一次
+run”覆盖的共享字段。
+
+同一实例重叠运行没有可定义的 history 合并语义，Runtime 选择立即抛出
+`RunAlreadyActiveError`，而不是静默交错消息。active guard 在 async generator 的 `finally`
+中释放，覆盖成功、provider/tool 异常、max steps 和调用者 `aclose()`；不同 AgentLoop 实例仍可
+并发。`cancel()` 只设置当前 RunState 的 event，没有 active run 时不预取消下一轮。
+
+### Tool Descriptor 与结构化失败
+
+Tool 的 Python 执行 Protocol 仍只要求 name、description、parameters 和 `run()`；安全与归因
+元数据由不可变 `ToolDescriptor` 描述：source/source_id、effect、destructive、path_argument。
+Registry 在注册时解析一次，权限、read-only 判断、资源 fallback 和 Trace attribution 共用同一
+结果。内置文件工具、LoadSkill、MCP 和 Docker shell 都已显式声明；MCP 即使不使用
+`mcp__server__tool` 名称也能保留 server 归因。
+
+旧 Tool 在一个兼容周期内仍可注册。Registry 把旧 `read_only` 和名称惯例收敛到单一 legacy
+adapter，标记 `descriptor_inferred=true`；未知 effect 按 mutation 处理，动态 resource resolver
+抛错或返回无效结果时使用全局 tree write lock。核心权限与 AgentLoop 不再自行解析 MCP/Skill
+名称或猜 path/file_path/root，新工具通过 `path_argument` 明确权限路径。
+
+`ToolResult` 保留 output/is_error/metadata 三参数兼容，并新增可选 `ToolFailure`。Registry 的
+lookup、schema validate、authorize、execute timeout/exception 和 postprocess 都返回稳定的
+code/stage/retryable；旧工具返回 `is_error=True` 时归一化为 `tool_reported_error`。AgentEvent
+和 Trace 保存 failure 字典，模型 observation 仍是简洁自然语言，避免把内部错误类型耦合到
+prompt。
+
 ## 3. Resource-aware 工具调度
 
 ### 问题
@@ -58,9 +90,30 @@ tool calls ─→ resolve ResourceAccess(key, read/write, exact/tree)
 
 `asyncio.gather` 只负责保持 result 顺序；真正的并发安全由 `ResourceLockManager` 的 condition + active lock set 保证。多个资源先稳定排序，避免未来一个调用声明多资源时产生锁序死锁。
 
+总量边界由每轮 `RunState` 的 semaphore 单独承担，默认最大并发 8。每个调用先获取 slot，
+再运行 pre-hook、解析并等待 resource lock，退出时按 `finally` 释放；取消等待中的 batch 会取消
+所有 task，不泄漏 slot。`tool_slot_wait/acquired/released` 与
+`resource_wait/acquired/released` 分离记录，因此能区分总容量排队和资源冲突排队。值 1 提供
+确定性串行模式，但不改变 observation 的模型 call 顺序。
+
 Trace 为每次调用记录 `resource_wait`、`resource_acquired` 和 `resource_released`；后两者分别包含 `waited_ms` 与 `held_ms`。因此可以区分模型是否并行提交、锁是否造成等待，以及慢点发生在排队还是工具执行阶段。
 
 复杂度：当前 active lock 冲突检测为 O(r×a)，适合 Mini 的小 batch。生产规模可换成 trie + keyed RW lock，并加入 FIFO waiter 防止写饥饿。
+
+### 文件快照与原子 EditFile
+
+每轮 RunState 拥有独立 `FileSnapshotStore`。`read_file` 成功读取 bytes 后记录 resolved path、
+SHA-256、size 和 mtime；`write_file` 成功后刷新快照。`edit_file` 要求本轮快照或调用者显式
+提供 expected_sha256，当前内容 hash 不同即返回 `file_changed`。
+
+编辑只支持 exact old_text/new_text：零匹配返回 `match_not_found`，多匹配默认返回
+`ambiguous_match`，显式 replace_all 才批量替换。它不做模糊匹配、quote normalization 或完整
+unified-diff 解析，避免模型在不确定位置修改。
+
+写入在目标同目录创建临时文件，写 bytes、flush/fsync、复制原 mode，并在 `os.replace` 前再次
+读取目标 hash 缩小 TOCTOU 窗口；成功后 fsync 目录（平台不支持时 best effort）。任何 replace
+错误都会清理 temp 并返回 `atomic_replace_failed`，目标原内容保持。该设计降低半写和旧内容
+覆盖风险，但不声称提供数据库事务或恶意跨进程隔离。
 
 ## 4. Responses Provider
 
@@ -140,15 +193,26 @@ Shell 被声明为 workspace tree mutation，因此与任意 workspace 文件访
 
 容器路径 `/workspace/foo` 只存在于 sandbox 视角；宿主侧文件工具必须使用 workspace-relative 的 `foo`。该映射写入 tool description，避免模型把容器绝对路径误传给 `read_file`。
 
-## 8. Trace 脱敏
+## 8. Trace Sink、本地治理与脱敏
 
-Trace 是 append-only 审计证据，同时也是高敏感数据。`TraceWriter` 在序列化后递归处理：
+Trace 是 append-only 审计证据，同时也是高敏感数据。AgentLoop、HookExecutor 和 ToolContext
+只依赖极小 `TraceSink` Protocol；默认实现是 `LocalJsonlTraceSink`，旧名称 `TraceWriter`
+保留为兼容 alias，测试和嵌入场景可使用 `MemoryTraceSink`。本地实现在线程锁内分配 sequence
+并写完整 JSONL 行，因此并发工具不会造成行交错，`finish()` 也保持幂等。
+
+本地文件通过 `os.open` 以 `0600` 创建并在每次 append 时重新收紧 mode；序列化前递归处理：
 
 - 整字段遮盖：`api_key`、`authorization`、`password`、`secret`、access/refresh token 等；
 - 字符串 pattern 遮盖：Bearer credential 和常见 `sk-...` key；
 - 不把 `input_tokens` 这类业务统计误判为 credential。
 
-默认安全、显式降级：只有 CLI 参数 `--unsafe-trace-secrets` 才关闭。该实现是 best effort，不可能识别所有业务秘密，因此 Trace 仍需最小文件权限、加密、TTL 和访问审计。
+默认安全、显式降级：只有 CLI 参数 `--unsafe-trace-secrets` 才关闭脱敏。写入策略默认
+best-effort，第一次 I/O 失败经 callback 或 RuntimeWarning 报告并禁用 sink；`--strict-trace`
+改为抛出 typed `TraceWriteError`，适合 CI/compliance。`TraceStore.prune()` 支持按天数或最多保留
+运行数清理完成态记录，CLI 默认 dry-run，必须加 `--apply` 才删除，并始终跳过 active run。
+
+这些机制仍不可能识别所有业务秘密，也不提供 at-rest 加密；部署方仍需管理 Trace 目录访问、
+磁盘加密和保留周期。
 
 ## 9. 可扩展 Hook 与完成验证
 

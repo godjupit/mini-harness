@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
+from uuid import uuid4
 
 from mini_openharness.compaction import ArtifactStore, ContextCompactor
 from mini_openharness.hooks import HookEvent, HookExecutor, HookRegistry
@@ -23,8 +24,15 @@ from mini_openharness.provider import (
     ProviderRetry,
     ProviderTextDelta,
 )
-from mini_openharness.tools import ResourceLockManager, ToolContext, ToolRegistry, ToolResult
-from mini_openharness.trace import TraceWriter
+from mini_openharness.tools import (
+    FileSnapshotStore,
+    ResourceLockManager,
+    ToolContext,
+    ToolFailure,
+    ToolRegistry,
+    ToolResult,
+)
+from mini_openharness.trace import TraceSink
 
 
 EventKind = Literal[
@@ -50,7 +58,33 @@ class AgentEvent:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ConversationState:
+    """State that intentionally survives across sequential user turns."""
+
+    messages: list[Message]
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
+class RunState:
+    """State owned by exactly one active AgentLoop.run invocation."""
+
+    run_id: str
+    cancel_event: asyncio.Event
+    resource_locks: ResourceLockManager
+    tool_slots: asyncio.Semaphore
+    file_snapshots: FileSnapshotStore
+    last_tool_batch: str | None = None
+    repeated_tool_batches: int = 0
+
+
 class MaxStepsExceeded(RuntimeError):
+    pass
+
+
+class RunAlreadyActiveError(RuntimeError):
     pass
 
 
@@ -68,13 +102,14 @@ class AgentLoop:
         allow_write: bool = False,
         permission_policy: PermissionPolicy | None = None,
         approval_callback: ApprovalCallback | None = None,
-        tracer: TraceWriter | None = None,
+        tracer: TraceSink | None = None,
         compactor: ContextCompactor | None = None,
         artifact_store: ArtifactStore | None = None,
         input_cost_per_million: float = 0.0,
         output_cost_per_million: float = 0.0,
         tool_timeout_seconds: float = 30.0,
         max_repeated_tool_batches: int = 3,
+        max_concurrent_tools: int = 8,
         hooks: HookRegistry | None = None,
         messages: list[Message] | None = None,
     ) -> None:
@@ -84,6 +119,8 @@ class AgentLoop:
             raise ValueError("tool_timeout_seconds must be positive")
         if max_repeated_tool_batches < 1:
             raise ValueError("max_repeated_tool_batches must be at least 1")
+        if max_concurrent_tools < 1:
+            raise ValueError("max_concurrent_tools must be at least 1")
         self.provider = provider
         self.tools = tools
         self.workspace = Path(workspace).resolve()
@@ -98,27 +135,36 @@ class AgentLoop:
         self.output_cost_per_million = output_cost_per_million
         self.tool_timeout_seconds = tool_timeout_seconds
         self.max_repeated_tool_batches = max_repeated_tool_batches
+        self.max_concurrent_tools = max_concurrent_tools
         self.hooks = hooks if hooks is not None else HookRegistry()
         self.hook_executor = HookExecutor(
             self.hooks,
             workspace=self.workspace,
             tracer=self.tracer,
         )
-        self.cancel_event = asyncio.Event()
         if messages:
-            self.messages = list(messages)
+            conversation_messages = list(messages)
             current_system = Message("system", system_prompt)
-            if self.messages[0].role == "system":
-                self.messages[0] = current_system
+            if conversation_messages[0].role == "system":
+                conversation_messages[0] = current_system
             else:
-                self.messages.insert(0, current_system)
+                conversation_messages.insert(0, current_system)
         else:
-            self.messages = [Message("system", system_prompt)]
-        self.input_tokens = 0
-        self.output_tokens = 0
-        self._last_tool_batch: str | None = None
-        self._repeated_tool_batches = 0
-        self._resource_locks = ResourceLockManager()
+            conversation_messages = [Message("system", system_prompt)]
+        self._conversation = ConversationState(conversation_messages)
+        self._active_run: RunState | None = None
+
+    @property
+    def messages(self) -> list[Message]:
+        return self._conversation.messages
+
+    @property
+    def input_tokens(self) -> int:
+        return self._conversation.input_tokens
+
+    @property
+    def output_tokens(self) -> int:
+        return self._conversation.output_tokens
 
     @property
     def estimated_cost(self) -> float:
@@ -128,15 +174,37 @@ class AgentLoop:
         ) / 1_000_000
 
     def cancel(self) -> None:
-        self.cancel_event.set()
+        if self._active_run is not None:
+            self._active_run.cancel_event.set()
 
     async def run(self, prompt: str) -> AsyncIterator[AgentEvent]:
+        if self._active_run is not None:
+            raise RunAlreadyActiveError(
+                "This AgentLoop already has an active run; use a separate instance for concurrency"
+            )
+
         # asyncio synchronization primitives bind to the active loop. A reusable
         # AgentLoop may be called from a new loop (for example two asyncio.run turns).
-        self.cancel_event = asyncio.Event()
-        self._resource_locks = ResourceLockManager()
-        self._last_tool_batch = None
-        self._repeated_tool_batches = 0
+        state = RunState(
+            run_id=uuid4().hex,
+            cancel_event=asyncio.Event(),
+            resource_locks=ResourceLockManager(),
+            tool_slots=asyncio.Semaphore(self.max_concurrent_tools),
+            file_snapshots=FileSnapshotStore(),
+        )
+        self._active_run = state
+        execution = self._run(prompt, state)
+        try:
+            async for event in execution:
+                yield event
+        finally:
+            try:
+                await execution.aclose()
+            finally:
+                if self._active_run is state:
+                    self._active_run = None
+
+    async def _run(self, prompt: str, state: RunState) -> AsyncIterator[AgentEvent]:
         prompt_hooks = await self.hook_executor.execute(
             HookEvent.USER_PROMPT_SUBMIT,
             {"prompt": prompt},
@@ -158,11 +226,12 @@ class AgentLoop:
             approval_callback=self.approval_callback,
             tracer=self.tracer,
             tool_timeout_seconds=self.tool_timeout_seconds,
+            file_snapshots=state.file_snapshots,
         )
         reactive_context_retry_attempted = False
 
         for step in range(1, self.max_steps + 1):
-            if self.cancel_event.is_set():
+            if state.cancel_event.is_set():
                 yield self._cancelled_event()
                 return
             compact_event = self._compact_if_needed()
@@ -192,7 +261,7 @@ class AgentLoop:
                         async for provider_event in stream_method(
                             self.messages,
                             self.tools.schemas(),
-                            cancel_event=self.cancel_event,
+                            cancel_event=state.cancel_event,
                         ):
                             if isinstance(provider_event, ProviderTextDelta):
                                 streamed = True
@@ -260,8 +329,8 @@ class AgentLoop:
                 yield AgentEvent("error", error, {"step": step})
                 return
 
-            self.input_tokens += reply.input_tokens
-            self.output_tokens += reply.output_tokens
+            self._conversation.input_tokens += reply.input_tokens
+            self._conversation.output_tokens += reply.output_tokens
             self.messages.append(Message("assistant", reply.content, tool_calls=reply.tool_calls))
             if self.tracer:
                 self.tracer.emit(
@@ -320,16 +389,13 @@ class AgentLoop:
                     "id": call.id,
                     "name": call.name,
                     "input": call.arguments,
-                    "source": self.tools.source(call.name),
+                    **self.tools.attribution(call.name),
                 }
-                if call.name.startswith("mcp__"):
-                    segments = call.name.split("__", 2)
-                    data["mcp_server"] = segments[1] if len(segments) > 2 else "unknown"
                 if self.tracer:
                     self.tracer.emit("tool_start", data)
                 yield AgentEvent("tool_start", data=data)
 
-            repeated = self._record_tool_batch(reply.tool_calls)
+            repeated = self._record_tool_batch(reply.tool_calls, state)
             if repeated > self.max_repeated_tool_batches:
                 reason = (
                     "Repeated identical tool batch blocked after "
@@ -340,17 +406,39 @@ class AgentLoop:
                     self.tracer.emit("loop_guard", guard_data)
                 yield AgentEvent("loop_guard", reason, guard_data)
                 timed_results = [
-                    (ToolResult(reason, is_error=True, metadata={"loop_guard": True}), 0)
+                    (
+                        ToolResult.fail(
+                            reason,
+                            code="loop_guard",
+                            stage="execute",
+                            metadata={"loop_guard": True},
+                        ),
+                        0,
+                    )
                     for _ in reply.tool_calls
                 ]
             else:
-                timed_results = await self._execute_all(reply.tool_calls, context)
+                timed_results = await self._execute_all(reply.tool_calls, context, state)
             if timed_results is None:
                 yield self._cancelled_event()
                 return
             for call, (result, elapsed_ms) in zip(reply.tool_calls, timed_results):
                 inline_output, artifact_path = self._offload(call.id, result.output)
-                stored_result = ToolResult(inline_output, result.is_error, dict(result.metadata))
+                stored_failure = result.failure
+                if stored_failure is not None and inline_output != result.output:
+                    stored_failure = ToolFailure(
+                        code=stored_failure.code,
+                        stage=stored_failure.stage,
+                        message=inline_output,
+                        retryable=stored_failure.retryable,
+                        detail=dict(stored_failure.detail),
+                    )
+                stored_result = ToolResult(
+                    inline_output,
+                    result.is_error,
+                    dict(result.metadata),
+                    stored_failure,
+                )
                 if artifact_path is not None:
                     stored_result.metadata["artifact_path"] = str(artifact_path)
                     stored_result.metadata["original_chars"] = len(result.output)
@@ -358,18 +446,20 @@ class AgentLoop:
                 data = {
                     "id": call.id,
                     "name": call.name,
-                    "source": self.tools.source(call.name),
+                    **self.tools.attribution(call.name),
                     "is_error": stored_result.is_error,
                     "elapsed_ms": elapsed_ms,
                     "output": stored_result.output,
                     **stored_result.metadata,
                 }
-                if call.name.startswith("mcp__"):
-                    segments = call.name.split("__", 2)
-                    data["mcp_server"] = segments[1] if len(segments) > 2 else "unknown"
+                if stored_result.failure is not None:
+                    data["failure"] = stored_result.failure.to_dict()
                 if self.tracer:
                     self.tracer.emit("tool_end", data)
-                    if call.name == "load_skill" and not stored_result.is_error:
+                    if (
+                        self.tools.descriptor(call.name).source == "skill"
+                        and not stored_result.is_error
+                    ):
                         self.tracer.emit("skill_loaded", {"name": call.arguments.get("name")})
                 yield AgentEvent("tool_end", stored_result.output, data)
 
@@ -382,8 +472,45 @@ class AgentLoop:
         self,
         call: ToolCall,
         context: ToolContext,
+        state: RunState,
     ) -> tuple[ToolResult, int]:
         started = time.monotonic()
+        slot_data = {
+            "tool": call.name,
+            "tool_call_id": call.id,
+            "max_concurrent_tools": self.max_concurrent_tools,
+        }
+        if self.tracer:
+            self.tracer.emit("tool_slot_wait", slot_data)
+        async with state.tool_slots:
+            acquired = time.monotonic()
+            if self.tracer:
+                self.tracer.emit(
+                    "tool_slot_acquired",
+                    {
+                        **slot_data,
+                        "waited_ms": int((acquired - started) * 1000),
+                    },
+                )
+            try:
+                return await self._execute_with_slot(call, context, state, started)
+            finally:
+                if self.tracer:
+                    self.tracer.emit(
+                        "tool_slot_released",
+                        {
+                            **slot_data,
+                            "held_ms": int((time.monotonic() - acquired) * 1000),
+                        },
+                    )
+
+    async def _execute_with_slot(
+        self,
+        call: ToolCall,
+        context: ToolContext,
+        state: RunState,
+        started: float,
+    ) -> tuple[ToolResult, int]:
         name = call.name
         arguments = call.arguments
         pre_hooks = await self.hook_executor.execute(
@@ -398,9 +525,10 @@ class AgentLoop:
         if pre_hooks.blocked:
             reason = pre_hooks.reason or "tool call rejected by hook"
             return (
-                ToolResult(
+                ToolResult.fail(
                     f"Hook blocked {name}: {reason}",
-                    is_error=True,
+                    code="hook_blocked",
+                    stage="authorize",
                     metadata={"hook_blocked": True, "hook_event": HookEvent.PRE_TOOL_USE.value},
                 ),
                 int((time.monotonic() - started) * 1000),
@@ -408,9 +536,10 @@ class AgentLoop:
         arguments = pre_hooks.payload.get("tool_input", arguments)
         if not isinstance(arguments, dict):
             return (
-                ToolResult(
+                ToolResult.fail(
                     f"Hook produced invalid tool_input for {name}: expected an object",
-                    is_error=True,
+                    code="invalid_hook_output",
+                    stage="validate",
                     metadata={"hook_invalid_payload": True},
                 ),
                 int((time.monotonic() - started) * 1000),
@@ -428,7 +557,7 @@ class AgentLoop:
                     "resources": resource_data,
                 },
             )
-        async with self._resource_locks.acquire(resources):
+        async with state.resource_locks.acquire(resources):
             acquired = time.monotonic()
             if self.tracer:
                 self.tracer.emit(
@@ -456,6 +585,7 @@ class AgentLoop:
                 result.output,
                 result.is_error,
                 {**result.metadata, "hook_modified_input": True, "executed_input": arguments},
+                result.failure,
             )
         post_hooks = await self.hook_executor.execute(
             HookEvent.POST_TOOL_USE,
@@ -471,9 +601,10 @@ class AgentLoop:
         )
         if post_hooks.blocked:
             reason = post_hooks.reason or "tool result rejected by hook"
-            result = ToolResult(
+            result = ToolResult.fail(
                 f"Hook blocked result from {name}: {reason}",
-                is_error=True,
+                code="hook_blocked",
+                stage="postprocess",
                 metadata={
                     **result.metadata,
                     "hook_blocked": True,
@@ -490,23 +621,41 @@ class AgentLoop:
                 or not isinstance(metadata, dict)
                 or not isinstance(is_error, bool)
             ):
-                result = ToolResult(
+                result = ToolResult.fail(
                     f"Hook produced an invalid post_tool_use payload for {name}",
-                    is_error=True,
+                    code="invalid_hook_output",
+                    stage="postprocess",
                     metadata={"hook_invalid_payload": True},
                 )
             else:
-                result = ToolResult(output, is_error, dict(metadata))
+                failure = result.failure if is_error else None
+                if failure is not None and output != result.output:
+                    failure = ToolFailure(
+                        code=failure.code,
+                        stage=failure.stage,
+                        message=output,
+                        retryable=failure.retryable,
+                        detail=dict(failure.detail),
+                    )
+                if is_error and failure is None:
+                    failure = ToolFailure(
+                        code="hook_reported_error",
+                        stage="postprocess",
+                        message=output,
+                    )
+                result = ToolResult(output, is_error, dict(metadata), failure)
         return result, int((time.monotonic() - started) * 1000)
 
-    async def _execute_all(self, calls, context):
+    async def _execute_all(self, calls, context, state: RunState):
         async def execute_batch():
             # Every call starts concurrently; hierarchical read/write resource locks
             # serialize only conflicting effects while gather preserves result order.
-            return await asyncio.gather(*(self._execute_timed(call, context) for call in calls))
+            return await asyncio.gather(
+                *(self._execute_timed(call, context, state) for call in calls)
+            )
 
         gather_task = asyncio.create_task(execute_batch())
-        cancel_task = asyncio.create_task(self.cancel_event.wait())
+        cancel_task = asyncio.create_task(state.cancel_event.wait())
         done, _ = await asyncio.wait(
             {gather_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
         )
@@ -520,19 +669,19 @@ class AgentLoop:
             await cancel_task
         return await gather_task
 
-    def _record_tool_batch(self, calls) -> int:
+    def _record_tool_batch(self, calls, state: RunState) -> int:
         signature = json.dumps(
             [{"name": call.name, "arguments": call.arguments} for call in calls],
             sort_keys=True,
             ensure_ascii=False,
             default=str,
         )
-        if signature == self._last_tool_batch:
-            self._repeated_tool_batches += 1
+        if signature == state.last_tool_batch:
+            state.repeated_tool_batches += 1
         else:
-            self._last_tool_batch = signature
-            self._repeated_tool_batches = 1
-        return self._repeated_tool_batches
+            state.last_tool_batch = signature
+            state.repeated_tool_batches = 1
+        return state.repeated_tool_batches
 
     def _offload(self, call_id: str, output: str) -> tuple[str, Path | None]:
         if self.artifact_store is None:
@@ -551,7 +700,7 @@ class AgentLoop:
         result = self.compactor.compact(self.messages, force=force)
         if not result.compacted:
             return None
-        self.messages = result.messages
+        self._conversation.messages = result.messages
         data = {
             "before_tokens": result.before_tokens,
             "after_tokens": result.after_tokens,

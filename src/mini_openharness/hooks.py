@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Protocol
 
-from mini_openharness.trace import TraceWriter
+from mini_openharness.trace import TraceSink
 
 
 class HookEvent(str, Enum):
@@ -217,7 +217,7 @@ class HookExecutor:
         registry: HookRegistry,
         *,
         workspace: str | Path,
-        tracer: TraceWriter | None = None,
+        tracer: TraceSink | None = None,
     ) -> None:
         self.registry = registry
         self.workspace = Path(workspace).resolve()

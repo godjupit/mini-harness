@@ -1,5 +1,7 @@
 import os
 
+import pytest
+
 import mini_openharness.cli as cli
 from mini_openharness.cli import _load_environment, build_run_parser
 from mini_openharness.provider import ProviderError
@@ -25,16 +27,29 @@ def test_cli_defaults_to_responses_and_sandbox_shell_is_opt_in(monkeypatch):
 
     defaults = build_run_parser().parse_args([])
     sandboxed = build_run_parser().parse_args(["--sandbox-shell"])
+    strict_trace = build_run_parser().parse_args(["--strict-trace"])
 
     assert defaults.api_mode == "responses"
     assert defaults.sandbox_shell is False
+    assert defaults.strict_trace is False
     assert sandboxed.sandbox_shell is True
+    assert strict_trace.strict_trace is True
 
 
 def test_cli_accepts_hook_configuration():
     args = build_run_parser().parse_args(["--hooks-config", "hooks.json"])
 
     assert args.hooks_config == "hooks.json"
+
+
+def test_cli_accepts_only_positive_tool_concurrency():
+    defaults = build_run_parser().parse_args([])
+    configured = build_run_parser().parse_args(["--max-concurrent-tools", "3"])
+
+    assert defaults.max_concurrent_tools == 8
+    assert configured.max_concurrent_tools == 3
+    with pytest.raises(SystemExit):
+        build_run_parser().parse_args(["--max-concurrent-tools", "0"])
 
 
 def test_cli_provider_error_returns_nonzero_and_hints_on_responses_404(

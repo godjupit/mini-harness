@@ -65,6 +65,7 @@ class PermissionPolicy:
         tool_name: str,
         read_only: bool,
         path: str | None = None,
+        source: str = "local",
     ) -> PermissionDecision:
         candidate_path = path or ""
         for rule in self.rules:
@@ -78,9 +79,9 @@ class PermissionPolicy:
                 )
         if read_only:
             return PermissionDecision("allow", "read-only tools are allowed")
-        source = "MCP tools" if tool_name.startswith("mcp__") else "mutating tools"
+        category = "MCP tools" if source == "mcp" else "mutating tools"
         return PermissionDecision(
-            self.default_mutation, f"{source} default to {self.default_mutation}"
+            self.default_mutation, f"{category} default to {self.default_mutation}"
         )
 
 

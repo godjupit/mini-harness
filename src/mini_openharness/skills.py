@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from mini_openharness.tools import ResourceAccess, ToolContext, ToolResult
+from mini_openharness.tools import ResourceAccess, ToolContext, ToolDescriptor, ToolResult
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,7 @@ class LoadSkillTool:
     name = "load_skill"
     description = "Load the full instructions for one available skill."
     read_only = True
+    descriptor = ToolDescriptor(source="skill", effect="read")
     parameters = {
         "type": "object",
         "properties": {"name": {"type": "string"}},

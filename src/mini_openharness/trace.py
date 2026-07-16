@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
+import warnings
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping, Protocol
 from uuid import uuid4
 
 
@@ -22,7 +24,21 @@ class TraceEvent:
     data: dict[str, Any]
 
 
-class TraceWriter:
+class TraceSink(Protocol):
+    run_id: str
+
+    def emit(self, kind: str, data: Mapping[str, Any] | None = None) -> TraceEvent: ...
+
+    def finish(
+        self, *, status: str, data: Mapping[str, Any] | None = None
+    ) -> TraceEvent: ...
+
+
+class TraceWriteError(RuntimeError):
+    pass
+
+
+class LocalJsonlTraceSink:
     """Write one run as JSONL; safe to call from concurrent tool tasks."""
 
     def __init__(
@@ -32,19 +48,35 @@ class TraceWriter:
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         redact_secrets: bool = True,
+        strict: bool = False,
+        on_error: Callable[[str], None] | None = None,
     ) -> None:
         self.root = Path(root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id or _new_run_id()
         self.path = self.root / f"{self.run_id}.jsonl"
         self._started = time.monotonic()
         self._sequence = 0
         self._lock = threading.Lock()
+        self._finish_lock = threading.Lock()
         self._finished_event: TraceEvent | None = None
         self.redact_secrets = redact_secrets
+        self.strict = strict
+        self.on_error = on_error
+        self._disabled = False
+        self._reported_error = False
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            descriptor = self._open_append()
+            os.close(descriptor)
+        except OSError as exc:
+            self._handle_write_error(exc)
         self.emit("run_start", {"run_id": self.run_id, **(metadata or {})})
 
-    def emit(self, kind: str, data: dict[str, Any] | None = None) -> TraceEvent:
+    @property
+    def disabled(self) -> bool:
+        return self._disabled
+
+    def emit(self, kind: str, data: Mapping[str, Any] | None = None) -> TraceEvent:
         with self._lock:
             self._sequence += 1
             event = TraceEvent(
@@ -53,19 +85,108 @@ class TraceWriter:
                 elapsed_ms=int((time.monotonic() - self._started) * 1000),
                 kind=kind,
                 data=(
-                    _redact(_json_safe(data or {}))
+                    _redact(_json_safe(dict(data or {})))
                     if self.redact_secrets
-                    else _json_safe(data or {})
+                    else _json_safe(dict(data or {}))
                 ),
             )
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
+            if not self._disabled:
+                line = (json.dumps(asdict(event), ensure_ascii=False) + "\n").encode("utf-8")
+                try:
+                    self._append_line(line)
+                except OSError as exc:
+                    self._handle_write_error(exc)
             return event
 
-    def finish(self, *, status: str, data: dict[str, Any] | None = None) -> TraceEvent:
-        if self._finished_event is None:
-            self._finished_event = self.emit("run_end", {"status": status, **(data or {})})
-        return self._finished_event
+    def finish(
+        self, *, status: str, data: Mapping[str, Any] | None = None
+    ) -> TraceEvent:
+        with self._finish_lock:
+            if self._finished_event is None:
+                self._finished_event = self.emit(
+                    "run_end", {"status": status, **dict(data or {})}
+                )
+            return self._finished_event
+
+    def _open_append(self) -> int:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.path, flags, 0o600)
+        os.fchmod(descriptor, 0o600)
+        return descriptor
+
+    def _append_line(self, line: bytes) -> None:
+        descriptor = self._open_append()
+        try:
+            view = memoryview(line)
+            while view:
+                written = os.write(descriptor, view)
+                if written == 0:
+                    raise OSError("trace write returned zero bytes")
+                view = view[written:]
+        finally:
+            os.close(descriptor)
+
+    def _handle_write_error(self, exc: OSError) -> None:
+        message = f"Trace disabled after write failure for {self.path}: {exc}"
+        if self.strict:
+            raise TraceWriteError(message) from exc
+        self._disabled = True
+        if self._reported_error:
+            return
+        self._reported_error = True
+        if self.on_error is not None:
+            try:
+                self.on_error(message)
+                return
+            except Exception:
+                pass
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+
+
+TraceWriter = LocalJsonlTraceSink
+
+
+class MemoryTraceSink:
+    """In-memory TraceSink for tests and embedding without filesystem writes."""
+
+    def __init__(
+        self,
+        *,
+        run_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        redact_secrets: bool = True,
+    ) -> None:
+        self.run_id = run_id or _new_run_id()
+        self.events: list[TraceEvent] = []
+        self.redact_secrets = redact_secrets
+        self._started = time.monotonic()
+        self._lock = threading.Lock()
+        self._finish_lock = threading.Lock()
+        self._finished_event: TraceEvent | None = None
+        self.emit("run_start", {"run_id": self.run_id, **dict(metadata or {})})
+
+    def emit(self, kind: str, data: Mapping[str, Any] | None = None) -> TraceEvent:
+        with self._lock:
+            payload = _json_safe(dict(data or {}))
+            event = TraceEvent(
+                sequence=len(self.events) + 1,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                elapsed_ms=int((time.monotonic() - self._started) * 1000),
+                kind=kind,
+                data=_redact(payload) if self.redact_secrets else payload,
+            )
+            self.events.append(event)
+            return event
+
+    def finish(
+        self, *, status: str, data: Mapping[str, Any] | None = None
+    ) -> TraceEvent:
+        with self._finish_lock:
+            if self._finished_event is None:
+                self._finished_event = self.emit(
+                    "run_end", {"status": status, **dict(data or {})}
+                )
+            return self._finished_event
 
 
 @dataclass(frozen=True)
@@ -115,7 +236,13 @@ class TraceStore:
         path = self.root / f"{run_id}.jsonl"
         if not path.is_file():
             raise FileNotFoundError(f"Trace not found: {run_id}")
-        for line in path.read_text(encoding="utf-8").splitlines():
+        content = path.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        if content and not content.endswith("\n"):
+            # A store may inspect an active trace between partial os.write calls.
+            # LocalJsonlTraceSink always terminates complete records with a newline.
+            lines = lines[:-1]
+        for line in lines:
             if not line.strip():
                 continue
             payload = json.loads(line)
@@ -131,6 +258,32 @@ class TraceStore:
         """Render recorded events only; replay never invokes providers or tools."""
         for event in self.read(run_id):
             yield render_event(event)
+
+    def prune(
+        self,
+        *,
+        older_than_days: float | None = None,
+        max_runs: int | None = None,
+        dry_run: bool = True,
+    ) -> list[Path]:
+        if older_than_days is not None and older_than_days <= 0:
+            raise ValueError("older_than_days must be positive")
+        if max_runs is not None and max_runs < 1:
+            raise ValueError("max_runs must be at least 1")
+        completed = [summary for summary in self.list() if summary.status != "running"]
+        candidates: set[Path] = set()
+        if older_than_days is not None:
+            cutoff = time.time() - older_than_days * 86_400
+            candidates.update(
+                summary.path for summary in completed if summary.path.stat().st_mtime < cutoff
+            )
+        if max_runs is not None:
+            candidates.update(summary.path for summary in completed[max_runs:])
+        ordered = sorted(candidates, key=lambda path: path.stat().st_mtime)
+        if not dry_run:
+            for path in ordered:
+                path.unlink(missing_ok=True)
+        return ordered
 
 
 def render_event(event: TraceEvent) -> str:

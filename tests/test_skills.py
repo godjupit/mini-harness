@@ -20,6 +20,8 @@ def test_skill_metadata_is_discovered_before_body_is_loaded(tmp_path):
 
     result = asyncio.run(LoadSkillTool(catalog).run({"name": "review"}, ToolContext(tmp_path)))
     assert "SECRET INSTRUCTIONS" in result.output
+    assert LoadSkillTool.descriptor.source == "skill"
+    assert LoadSkillTool.descriptor.effect == "read"
 
 
 def test_unknown_skill_is_rejected_by_registry(tmp_path):

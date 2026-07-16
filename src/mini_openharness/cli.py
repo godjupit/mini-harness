@@ -32,6 +32,20 @@ from mini_openharness.tools import default_tools
 from mini_openharness.trace import TraceStore, TraceWriter
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
 def build_run_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mini-oh", description="A tiny coding-agent harness")
     parser.add_argument("prompt", nargs="?", help="Task for the coding agent")
@@ -57,6 +71,7 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=12)
     parser.add_argument("--tool-timeout", type=float, default=30.0)
     parser.add_argument("--max-repeated-tool-batches", type=int, default=3)
+    parser.add_argument("--max-concurrent-tools", type=_positive_int, default=8)
     parser.add_argument(
         "--sandbox-shell",
         action="store_true",
@@ -76,6 +91,11 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trace-dir", help="JSONL trace directory")
     parser.add_argument("--no-trace", action="store_true", help="Disable run tracing")
     parser.add_argument(
+        "--strict-trace",
+        action="store_true",
+        help="Fail the run when a local trace cannot be written",
+    )
+    parser.add_argument(
         "--unsafe-trace-secrets",
         action="store_true",
         help="Disable default secret redaction in local traces",
@@ -85,10 +105,19 @@ def build_run_parser() -> argparse.ArgumentParser:
 
 def build_trace_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mini-oh trace", description="Inspect run traces")
-    parser.add_argument("action", choices=("list", "show", "replay"))
+    parser.add_argument("action", choices=("list", "show", "replay", "prune"))
     parser.add_argument("run_id", nargs="?")
     parser.add_argument("--trace-dir", default=".mini-oh/traces")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--older-than", type=_positive_float, metavar="DAYS", help="Prune completed runs by age"
+    )
+    parser.add_argument(
+        "--max-runs", type=_positive_int, help="Keep at most this many completed runs"
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="Delete prune candidates; default is dry-run"
+    )
     return parser
 
 
@@ -125,6 +154,7 @@ async def _run(args: argparse.Namespace) -> int:
         tracer = TraceWriter(
             trace_dir,
             redact_secrets=not args.unsafe_trace_secrets,
+            strict=args.strict_trace,
             metadata={
                 "prompt": prompt,
                 "workspace": str(workspace),
@@ -179,6 +209,7 @@ async def _run(args: argparse.Namespace) -> int:
             output_cost_per_million=args.output_cost,
             tool_timeout_seconds=args.tool_timeout,
             max_repeated_tool_batches=args.max_repeated_tool_batches,
+            max_concurrent_tools=args.max_concurrent_tools,
             hooks=hooks,
         )
         async for event in loop.run(prompt):
@@ -266,6 +297,21 @@ def _trace_command(args: argparse.Namespace) -> int:
                     f"{item.run_id:26} {item.status:10} {item.elapsed_ms:7}ms "
                     f"{item.event_count:4} events  {item.prompt[:60]}"
                 )
+        return 0
+    if args.action == "prune":
+        if args.older_than is None and args.max_runs is None:
+            raise SystemExit("trace prune requires --older-than or --max-runs")
+        candidates = store.prune(
+            older_than_days=args.older_than,
+            max_runs=args.max_runs,
+            dry_run=not args.apply,
+        )
+        action = "deleted" if args.apply else "would delete"
+        if not candidates:
+            print(f"{action}: (none)")
+        else:
+            for path in candidates:
+                print(f"{action}: {path}")
         return 0
     if not args.run_id:
         raise SystemExit(f"trace {args.action} requires <run-id>")

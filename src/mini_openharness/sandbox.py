@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from mini_openharness.tools import ResourceAccess, ToolContext, ToolResult
+from mini_openharness.tools import ResourceAccess, ToolContext, ToolDescriptor, ToolResult
 
 
 class SandboxUnavailableError(RuntimeError):
@@ -176,6 +176,7 @@ class SandboxedShellTool:
         "to the workspace-relative path example.txt."
     )
     read_only = False
+    descriptor = ToolDescriptor(source="sandbox", effect="write", destructive=True)
     parameters = {
         "type": "object",
         "properties": {

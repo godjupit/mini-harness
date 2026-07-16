@@ -78,7 +78,26 @@ def test_mcp_adapter_uses_same_permission_and_registry_path(tmp_path):
     )
 
     assert blocked.is_error
+    assert blocked.failure.code == "permission_denied"
     assert allowed.output == "echo:hello"
+
+
+def test_mcp_descriptor_preserves_source_without_name_prefix(tmp_path):
+    tool = McpTool(
+        server_name="demo",
+        remote_name="echo",
+        description="echo",
+        parameters={"type": "object"},
+        session=FakeSession(),
+    )
+    tool.name = "echo"
+    registry = ToolRegistry()
+    registry.register(tool)
+
+    assert registry.source("echo") == "mcp"
+    assert registry.descriptor("echo").source_id == "demo"
+    assert registry.descriptor_inferred("echo") is False
+    assert registry.attribution("echo")["mcp_server"] == "demo"
 
 
 def test_mcp_output_schema_is_validated_and_structured_content_is_preserved(tmp_path):

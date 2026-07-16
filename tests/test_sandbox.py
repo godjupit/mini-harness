@@ -35,6 +35,9 @@ def test_docker_sandbox_argv_enforces_core_isolation(tmp_path):
 def test_sandbox_tool_explains_container_to_workspace_path_mapping():
     assert "/workspace/example.txt" in SandboxedShellTool.description
     assert "workspace-relative path example.txt" in SandboxedShellTool.description
+    assert SandboxedShellTool.descriptor.source == "sandbox"
+    assert SandboxedShellTool.descriptor.effect == "write"
+    assert SandboxedShellTool.descriptor.destructive is True
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker CLI unavailable")

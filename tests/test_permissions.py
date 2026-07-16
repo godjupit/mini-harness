@@ -56,6 +56,10 @@ def test_ask_callback_and_decision_are_traced(tmp_path):
     ][0]
     assert event.data["requested_action"] == "ask"
     assert event.data["allowed"] is True
+    assert event.data["source"] == "local"
+    assert event.data["effect"] == "write"
+    assert event.data["descriptor_inferred"] is False
+    assert event.data["path"] == "approved.txt"
 
 
 def test_explicit_deny_overrides_allow_write(tmp_path):

@@ -6,9 +6,11 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -16,6 +18,7 @@ from mini_openharness.compaction import ArtifactStore, ContextCompactor
 from mini_openharness.engine import AgentEvent, AgentLoop, MaxStepsExceeded
 from mini_openharness.hooks import load_hook_registry
 from mini_openharness.mcp import McpManager
+from mini_openharness.models import Message
 from mini_openharness.permissions import PermissionPolicy
 from mini_openharness.provider import (
     DemoProvider,
@@ -26,6 +29,13 @@ from mini_openharness.sandbox import (
     DockerSandbox,
     DockerSandboxConfig,
     SandboxedShellTool,
+)
+from mini_openharness.session import (
+    Interruption,
+    SessionLog,
+    SessionStore,
+    detect_interruption,
+    strip_dangling_tool_calls,
 )
 from mini_openharness.skills import LoadSkillTool, SkillCatalog
 from mini_openharness.tools import default_tools
@@ -46,9 +56,25 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+_ACTIVE_SESSION: SessionLog | None = None
+
+
+def _print_resume_hint() -> None:
+    if _ACTIVE_SESSION is not None:
+        print(
+            f"Resume this session with: mini-oh resume {_ACTIVE_SESSION.session_id}",
+            file=sys.stderr,
+        )
+
+
 def build_run_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mini-oh", description="A tiny coding-agent harness")
     parser.add_argument("prompt", nargs="?", help="Task for the coding agent")
+    _add_agent_arguments(parser)
+    return parser
+
+
+def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--demo", action="store_true", help="Run offline deterministic tool demo")
     parser.add_argument("--workspace", default=".", help="Agent workspace boundary")
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
@@ -100,7 +126,8 @@ def build_run_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable default secret redaction in local traces",
     )
-    return parser
+    parser.add_argument("--no-session", action="store_true", help="Disable session persistence")
+    parser.add_argument("--session-dir", help="JSONL conversation session directory")
 
 
 def build_trace_parser() -> argparse.ArgumentParser:
@@ -121,9 +148,152 @@ def build_trace_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_sessions_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="mini-oh sessions", description="List conversation sessions")
+    parser.add_argument("--session-dir", help="JSONL conversation session directory")
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_resume_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mini-oh resume", description="Resume an interrupted conversation session"
+    )
+    parser.add_argument("session_id", nargs="?", help="Session id; defaults to the most recent")
+    parser.add_argument("--latest", action="store_true", help="Resume the most recent session")
+    _add_agent_arguments(parser)
+    return parser
+
+
+def _session_dir(args: argparse.Namespace) -> Path:
+    workspace = Path(args.workspace).resolve()
+    return Path(args.session_dir or workspace / ".mini-oh" / "sessions").resolve()
+
+
 async def _run(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     prompt = args.prompt or "Inspect this project and summarize its architecture."
+    session_log = None
+    if not args.no_session:
+        session_log = SessionLog(
+            _session_dir(args),
+            metadata={"first_prompt": prompt, "workspace": str(workspace)},
+        )
+        global _ACTIVE_SESSION
+        _ACTIVE_SESSION = session_log
+    return await _drive_session(
+        args,
+        session_log=session_log,
+        messages=None,
+        trace_prompt=prompt,
+        run_events=lambda loop: loop.run(prompt),
+    )
+
+
+async def _resume_command(args: argparse.Namespace) -> int:
+    store = SessionStore(_session_dir(args))
+    latest = store.latest()
+    session_id = args.session_id or (latest.session_id if latest else None)
+    if not session_id:
+        print("no sessions found; run `mini-oh` with a prompt first", file=sys.stderr)
+        return 1
+    try:
+        record = store.read(session_id)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    messages = list(record.messages)
+    interruption = detect_interruption(messages)
+    if interruption == Interruption.COMPLETED:
+        print(f"session {session_id} already completed", file=sys.stderr)
+        return 0
+    if interruption == Interruption.DANGLING_TOOL_CALLS:
+        messages = strip_dangling_tool_calls(messages)
+    session_log = SessionLog.open_existing(_session_dir(args), session_id)
+    global _ACTIVE_SESSION
+    _ACTIVE_SESSION = session_log
+    first_prompt = str(record.meta.get("first_prompt", ""))
+    print(f"resuming session {session_id} from: {interruption.value}", file=sys.stderr)
+    return await _drive_session(
+        args,
+        session_log=session_log,
+        messages=messages,
+        trace_prompt=first_prompt or "(resumed session)",
+        run_events=lambda loop: loop.resume(),
+    )
+
+
+async def _drive_session(
+    args: argparse.Namespace,
+    *,
+    session_log: SessionLog | None,
+    messages: list[Message] | None,
+    trace_prompt: str,
+    run_events: Any,
+) -> int:
+    loop = None
+    tracer = None
+    mcp_manager = None
+    provider = None
+    exit_code = 1
+    try:
+        loop, tracer, mcp_manager, provider = await _build_runtime(
+            args,
+            session_log=session_log,
+            messages=messages,
+            trace_prompt=trace_prompt,
+        )
+        if mcp_manager:
+            registered = await mcp_manager.connect_and_register(loop.tools)
+            print(f"connected MCP tools: {', '.join(registered) or '(none)'}")
+        exit_code = await _consume_events(loop, run_events(loop), args)
+    except MaxStepsExceeded as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        exit_code = 1
+    except KeyboardInterrupt:
+        if loop:
+            loop.cancel()
+        _print_resume_hint()
+        return 130
+    except asyncio.CancelledError:
+        if loop:
+            loop.cancel()
+        if tracer:
+            tracer.finish(status="cancelled", data={"reason": "CLI task cancelled"})
+        _print_resume_hint()
+        raise
+    finally:
+        await _close_runtime(mcp_manager, provider)
+        _ACTIVE_SESSION = None
+    if tracer:
+        print(f"trace: {tracer.path}")
+    if session_log is not None:
+        print(f"session: {session_log.session_id}")
+    return exit_code
+
+
+async def _consume_events(loop: AgentLoop, events: Any, args: argparse.Namespace) -> int:
+    exit_code = 1
+    async for event in events:
+        _print_event(event)
+        if event.kind == "done":
+            exit_code = 0
+        elif event.kind == "cancelled":
+            exit_code = 130
+        elif event.kind == "error":
+            _print_provider_hint(args, event)
+            exit_code = 1
+    return exit_code
+
+
+async def _build_runtime(
+    args: argparse.Namespace,
+    *,
+    session_log: SessionLog | None,
+    messages: list[Message] | None = None,
+    trace_prompt: str,
+) -> tuple[AgentLoop, TraceWriter | None, McpManager | None, Any]:
+    workspace = Path(args.workspace).resolve()
     skills = SkillCatalog(args.skills_dir or workspace / "skills")
     system_parts = ["You are a concise coding assistant. Inspect before editing."]
     skill_prompt = skills.prompt()
@@ -156,7 +326,7 @@ async def _run(args: argparse.Namespace) -> int:
             redact_secrets=not args.unsafe_trace_secrets,
             strict=args.strict_trace,
             metadata={
-                "prompt": prompt,
+                "prompt": trace_prompt,
                 "workspace": str(workspace),
                 "provider": provider_name,
                 "model": args.model if not args.demo else "demo",
@@ -181,68 +351,60 @@ async def _run(args: argparse.Namespace) -> int:
     policy = _permission_policy(args)
     hooks = load_hook_registry(args.hooks_config) if args.hooks_config else None
     approval = _approval_callback(args)
-    loop = None
-    exit_code = 1
-    try:
-        if mcp_manager:
-            registered = await mcp_manager.connect_and_register(tools)
-            print(f"connected MCP tools: {', '.join(registered) or '(none)'}")
-        loop = AgentLoop(
-            provider=provider,
-            tools=tools,
-            workspace=workspace,
-            system_prompt="\n\n".join(system_parts),
-            max_steps=args.max_steps,
-            allow_write=args.allow_write,
-            permission_policy=policy,
-            approval_callback=approval,
-            tracer=tracer,
-            compactor=ContextCompactor(
-                threshold_tokens=args.context_threshold,
-                keep_recent_units=args.keep_recent,
-            ),
-            artifact_store=ArtifactStore(
-                workspace / ".mini-oh" / "artifacts",
-                max_inline_chars=args.max_inline_output,
-            ),
-            input_cost_per_million=args.input_cost,
-            output_cost_per_million=args.output_cost,
-            tool_timeout_seconds=args.tool_timeout,
-            max_repeated_tool_batches=args.max_repeated_tool_batches,
-            max_concurrent_tools=args.max_concurrent_tools,
-            hooks=hooks,
+    loop = AgentLoop(
+        provider=provider,
+        tools=tools,
+        workspace=workspace,
+        system_prompt="\n\n".join(system_parts),
+        max_steps=args.max_steps,
+        allow_write=args.allow_write,
+        permission_policy=policy,
+        approval_callback=approval,
+        tracer=tracer,
+        compactor=ContextCompactor(
+            threshold_tokens=args.context_threshold,
+            keep_recent_units=args.keep_recent,
+        ),
+        artifact_store=ArtifactStore(
+            workspace / ".mini-oh" / "artifacts",
+            max_inline_chars=args.max_inline_output,
+        ),
+        input_cost_per_million=args.input_cost,
+        output_cost_per_million=args.output_cost,
+        tool_timeout_seconds=args.tool_timeout,
+        max_repeated_tool_batches=args.max_repeated_tool_batches,
+        max_concurrent_tools=args.max_concurrent_tools,
+        hooks=hooks,
+        messages=messages,
+        session=session_log,
+    )
+    return loop, tracer, mcp_manager, provider
+
+
+async def _close_runtime(mcp_manager: McpManager | None, provider: Any) -> None:
+    if mcp_manager:
+        await mcp_manager.close()
+    close = getattr(provider, "close", None)
+    if close is not None:
+        await close()
+
+
+def _sessions_command(args: argparse.Namespace) -> int:
+    store = SessionStore(Path(args.session_dir or Path.cwd() / ".mini-oh" / "sessions"))
+    summaries = store.list()
+    if args.json:
+        print(
+            json.dumps(
+                [asdict(item) | {"path": str(item.path)} for item in summaries], indent=2
+            )
         )
-        async for event in loop.run(prompt):
-            _print_event(event)
-            if event.kind == "done":
-                exit_code = 0
-            elif event.kind == "cancelled":
-                exit_code = 130
-            elif event.kind == "error":
-                _print_provider_hint(args, event)
-                exit_code = 1
-    except MaxStepsExceeded as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        exit_code = 1
-    except KeyboardInterrupt:
-        if loop:
-            loop.cancel()
-        return 130
-    except asyncio.CancelledError:
-        if loop:
-            loop.cancel()
-        if tracer:
-            tracer.finish(status="cancelled", data={"reason": "CLI task cancelled"})
-        raise
-    finally:
-        if mcp_manager:
-            await mcp_manager.close()
-        close = getattr(provider, "close", None)
-        if close is not None:
-            await close()
-    if tracer:
-        print(f"trace: {tracer.path}")
-    return exit_code
+    else:
+        for item in summaries:
+            print(
+                f"{item.session_id:26} {item.created_at} {item.message_count:4} msgs  "
+                f"{item.first_prompt[:60]}"
+            )
+    return 0
 
 
 def _print_provider_hint(args: argparse.Namespace, event: AgentEvent) -> None:
@@ -370,12 +532,32 @@ def main(argv: list[str] | None = None) -> int:
     _load_environment()
     arguments = list(sys.argv[1:] if argv is None else argv)
     try:
-        if arguments and arguments[0] == "trace":
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except (ValueError, OSError):
+        pass
+    try:
+        command = arguments[0] if arguments else None
+        if command == "trace":
             return _trace_command(build_trace_parser().parse_args(arguments[1:]))
+        if command == "sessions":
+            return _sessions_command(build_sessions_parser().parse_args(arguments[1:]))
+        if command == "resume":
+            return asyncio.run(_resume_command(build_resume_parser().parse_args(arguments[1:])))
+        if command == "continue":
+            return asyncio.run(
+                _resume_command(build_resume_parser().parse_args(arguments[1:]))
+            )
         return asyncio.run(_run(build_run_parser().parse_args(arguments)))
     except KeyboardInterrupt:
+        _print_resume_hint()
         print("cancelled", file=sys.stderr)
         return 130
+
+
+def _handle_sigterm(signum: int, frame: object) -> None:
+    del signum, frame
+    _print_resume_hint()
+    sys.exit(143)
 
 
 def _load_environment() -> None:

@@ -8,13 +8,14 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Callable, Literal
 from uuid import uuid4
 
 from mini_openharness.compaction import ArtifactStore, ContextCompactor
 from mini_openharness.hooks import HookEvent, HookExecutor, HookRegistry
 from mini_openharness.models import Message, ModelReply, ToolCall
 from mini_openharness.permissions import ApprovalCallback, PermissionPolicy
+from mini_openharness.session import SessionLog
 from mini_openharness.provider import (
     ModelProvider,
     ProviderCancelledError,
@@ -112,6 +113,7 @@ class AgentLoop:
         max_concurrent_tools: int = 8,
         hooks: HookRegistry | None = None,
         messages: list[Message] | None = None,
+        session: SessionLog | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -142,6 +144,7 @@ class AgentLoop:
             workspace=self.workspace,
             tracer=self.tracer,
         )
+        self.session = session
         if messages:
             conversation_messages = list(messages)
             current_system = Message("system", system_prompt)
@@ -177,7 +180,34 @@ class AgentLoop:
         if self._active_run is not None:
             self._active_run.cancel_event.set()
 
+    def _persist(self, message: Message) -> None:
+        if self.session is not None:
+            self.session.append_message(message)
+
     async def run(self, prompt: str) -> AsyncIterator[AgentEvent]:
+        execution = self._drive(lambda state: self._run(prompt, state))
+        try:
+            async for event in execution:
+                yield event
+        finally:
+            await execution.aclose()
+
+    async def resume(self) -> AsyncIterator[AgentEvent]:
+        """Continue an interrupted session without a new user prompt.
+
+        The conversation must be preloaded through AgentLoop(messages=...); the
+        loop resumes from wherever the transcript stopped.
+        """
+        execution = self._drive(self._resume_run)
+        try:
+            async for event in execution:
+                yield event
+        finally:
+            await execution.aclose()
+
+    async def _drive(
+        self, runner: Callable[[RunState], AsyncIterator[AgentEvent]]
+    ) -> AsyncIterator[AgentEvent]:
         if self._active_run is not None:
             raise RunAlreadyActiveError(
                 "This AgentLoop already has an active run; use a separate instance for concurrency"
@@ -193,7 +223,7 @@ class AgentLoop:
             file_snapshots=FileSnapshotStore(),
         )
         self._active_run = state
-        execution = self._run(prompt, state)
+        execution = runner(state)
         try:
             async for event in execution:
                 yield event
@@ -218,8 +248,15 @@ class AgentLoop:
             yield AgentEvent("error", f"Hook blocked prompt: {reason}", data)
             return
         prompt = str(prompt_hooks.payload.get("prompt", prompt))
-        self.messages.append(Message("user", prompt))
-        context = ToolContext(
+        user_message = Message("user", prompt)
+        self.messages.append(user_message)
+        self._persist(user_message)
+        context = self._make_context(state)
+        async for event in self._loop(context, state, max_steps=self.max_steps):
+            yield event
+
+    def _make_context(self, state: RunState) -> ToolContext:
+        return ToolContext(
             self.workspace,
             allow_write=self.allow_write,
             permission_policy=self.permission_policy,
@@ -228,9 +265,24 @@ class AgentLoop:
             tool_timeout_seconds=self.tool_timeout_seconds,
             file_snapshots=state.file_snapshots,
         )
+
+    async def _resume_run(self, state: RunState) -> AsyncIterator[AgentEvent]:
+        used_steps = sum(1 for message in self.messages if message.role == "assistant")
+        remaining_steps = max(1, self.max_steps - used_steps)
+        context = self._make_context(state)
+        async for event in self._loop(context, state, max_steps=remaining_steps):
+            yield event
+
+    async def _loop(
+        self,
+        context: ToolContext,
+        state: RunState,
+        *,
+        max_steps: int,
+    ) -> AsyncIterator[AgentEvent]:
         reactive_context_retry_attempted = False
 
-        for step in range(1, self.max_steps + 1):
+        for step in range(1, max_steps + 1):
             if state.cancel_event.is_set():
                 yield self._cancelled_event()
                 return
@@ -331,7 +383,11 @@ class AgentLoop:
 
             self._conversation.input_tokens += reply.input_tokens
             self._conversation.output_tokens += reply.output_tokens
-            self.messages.append(Message("assistant", reply.content, tool_calls=reply.tool_calls))
+            assistant_message = Message(
+                "assistant", reply.content, tool_calls=reply.tool_calls
+            )
+            self.messages.append(assistant_message)
+            self._persist(assistant_message)
             if self.tracer:
                 self.tracer.emit(
                     "model_response",
@@ -718,6 +774,8 @@ class AgentLoop:
 
     def _append_tool_result(self, call_id: str, name: str, result: ToolResult) -> None:
         prefix = "ERROR: " if result.is_error else ""
-        self.messages.append(
-            Message("tool", prefix + result.output, tool_call_id=call_id, name=name)
+        message = Message(
+            "tool", prefix + result.output, tool_call_id=call_id, name=name
         )
+        self.messages.append(message)
+        self._persist(message)

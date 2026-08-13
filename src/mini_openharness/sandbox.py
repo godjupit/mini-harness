@@ -176,7 +176,12 @@ class SandboxedShellTool:
         "to the workspace-relative path example.txt."
     )
     read_only = False
-    descriptor = ToolDescriptor(source="sandbox", effect="write", destructive=True)
+    descriptor = ToolDescriptor(
+        source="sandbox",
+        effect="write",
+        destructive=True,
+        command_argument="command",
+    )
     parameters = {
         "type": "object",
         "properties": {

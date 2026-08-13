@@ -135,6 +135,9 @@ mini-oh --permission-config examples/permissions.json --workspace . "更新文�
 mini-oh --allow-write --permission-config examples/permissions.json "执行任务"
 ```
 
+Shell 权限还可用 `command` 做命令级匹配。例如
+`{"tool":"sandbox_shell","command":"npm test*","action":"allow"}`。复合命令会拆成子命令逐项检查，任一 `deny` 会拒绝整条命令；没有规则或无法安全分析的复杂 Shell 语法默认进入 `ask`。需要有意允许重定向、命令替换等复杂语法时，应配置完整命令的精确规则，而不是宽泛通配符。
+
 示例规则：
 
 ```json

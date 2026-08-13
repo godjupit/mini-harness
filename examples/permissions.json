@@ -15,6 +15,16 @@
       "tool": "mcp__*",
       "path": "*",
       "action": "ask"
+    },
+    {
+      "tool": "sandbox_shell",
+      "command": "npm test*",
+      "action": "allow"
+    },
+    {
+      "tool": "sandbox_shell",
+      "command": "npm publish*",
+      "action": "deny"
     }
   ]
 }

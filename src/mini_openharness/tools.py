@@ -132,6 +132,7 @@ class ToolDescriptor:
     effect: ToolEffect = "unknown"
     destructive: bool = False
     path_argument: str | None = None
+    command_argument: str | None = None
 
     def __post_init__(self) -> None:
         if self.effect not in {"read", "write", "remote", "unknown"}:
@@ -140,6 +141,8 @@ class ToolDescriptor:
             raise ValueError("tool descriptor source must not be empty")
         if self.path_argument == "":
             raise ValueError("tool descriptor path_argument must not be empty")
+        if self.command_argument == "":
+            raise ValueError("tool descriptor command_argument must not be empty")
 
 
 @dataclass(frozen=True)
@@ -263,6 +266,13 @@ class ToolRegistry:
             return _legacy_permission_path(arguments)
         return None
 
+    def permission_command(self, name: str, arguments: dict[str, Any]) -> str | None:
+        descriptor = self.descriptor(name)
+        if descriptor.command_argument is None:
+            return None
+        value = arguments.get(descriptor.command_argument)
+        return value if isinstance(value, str) else None
+
     def attribution(self, name: str) -> dict[str, Any]:
         descriptor = self.descriptor(name)
         data: dict[str, Any] = {
@@ -331,6 +341,7 @@ class ToolRegistry:
 
         descriptor = self.descriptor(name)
         permission_path = self.permission_path(name, arguments)
+        permission_command = self.permission_command(name, arguments)
         try:
             policy = context.permission_policy or PermissionPolicy(
                 default_mutation="allow" if context.allow_write else "ask"
@@ -340,6 +351,7 @@ class ToolRegistry:
                 read_only=descriptor.effect == "read",
                 path=permission_path,
                 source=descriptor.source,
+                command=permission_command,
             )
             allowed = decision.action == "allow"
             if decision.action == "ask" and context.approval_callback is not None:
@@ -357,6 +369,7 @@ class ToolRegistry:
                         "allowed": allowed,
                         "reason": decision.reason,
                         "path": permission_path,
+                        "command": permission_command,
                         "destructive": descriptor.destructive,
                     },
                 )

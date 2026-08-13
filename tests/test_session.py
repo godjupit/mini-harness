@@ -11,6 +11,7 @@ import pytest
 
 import mini_openharness.cli as cli
 from mini_openharness.engine import AgentLoop
+from mini_openharness.hooks import CallbackHook, HookEvent, HookRegistry, HookResult
 from mini_openharness.models import Message, ModelReply, ToolCall
 from mini_openharness.session import (
     Interruption,
@@ -35,6 +36,13 @@ class ScriptedProvider:
 def collect_resume(loop: AgentLoop):
     async def run():
         return [event async for event in loop.resume()]
+
+    return asyncio.run(run())
+
+
+def collect_run(loop: AgentLoop, prompt: str):
+    async def run():
+        return [event async for event in loop.run(prompt)]
 
     return asyncio.run(run())
 
@@ -81,6 +89,14 @@ def test_session_store_tolerates_trailing_half_line(tmp_path):
 def test_session_store_read_missing_session_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         SessionStore(tmp_path).read("missing")
+
+
+@pytest.mark.parametrize("session_id", ["../escape", "nested/session", "/absolute"])
+def test_session_ids_cannot_escape_the_session_directory(tmp_path, session_id):
+    with pytest.raises(ValueError, match="session id"):
+        SessionLog(tmp_path, session_id=session_id)
+    with pytest.raises(ValueError, match="session id"):
+        SessionStore(tmp_path).read(session_id)
 
 
 def test_session_log_open_existing_appends_without_rewriting_meta(tmp_path):
@@ -184,6 +200,16 @@ def test_strip_keeps_unresolved_assistant_content():
     ]
 
 
+def test_strip_removes_unresolved_calls_from_earlier_resume_attempts():
+    messages = [
+        Message("user", "hi"),
+        Message("assistant", "", tool_calls=(ToolCall("old", "list_files", {}),)),
+        Message("assistant", "", tool_calls=(ToolCall("new", "read_file", {}),)),
+    ]
+
+    assert strip_dangling_tool_calls(messages) == [Message("user", "hi")]
+
+
 def test_strip_leaves_resolved_conversations_untouched():
     messages = [
         Message("user", "hi"),
@@ -270,6 +296,34 @@ def test_engine_resume_appends_new_messages_to_session_log(tmp_path):
     assert record.messages[-1].content == "done"
 
 
+def test_engine_persists_stop_hook_retry_message(tmp_path):
+    attempts = 0
+
+    def reject_once(context):
+        nonlocal attempts
+        del context
+        attempts += 1
+        if attempts == 1:
+            return HookResult(blocked=True, reason="verification failed")
+        return HookResult()
+
+    hooks = HookRegistry()
+    hooks.register(HookEvent.STOP, CallbackHook("verification", reject_once))
+    log = SessionLog(tmp_path, session_id="hook-retry")
+    loop = AgentLoop(
+        provider=ScriptedProvider([ModelReply(content="first"), ModelReply(content="fixed")]),
+        tools=default_tools(),
+        workspace=tmp_path,
+        hooks=hooks,
+        session=log,
+    )
+
+    collect_run(loop, "task")
+
+    record = SessionStore(tmp_path).read("hook-retry")
+    assert "Completion was rejected" in record.messages[-2].content
+
+
 # --- CLI --------------------------------------------------------------------
 
 
@@ -321,6 +375,7 @@ def test_cli_run_session_dir_places_session_file(tmp_path):
     record = SessionStore(session_dir).read(files[0].stem)
     assert record.messages[0].role == "user"
     assert record.messages[0].content == "hello"
+    assert cli._ACTIVE_SESSION is None
 
 
 def test_cli_resume_reports_completed_session(tmp_path, capsys):

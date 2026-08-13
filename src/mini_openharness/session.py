@@ -42,25 +42,24 @@ def detect_interruption(messages: list[Message]) -> Interruption:
 
 
 def strip_dangling_tool_calls(messages: list[Message]) -> list[Message]:
-    """Drop the trailing assistant's unresolved tool_calls so the model re-plans.
+    """Drop every unresolved tool_call so a resumed transcript is valid.
 
     Mirrors Claude Code's filterUnresolvedToolUses: a tool_use with no tool_result
     must not reach the model. If stripping leaves an empty assistant message it is
     removed entirely.
     """
-    relevant_indexes = [index for index, item in enumerate(messages) if item.role != "system"]
-    if not relevant_indexes:
-        return messages
-    last_index = relevant_indexes[-1]
-    last = messages[last_index]
-    if last.role != "assistant" or not last.tool_calls:
-        return messages
     resolved = {message.tool_call_id for message in messages if message.role == "tool"}
-    if not any(call.id not in resolved for call in last.tool_calls):
-        return messages
-    if last.content:
-        return messages[:last_index] + [Message("assistant", last.content)]
-    return messages[:last_index]
+    sanitized: list[Message] = []
+    for message in messages:
+        if message.role != "assistant" or not message.tool_calls:
+            sanitized.append(message)
+            continue
+        calls = tuple(call for call in message.tool_calls if call.id in resolved)
+        if calls == message.tool_calls:
+            sanitized.append(message)
+        elif message.content or calls:
+            sanitized.append(Message("assistant", message.content, tool_calls=calls))
+    return sanitized
 
 
 @dataclass(frozen=True)
@@ -96,7 +95,7 @@ class SessionLog:
     ) -> None:
         self.root = Path(root).resolve()
         self.session_id = session_id or uuid4().hex
-        self.path = self.root / f"{self.session_id}.jsonl"
+        self.path = _session_path(self.root, self.session_id)
         self.root.mkdir(parents=True, exist_ok=True)
         self._append_line(
             json.dumps(
@@ -116,7 +115,7 @@ class SessionLog:
         instance = cls.__new__(cls)
         instance.root = Path(root).resolve()
         instance.session_id = session_id
-        instance.path = instance.root / f"{session_id}.jsonl"
+        instance.path = _session_path(instance.root, session_id)
         if not instance.path.is_file():
             raise FileNotFoundError(f"Session not found: {session_id}")
         return instance
@@ -181,7 +180,7 @@ class SessionStore:
         return sessions[0] if sessions else None
 
     def read(self, session_id: str) -> SessionRecord:
-        path = self.root / f"{session_id}.jsonl"
+        path = _session_path(self.root, session_id)
         if not path.is_file():
             raise FileNotFoundError(f"Session not found: {session_id}")
         meta, messages = self._parse(path)
@@ -225,3 +224,10 @@ def _first_user_text(messages: list[Message]) -> str:
         (message.content for message in messages if message.role == "user"),
         "",
     )
+
+
+def _session_path(root: Path, session_id: str) -> Path:
+    """Return a session path without allowing callers to escape ``root``."""
+    if not session_id or not session_id.replace("-", "").replace("_", "").isalnum():
+        raise ValueError("session id may contain only letters, digits, '-' and '_'")
+    return root / f"{session_id}.jsonl"

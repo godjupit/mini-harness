@@ -427,13 +427,13 @@ class AgentLoop:
                     if self.tracer:
                         self.tracer.emit("hook_blocked", hook_data)
                     yield AgentEvent("hook_blocked", reason, hook_data)
-                    self.messages.append(
-                        Message(
-                            "user",
-                            "Completion was rejected by a trusted verification hook: "
-                            f"{reason}\nFix the issue, verify it, and try to finish again.",
-                        )
+                    retry_message = Message(
+                        "user",
+                        "Completion was rejected by a trusted verification hook: "
+                        f"{reason}\nFix the issue, verify it, and try to finish again.",
                     )
+                    self.messages.append(retry_message)
+                    self._persist(retry_message)
                     continue
                 if self.tracer:
                     self.tracer.finish(status="completed", data=data)

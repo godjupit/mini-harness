@@ -199,7 +199,7 @@ async def _resume_command(args: argparse.Namespace) -> int:
         return 1
     try:
         record = store.read(session_id)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     messages = list(record.messages)
@@ -231,6 +231,7 @@ async def _drive_session(
     trace_prompt: str,
     run_events: Any,
 ) -> int:
+    global _ACTIVE_SESSION
     loop = None
     tracer = None
     mcp_manager = None

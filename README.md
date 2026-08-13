@@ -1,4 +1,4 @@
-# Mini OpenHarness
+# Mini Harness
 
 一个可以在面试中讲清楚、现场跑通的精简 coding-agent runtime。它保留 Agent Loop、Hooks、Skills、MCP、权限审批、effect-aware 工具调度、上下文压缩、流式 Provider、Trace/Replay 和 Docker 自测。
 

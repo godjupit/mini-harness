@@ -709,8 +709,9 @@ def test_context_error_forces_one_compaction_and_retries_same_model_step(tmp_pat
             self.requests = []
 
         async def complete(self, messages, tools):
-            del tools
             self.requests.append(list(messages))
+            if not tools:
+                return ModelReply(content="Earlier work: old requests were explored.")
             if len(self.requests) == 1:
                 raise ProviderContextWindowError("maximum context length exceeded")
             return ModelReply(content="recovered")
@@ -739,8 +740,8 @@ def test_context_error_forces_one_compaction_and_retries_same_model_step(tmp_pat
     compact = next(event for event in events if event.kind == "compact")
     done = next(event for event in events if event.kind == "done")
     assert compact.data["trigger"] == "reactive"
-    assert len(provider.requests) == 2
-    assert len(provider.requests[1]) < len(provider.requests[0])
+    assert len(provider.requests) == 3
+    assert len(provider.requests[2]) < len(provider.requests[0])
     assert done.data["steps"] == 1
     trace = list(TraceStore(tmp_path / "traces").read("reactive-compact"))
     assert any(event.kind == "context_retry" for event in trace)

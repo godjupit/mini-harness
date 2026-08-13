@@ -286,7 +286,7 @@ class AgentLoop:
             if state.cancel_event.is_set():
                 yield self._cancelled_event()
                 return
-            compact_event = self._compact_if_needed()
+            compact_event = await self._compact_if_needed()
             if compact_event is not None:
                 yield compact_event
 
@@ -344,7 +344,7 @@ class AgentLoop:
                     compact_event = None
                     if not reactive_context_retry_attempted:
                         reactive_context_retry_attempted = True
-                        compact_event = self._compact_if_needed(
+                        compact_event = await self._compact_if_needed(
                             force=True,
                             trigger="reactive",
                         )
@@ -745,7 +745,7 @@ class AgentLoop:
         run_id = self.tracer.run_id if self.tracer else "untraced"
         return self.artifact_store.offload(run_id=run_id, tool_call_id=call_id, output=output)
 
-    def _compact_if_needed(
+    async def _compact_if_needed(
         self,
         *,
         force: bool = False,
@@ -753,14 +753,21 @@ class AgentLoop:
     ) -> AgentEvent | None:
         if self.compactor is None:
             return None
-        result = self.compactor.compact(self.messages, force=force)
+        result = await self.compactor.compact_with_provider(
+            self.messages,
+            self.provider,
+            force=force,
+        )
         if not result.compacted:
             return None
         self._conversation.messages = result.messages
+        self._conversation.input_tokens += result.summary_input_tokens
+        self._conversation.output_tokens += result.summary_output_tokens
         data = {
             "before_tokens": result.before_tokens,
             "after_tokens": result.after_tokens,
             "summarized_messages": result.summarized_messages,
+            "summary_source": result.summary_source,
             "trigger": trigger,
         }
         if self.tracer:

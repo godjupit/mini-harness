@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+
 from mini_openharness.compaction import ArtifactStore, ContextCompactor, SUMMARY_PREFIX
-from mini_openharness.models import Message, ToolCall
+from mini_openharness.models import Message, ModelReply, ToolCall
 
 
 def test_compaction_keeps_recent_tool_call_and_all_results_together():
@@ -56,3 +58,63 @@ def test_forced_compaction_ignores_threshold_but_preserves_recent_units():
     assert not normal.compacted
     assert forced.compacted
     assert forced.messages[-2:] == messages[-2:]
+
+
+def test_model_compaction_creates_structured_handoff_and_keeps_recent_units():
+    class SummaryProvider:
+        requests = []
+
+        async def complete(self, messages, tools):
+            self.requests.append((messages, tools))
+            return ModelReply(
+                content=(
+                    "Primary request: update the parser.\n"
+                    "Files changed: src/parser.py.\n"
+                    "Pending work: add regression tests."
+                ),
+                input_tokens=40,
+                output_tokens=20,
+            )
+
+    messages = [Message("system", "system")]
+    for index in range(4):
+        messages.extend(
+            [
+                Message("user", f"request {index}"),
+                Message("assistant", f"answer {index}"),
+            ]
+        )
+    provider = SummaryProvider()
+
+    result = asyncio.run(
+        ContextCompactor(threshold_tokens=1, keep_recent_units=2).compact_with_provider(
+            messages, provider
+        )
+    )
+
+    assert result.compacted
+    assert result.summary_source == "model"
+    assert result.messages[1].content.startswith(SUMMARY_PREFIX)
+    assert "Pending work" in result.messages[1].content
+    assert result.messages[-2:] == messages[-2:]
+    assert provider.requests[0][1] == []
+
+
+def test_model_compaction_falls_back_when_summary_request_fails():
+    class FailingProvider:
+        async def complete(self, messages, tools):
+            del messages, tools
+            raise RuntimeError("summary unavailable")
+
+    messages = [Message("system", "system")]
+    for index in range(4):
+        messages.extend([Message("user", f"request {index}"), Message("assistant", "answer")])
+
+    result = asyncio.run(
+        ContextCompactor(threshold_tokens=1, keep_recent_units=2).compact_with_provider(
+            messages, FailingProvider()
+        )
+    )
+
+    assert result.compacted
+    assert result.summary_source == "deterministic_fallback"

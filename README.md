@@ -224,7 +224,7 @@ Permission 回答“这个 capability 是否允许执行”，Hook 回答“在�
 
 每次模型调用前估算 context token。超过阈值后：
 
-1. 把旧消息折叠成可读 summary；
+1. 发起一次不带工具的模型调用，把旧消息折叠成面向继续执行的结构化 handoff summary；
 2. 保留最近若干 atomic units；
 3. assistant tool calls 与其所有 tool results 永远作为同一个 unit，避免产生孤儿消息；
 4. 大型工具输出保存到 `.mini-oh/artifacts/<run-id>/`，history 只保留头尾和 artifact 路径。
@@ -233,7 +233,7 @@ Permission 回答“这个 capability 是否允许执行”，Hook 回答“在�
 mini-oh --context-threshold 12000 --keep-recent 6 --max-inline-output 8000 "长任务"
 ```
 
-当前 summary 是确定性、低成本实现。生产版可以替换为 LLM summarizer，而无需改变 AgentLoop 接口。
+摘要要求保留用户目标、重要决策、文件/工具发现、错误修复和待办事项；摘要调用失败或返回无效内容时，自动回退到确定性摘要，保证主任务仍能继续。该实现借鉴 Claude Code 的核心思路，但没有引入其 Session Memory、prompt cache 复用和多轮历史裁剪等完整机制。
 
 若 Provider 明确返回 context-window 超限，Runtime 会忽略普通阈值强制压缩一次，并在同一个逻辑 model step 重试；无法压缩或第二次仍失败则终止。该恢复只接受 typed `ProviderContextWindowError`，不会把任意 HTTP 400 当成可重试错误。
 

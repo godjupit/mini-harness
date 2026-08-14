@@ -21,7 +21,8 @@ from mini_openharness.mcp import McpManager
 from mini_openharness.models import Message
 from mini_openharness.multiagent import build_agent_tool
 from mini_openharness.permissions import (
-    ApprovalHandler,
+    AgentApprovalHandler,
+    HumanApprovalHandler,
     PermissionContext,
     PermissionEngine,
     PermissionMode,
@@ -98,8 +99,11 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY", ""))
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--max-retries", type=int, default=3)
-    parser.add_argument("--allow-write", action="store_true", help="Allow mutating tools")
-    parser.add_argument("--yes", action="store_true", help="Approve every ask decision")
+    parser.add_argument(
+        "--auto-review",
+        action="store_true",
+        help="AUTO_REVIEW mode: ASK decisions go to an independent reviewer agent",
+    )
     parser.add_argument("--permission-config", help="JSON allow/deny/ask rules")
     parser.add_argument("--hooks-config", help="JSON lifecycle command hooks")
     parser.add_argument("--max-steps", type=int, default=12)
@@ -360,14 +364,16 @@ async def _build_runtime(
     mcp_manager = McpManager.from_file(args.mcp_config) if args.mcp_config else None
     permission_engine = PermissionEngine(_permission_context(args))
     hooks = load_hook_registry(args.hooks_config) if args.hooks_config else None
-    approval = ApprovalHandler(_approval_callback(args))
+    if args.auto_review:
+        approval = AgentApprovalHandler(_build_reviewer(args, provider))
+    else:
+        approval = HumanApprovalHandler(_approval_callback(args))
     loop = AgentLoop(
         provider=provider,
         tools=tools,
         workspace=workspace,
         system_prompt="\n\n".join(system_parts),
         max_steps=args.max_steps,
-        allow_write=args.allow_write,
         permission_engine=permission_engine,
         approval_handler=approval,
         tracer=tracer,
@@ -430,12 +436,9 @@ def _permission_context(args: argparse.Namespace) -> PermissionContext:
     rules = build_default_rules()
     if args.permission_config:
         rules = load_rules_from_json(args.permission_config)
-    if args.yes:
-        mode = PermissionMode.BYPASS
-    elif args.allow_write:
-        mode = PermissionMode.ACCEPT_EDITS
-    else:
-        mode = PermissionMode.DEFAULT
+    mode = (
+        PermissionMode.AUTO_REVIEW if args.auto_review else PermissionMode.DEFAULT
+    )
     return PermissionContext(
         mode=mode,
         rules=rules,
@@ -444,13 +447,6 @@ def _permission_context(args: argparse.Namespace) -> PermissionContext:
 
 
 def _approval_callback(args: argparse.Namespace):
-    if args.yes:
-
-        async def approve_all(request, decision) -> bool:
-            del request, decision
-            return True
-
-        return approve_all
     if not sys.stdin.isatty():
         return None
 
@@ -461,6 +457,28 @@ def _approval_callback(args: argparse.Namespace):
         return answer.strip().lower() in {"y", "yes"}
 
     return ask
+
+
+def _build_reviewer(args: argparse.Namespace, provider):
+    """Independent reviewer: one tool-less model call answers approve/reject."""
+    del args
+
+    async def review(request, decision) -> bool:
+        prompt = (
+            "You are an independent permission reviewer. Decide whether to approve "
+            "the following request. Reply with exactly one word: approve or reject.\n"
+            f"tool: {request.tool_name}\n"
+            f"input: {request.input}\n"
+            f"reason: {decision.reason}\n"
+        )
+        try:
+            reply = await provider.complete([Message("system", prompt)], [])
+        except Exception:
+            return False
+        text = (reply.content or "").strip().lower()
+        return text.startswith("approve")
+
+    return review
 
 
 def _trace_command(args: argparse.Namespace) -> int:

@@ -123,7 +123,6 @@ class FileSnapshotStore:
 @dataclass(frozen=True)
 class ToolContext:
     workspace: Path
-    allow_write: bool = False
     permission_engine: PermissionEngine | None = None
     approval_handler: ApprovalHandler | None = None
     tracer: TraceSink | None = None
@@ -365,11 +364,7 @@ class ToolRegistry:
             if engine is None:
                 engine = PermissionEngine(
                     PermissionContext(
-                        mode=(
-                            PermissionMode.ACCEPT_EDITS
-                            if context.allow_write
-                            else PermissionMode.DEFAULT
-                        ),
+                        mode=PermissionMode.DEFAULT,
                         rules=build_default_rules(),
                         workspace=context.workspace,
                     )

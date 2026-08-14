@@ -4,9 +4,12 @@ import asyncio
 from pathlib import Path
 
 from mini_openharness.permissions import (
-    ApprovalHandler,
+    AgentApprovalHandler,
+    ApprovalResult,
+    HumanApprovalHandler,
     PermissionBehavior,
     PermissionContext,
+    PermissionDecision,
     PermissionEngine,
     PermissionMode,
     PermissionRequest,
@@ -49,6 +52,10 @@ def request(
         command=command,
         effect=effect,
     )
+
+
+def ask_decision() -> PermissionDecision:
+    return PermissionDecision(PermissionBehavior.ASK, "needs approval")
 
 
 def test_engine_rules_safety_and_defaults(tmp_path):
@@ -96,6 +103,23 @@ def test_engine_rules_safety_and_defaults(tmp_path):
     )
 
 
+def test_engine_decisions_are_mode_independent(tmp_path):
+    cases = [
+        request("read_file", path="a.py"),
+        request("write_file", path="x.txt", effect="write"),
+        request("read_file", path="../escape"),
+        request("sandbox_shell", command="echo hi > f.txt", effect="write"),
+    ]
+    default_engine = make_engine(tmp_path, mode=PermissionMode.DEFAULT)
+    review_engine = make_engine(tmp_path, mode=PermissionMode.AUTO_REVIEW)
+
+    for case in cases:
+        assert (
+            default_engine.authorize(case).behavior
+            == review_engine.authorize(case).behavior
+        )
+
+
 def test_ask_decision_goes_through_approval_and_is_traced(tmp_path):
     approvals = []
 
@@ -111,7 +135,7 @@ def test_ask_decision_goes_through_approval_and_is_traced(tmp_path):
             ToolContext(
                 tmp_path,
                 permission_engine=make_engine(tmp_path),
-                approval_handler=ApprovalHandler(approve),
+                approval_handler=HumanApprovalHandler(approve),
                 tracer=tracer,
             ),
         )
@@ -132,10 +156,9 @@ def test_ask_decision_goes_through_approval_and_is_traced(tmp_path):
     assert event.data["path"] == "approved.txt"
 
 
-def test_explicit_deny_overrides_accept_edits(tmp_path):
+def test_explicit_deny_overrides_rules_and_default(tmp_path):
     engine = make_engine(
         tmp_path,
-        mode=PermissionMode.ACCEPT_EDITS,
         rules=PermissionRules(
             deny=[PermissionRule(PermissionBehavior.DENY, tool="write_file", pattern="*")]
         ),
@@ -144,26 +167,18 @@ def test_explicit_deny_overrides_accept_edits(tmp_path):
         default_tools().execute(
             "write_file",
             {"path": "blocked.txt", "content": "no"},
-            ToolContext(tmp_path, allow_write=True, permission_engine=engine),
+            ToolContext(tmp_path, permission_engine=engine),
         )
     )
     assert result.is_error
     assert not (tmp_path / "blocked.txt").exists()
 
 
-def test_bypass_mode_allows_unmatched_tools(tmp_path):
-    engine = make_engine(tmp_path, mode=PermissionMode.BYPASS, rules=PermissionRules())
-
-    decision = engine.authorize(request("anything", effect="write"))
-
-    assert decision.behavior == PermissionBehavior.ALLOW
-
-
-def test_explicit_ask_not_bypassed_by_mode(tmp_path):
+def test_explicit_ask_rule_always_asks(tmp_path):
     rules = PermissionRules(
         ask=[PermissionRule(PermissionBehavior.ASK, tool="sandbox_shell", pattern="npm publish*")]
     )
-    engine = make_engine(tmp_path, mode=PermissionMode.BYPASS, rules=rules)
+    engine = make_engine(tmp_path, rules=rules)
 
     decision = engine.authorize(
         request("sandbox_shell", command="npm publish", effect="write")
@@ -172,14 +187,89 @@ def test_explicit_ask_not_bypassed_by_mode(tmp_path):
     assert decision.behavior == PermissionBehavior.ASK
 
 
-def test_bypass_auto_passes_complex_shell(tmp_path):
-    engine = make_engine(tmp_path, mode=PermissionMode.BYPASS, rules=PermissionRules())
+def test_complex_shell_is_ask(tmp_path):
+    engine = make_engine(tmp_path, rules=PermissionRules())
 
     decision = engine.authorize(
         request("sandbox_shell", command="echo hi > f.txt", effect="write")
     )
 
-    assert decision.behavior == PermissionBehavior.ALLOW
+    assert decision.behavior == PermissionBehavior.ASK
+
+
+def test_human_approval_handler():
+    req = request("write_file", effect="write")
+
+    async def approve(r, d):
+        del r, d
+        return True
+
+    async def deny(r, d):
+        del r, d
+        return False
+
+    async def run():
+        approved = await HumanApprovalHandler(approve).request(req, ask_decision())
+        denied = await HumanApprovalHandler(deny).request(req, ask_decision())
+        no_callback = await HumanApprovalHandler().request(req, ask_decision())
+        not_ask = await HumanApprovalHandler().request(
+            req, PermissionDecision(PermissionBehavior.ALLOW, "ok")
+        )
+        return approved, denied, no_callback, not_ask
+
+    approved, denied, no_callback, not_ask = asyncio.run(run())
+
+    assert approved == ApprovalResult(approved=True)
+    assert denied == ApprovalResult(approved=False)
+    assert no_callback == ApprovalResult(approved=False)
+    assert not_ask == ApprovalResult(approved=True)
+
+
+def test_agent_approval_handler():
+    req = request("write_file", effect="write")
+
+    async def approve(r, d):
+        del r, d
+        return True
+
+    async def reject(r, d):
+        del r, d
+        return False
+
+    async def explode(r, d):
+        del r, d
+        raise RuntimeError("reviewer down")
+
+    async def slow(r, d):
+        del r, d
+        await asyncio.sleep(5)
+        return True
+
+    async def invalid(r, d):
+        del r, d
+        return "maybe"  # type: ignore[return-value]
+
+    async def run():
+        approved = await AgentApprovalHandler(approve).request(req, ask_decision())
+        rejected = await AgentApprovalHandler(reject).request(req, ask_decision())
+        crashed = await AgentApprovalHandler(explode).request(req, ask_decision())
+        timed_out = await AgentApprovalHandler(slow, timeout=0.05).request(
+            req, ask_decision()
+        )
+        unparseable = await AgentApprovalHandler(invalid).request(req, ask_decision())
+        not_ask = await AgentApprovalHandler(reject).request(
+            req, PermissionDecision(PermissionBehavior.ALLOW, "ok")
+        )
+        return approved, rejected, crashed, timed_out, unparseable, not_ask
+
+    approved, rejected, crashed, timed_out, unparseable, not_ask = asyncio.run(run())
+
+    assert approved == ApprovalResult(approved=True)
+    assert rejected == ApprovalResult(approved=False)
+    assert crashed == ApprovalResult(approved=False)
+    assert timed_out == ApprovalResult(approved=False)
+    assert unparseable == ApprovalResult(approved=False)
+    assert not_ask == ApprovalResult(approved=True)
 
 
 def test_load_rules_from_json(tmp_path):

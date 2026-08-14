@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from mini_openharness.permissions import ApprovalHandler
+from mini_openharness.permissions import HumanApprovalHandler
 from mini_openharness.sandbox import (
     DockerSandbox,
     DockerSandboxConfig,
@@ -78,9 +78,8 @@ def test_real_docker_shell_writes_only_workspace_and_has_no_network(tmp_path):
             {"command": command, "timeout_seconds": 15},
             ToolContext(
                 tmp_path,
-                allow_write=True,
                 tool_timeout_seconds=20,
-                approval_handler=ApprovalHandler(approve_all),
+                approval_handler=HumanApprovalHandler(approve_all),
             ),
         )
 

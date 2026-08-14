@@ -20,7 +20,17 @@ from mini_openharness.mcp_auth import (
     build_oauth_provider,
 )
 from mini_openharness.mcp import McpManager, McpTool
+from mini_openharness.permissions import HumanApprovalHandler
 from mini_openharness.tools import ToolContext, ToolRegistry
+
+
+async def approve_all(request, decision):
+    del request, decision
+    return True
+
+
+def approve_all_handler() -> HumanApprovalHandler:
+    return HumanApprovalHandler(approve_all)
 
 
 class FakeSession:
@@ -73,7 +83,7 @@ def test_mcp_adapter_uses_same_permission_and_registry_path(tmp_path):
         registry.execute(
             "mcp__demo__echo",
             {"value": "hello"},
-            ToolContext(tmp_path, allow_write=True),
+            ToolContext(tmp_path, approval_handler=approve_all_handler()),
         )
     )
 
@@ -298,7 +308,7 @@ def test_real_streamable_http_mcp_transport(tmp_path):
                 result = await registry.execute(
                     "mcp__http__echo",
                     {"text": "works"},
-                    ToolContext(tmp_path, allow_write=True),
+                    ToolContext(tmp_path, approval_handler=approve_all_handler()),
                 )
                 return names, result
             finally:

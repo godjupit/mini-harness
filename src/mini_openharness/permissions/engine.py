@@ -8,7 +8,6 @@ from mini_openharness.permissions.types import (
     PermissionBehavior,
     PermissionContext,
     PermissionDecision,
-    PermissionMode,
     PermissionRequest,
 )
 
@@ -37,27 +36,17 @@ class PermissionEngine:
         if decision:
             return decision
 
-        # 4. 模式
-        decision = self._check_mode(request)
-        if decision:
-            return decision
-
-        # 5. 显式 allow
+        # 4. 显式 allow
         decision = self._check_allow_rules(request)
         if decision:
             return decision
 
-        # 6. 默认 ask
+        # 5. 默认决策
         return self._default_decision(request)
     
     def _check_safety(self, request: PermissionRequest) -> PermissionDecision | None:
         result = check_safety(request, self.context)
         if result.safe:
-            return None
-        if (
-            result.behavior == PermissionBehavior.ASK
-            and self.context.mode == PermissionMode.BYPASS
-        ):
             return None
         return PermissionDecision(result.behavior, result.reason)
 
@@ -80,13 +69,6 @@ class PermissionEngine:
             f"ask by rule tool={rule.tool} pattern={rule.pattern}",
             rule,
         )
-
-    def _check_mode(self, request: PermissionRequest) -> PermissionDecision | None:
-        if self.context.mode == PermissionMode.BYPASS:
-            return PermissionDecision(PermissionBehavior.ALLOW, "bypass mode")
-        if self.context.mode == PermissionMode.ACCEPT_EDITS and request.effect != "read":
-            return PermissionDecision(PermissionBehavior.ALLOW, "accept_edits mode")
-        return None
 
     def _check_allow_rules(self, request: PermissionRequest) -> PermissionDecision | None:
         rule = find_matching_rule(request, self.context.rules.allow)

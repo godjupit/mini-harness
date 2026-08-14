@@ -1,6 +1,11 @@
 """Rule-based permission decisions with optional human approval."""
 
-from mini_openharness.permissions.approval import ApprovalHandler, ApprovalResult
+from mini_openharness.permissions.approval import (
+    AgentApprovalHandler,
+    ApprovalHandler,
+    ApprovalResult,
+    HumanApprovalHandler,
+)
 from mini_openharness.permissions.engine import PermissionEngine
 from mini_openharness.permissions.rules import (
     build_default_rules,
@@ -20,6 +25,7 @@ from mini_openharness.permissions.types import (
 )
 
 __all__ = [
+    "AgentApprovalHandler",
     "ApprovalHandler",
     "ApprovalResult",
     "PermissionBehavior",
@@ -33,6 +39,7 @@ __all__ = [
     "SafetyResult",
     "build_default_rules",
     "find_matching_rule",
+    "HumanApprovalHandler",
     "load_rules_from_json",
     "match_rule",
 ]

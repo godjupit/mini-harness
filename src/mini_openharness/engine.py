@@ -100,7 +100,6 @@ class AgentLoop:
         workspace: str | Path,
         system_prompt: str = "You are a concise coding assistant. Inspect before editing.",
         max_steps: int = 12,
-        allow_write: bool = False,
         permission_engine: PermissionEngine | None = None,
         approval_handler: ApprovalHandler | None = None,
         tracer: TraceSink | None = None,
@@ -127,7 +126,6 @@ class AgentLoop:
         self.tools = tools
         self.workspace = Path(workspace).resolve()
         self.max_steps = max_steps
-        self.allow_write = allow_write
         self.permission_engine = permission_engine
         self.approval_handler = approval_handler
         self.tracer = tracer
@@ -258,7 +256,6 @@ class AgentLoop:
     def _make_context(self, state: RunState) -> ToolContext:
         return ToolContext(
             self.workspace,
-            allow_write=self.allow_write,
             permission_engine=self.permission_engine,
             approval_handler=self.approval_handler,
             tracer=self.tracer,

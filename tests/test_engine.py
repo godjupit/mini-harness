@@ -8,9 +8,12 @@ import pytest
 from mini_openharness.engine import AgentLoop, MaxStepsExceeded, RunAlreadyActiveError
 from mini_openharness.models import Message, ModelReply, ToolCall
 from mini_openharness.permissions import (
+    HumanApprovalHandler,
+    PermissionBehavior,
     PermissionContext,
     PermissionEngine,
     PermissionMode,
+    PermissionRule,
     PermissionRules,
 )
 from mini_openharness.provider import (
@@ -32,11 +35,24 @@ from mini_openharness.tools import (
 from mini_openharness.trace import TraceStore, TraceWriter
 
 
-def bypass_engine(workspace: Path) -> PermissionEngine:
+async def approve_all(request, decision):
+    del request, decision
+    return True
+
+
+def approve_all_handler() -> HumanApprovalHandler:
+    return HumanApprovalHandler(approve_all)
+
+
+def allow_all_engine(workspace: Path) -> PermissionEngine:
     return PermissionEngine(
         PermissionContext(
-            mode=PermissionMode.BYPASS,
-            rules=PermissionRules(),
+            mode=PermissionMode.DEFAULT,
+            rules=PermissionRules(
+                allow=[
+                    PermissionRule(PermissionBehavior.ALLOW, tool="*", pattern="*")
+                ]
+            ),
             workspace=workspace,
         )
     )
@@ -191,7 +207,7 @@ def test_agent_loop_read_then_edit_uses_per_run_snapshot(tmp_path):
         provider=provider,
         tools=default_tools(),
         workspace=tmp_path,
-        allow_write=True,
+        approval_handler=approve_all_handler(),
     )
 
     events = collect(loop, "update timeout")
@@ -223,7 +239,7 @@ def test_file_snapshot_does_not_leak_into_next_user_run(tmp_path):
         provider=provider,
         tools=default_tools(),
         workspace=tmp_path,
-        allow_write=True,
+        approval_handler=approve_all_handler(),
     )
 
     collect(loop, "read only")
@@ -301,7 +317,7 @@ def test_mutating_tool_batch_is_serialized(tmp_path):
         provider=provider,
         tools=tools,
         workspace=tmp_path,
-        allow_write=True,
+        approval_handler=approve_all_handler(),
         tracer=tracer,
     )
 
@@ -357,7 +373,7 @@ def test_non_conflicting_mutations_run_in_parallel(tmp_path):
             ModelReply(content="done"),
         ]
     )
-    loop = AgentLoop(provider=provider, tools=tools, workspace=tmp_path, allow_write=True)
+    loop = AgentLoop(provider=provider, tools=tools, workspace=tmp_path, approval_handler=approve_all_handler())
 
     collect(loop, "mutate separate files")
 
@@ -399,7 +415,7 @@ def test_tool_batch_respects_max_concurrency_and_traces_slots(tmp_path):
         provider=ScriptedProvider([ModelReply(tool_calls=calls), ModelReply(content="done")]),
         tools=tools,
         workspace=tmp_path,
-        allow_write=True,
+        approval_handler=approve_all_handler(),
         tracer=tracer,
         max_concurrent_tools=2,
     )
@@ -448,7 +464,7 @@ def test_repeated_tool_batch_is_blocked_but_model_can_recover(tmp_path):
         tools=tools,
         workspace=tmp_path,
         max_repeated_tool_batches=2,
-        permission_engine=bypass_engine(tmp_path),
+        permission_engine=allow_all_engine(tmp_path),
     )
 
     events = collect(loop, "do not loop")
@@ -609,7 +625,7 @@ def test_tool_failure_is_exposed_on_agent_and_trace_events(tmp_path):
         tools=tools,
         workspace=tmp_path,
         tracer=tracer,
-        permission_engine=bypass_engine(tmp_path),
+        permission_engine=allow_all_engine(tmp_path),
     )
 
     events = collect(loop, "fail safely")
@@ -674,7 +690,7 @@ def test_cancel_stops_in_flight_tool_task(tmp_path):
         provider=ScriptedProvider([ModelReply(tool_calls=(ToolCall("slow", "slow", {}),))]),
         tools=tools,
         workspace=tmp_path,
-        permission_engine=bypass_engine(tmp_path),
+        permission_engine=allow_all_engine(tmp_path),
     )
 
     async def run():

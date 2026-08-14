@@ -6,6 +6,7 @@ import stat
 from pathlib import Path
 
 from mini_openharness.permissions import (
+    HumanApprovalHandler,
     PermissionBehavior,
     PermissionContext,
     PermissionEngine,
@@ -26,11 +27,24 @@ from mini_openharness.tools import (
 )
 
 
-def bypass_engine(workspace: Path) -> PermissionEngine:
+async def approve_all(request, decision):
+    del request, decision
+    return True
+
+
+def approve_all_handler() -> HumanApprovalHandler:
+    return HumanApprovalHandler(approve_all)
+
+
+def allow_all_engine(workspace: Path) -> PermissionEngine:
     return PermissionEngine(
         PermissionContext(
-            mode=PermissionMode.BYPASS,
-            rules=PermissionRules(),
+            mode=PermissionMode.DEFAULT,
+            rules=PermissionRules(
+                allow=[
+                    PermissionRule(PermissionBehavior.ALLOW, tool="*", pattern="*")
+                ]
+            ),
             workspace=workspace,
         )
     )
@@ -57,7 +71,7 @@ def test_tool_timeout_becomes_recoverable_observation(tmp_path):
             ToolContext(
                 tmp_path,
                 tool_timeout_seconds=0.01,
-                permission_engine=bypass_engine(tmp_path),
+                permission_engine=allow_all_engine(tmp_path),
             ),
         )
     )
@@ -98,7 +112,7 @@ def test_registry_failures_have_stable_codes_and_stages(tmp_path):
         default_tools(),
         "write_file",
         {"path": "answer.txt", "unexpected": True},
-        ToolContext(tmp_path, allow_write=True),
+        ToolContext(tmp_path, approval_handler=approve_all_handler()),
     )
     denied = execute(
         default_tools(),
@@ -194,7 +208,7 @@ def test_legacy_tool_gets_fail_closed_inferred_descriptor(tmp_path):
         registry,
         "legacy",
         {},
-        ToolContext(tmp_path, permission_engine=bypass_engine(tmp_path)),
+        ToolContext(tmp_path, permission_engine=allow_all_engine(tmp_path)),
     )
 
     assert result.output == "ok"
@@ -254,13 +268,13 @@ def test_invalid_and_legacy_error_results_are_normalized(tmp_path):
         registry,
         "invalid_result",
         {},
-        ToolContext(tmp_path, permission_engine=bypass_engine(tmp_path)),
+        ToolContext(tmp_path, permission_engine=allow_all_engine(tmp_path)),
     )
     legacy = execute(
         registry,
         "legacy_error",
         {},
-        ToolContext(tmp_path, permission_engine=bypass_engine(tmp_path)),
+        ToolContext(tmp_path, permission_engine=allow_all_engine(tmp_path)),
     )
 
     assert (invalid.failure.code, invalid.failure.stage) == ("invalid_result", "postprocess")
@@ -347,7 +361,7 @@ def test_write_requires_explicit_permission(tmp_path):
         default_tools(),
         "write_file",
         {"path": "answer.txt", "content": "42"},
-        ToolContext(tmp_path, allow_write=False),
+        ToolContext(tmp_path),
     )
     assert result.is_error
     assert not (tmp_path / "answer.txt").exists()
@@ -358,7 +372,7 @@ def test_write_stays_inside_workspace(tmp_path):
         default_tools(),
         "write_file",
         {"path": "notes/answer.txt", "content": "42"},
-        ToolContext(tmp_path, allow_write=True),
+        ToolContext(tmp_path, approval_handler=approve_all_handler()),
     )
     assert not result.is_error
     assert (tmp_path / "notes/answer.txt").read_text(encoding="utf-8") == "42"
@@ -369,7 +383,7 @@ def test_read_then_edit_replaces_one_match_and_preserves_mode(tmp_path):
     path.write_text("timeout = 10\n", encoding="utf-8")
     path.chmod(0o640)
     snapshots = FileSnapshotStore()
-    context = ToolContext(tmp_path, allow_write=True, file_snapshots=snapshots)
+    context = ToolContext(tmp_path, approval_handler=approve_all_handler(), file_snapshots=snapshots)
     tools = default_tools()
 
     read = execute(tools, "read_file", {"path": "app.py"}, context)
@@ -393,7 +407,7 @@ def test_edit_requires_read_snapshot_or_expected_hash(tmp_path):
         default_tools(),
         "edit_file",
         {"path": "app.py", "old_text": "old", "new_text": "new"},
-        ToolContext(tmp_path, allow_write=True, file_snapshots=FileSnapshotStore()),
+        ToolContext(tmp_path, approval_handler=approve_all_handler(), file_snapshots=FileSnapshotStore()),
     )
 
     assert result.failure.code == "file_not_read"
@@ -404,7 +418,7 @@ def test_edit_detects_external_change_after_read(tmp_path):
     path = tmp_path / "app.py"
     path.write_text("original", encoding="utf-8")
     snapshots = FileSnapshotStore()
-    context = ToolContext(tmp_path, allow_write=True, file_snapshots=snapshots)
+    context = ToolContext(tmp_path, approval_handler=approve_all_handler(), file_snapshots=snapshots)
     tools = default_tools()
     execute(tools, "read_file", {"path": "app.py"}, context)
     path.write_text("user changed", encoding="utf-8")
@@ -424,7 +438,7 @@ def test_edit_rejects_missing_or_ambiguous_match_without_writing(tmp_path):
     path = tmp_path / "values.txt"
     path.write_text("same same", encoding="utf-8")
     snapshots = FileSnapshotStore()
-    context = ToolContext(tmp_path, allow_write=True, file_snapshots=snapshots)
+    context = ToolContext(tmp_path, approval_handler=approve_all_handler(), file_snapshots=snapshots)
     tools = default_tools()
     execute(tools, "read_file", {"path": "values.txt"}, context)
 
@@ -450,7 +464,7 @@ def test_edit_replace_all_preserves_unicode_and_line_endings(tmp_path):
     path = tmp_path / "values.txt"
     path.write_bytes("值=旧\r\n值=旧\r\n".encode())
     snapshots = FileSnapshotStore()
-    context = ToolContext(tmp_path, allow_write=True, file_snapshots=snapshots)
+    context = ToolContext(tmp_path, approval_handler=approve_all_handler(), file_snapshots=snapshots)
     tools = default_tools()
     execute(tools, "read_file", {"path": "values.txt"}, context)
 
@@ -477,7 +491,7 @@ def test_edit_atomic_replace_failure_keeps_original_and_cleans_temp(
     path = tmp_path / "app.py"
     path.write_text("old", encoding="utf-8")
     snapshots = FileSnapshotStore()
-    context = ToolContext(tmp_path, allow_write=True, file_snapshots=snapshots)
+    context = ToolContext(tmp_path, approval_handler=approve_all_handler(), file_snapshots=snapshots)
     tools = default_tools()
     execute(tools, "read_file", {"path": "app.py"}, context)
 
@@ -512,7 +526,7 @@ def test_edit_accepts_explicit_expected_hash_without_prior_read(tmp_path):
             "new_text": "new",
             "expected_sha256": expected,
         },
-        ToolContext(tmp_path, allow_write=True),
+        ToolContext(tmp_path, approval_handler=approve_all_handler()),
     )
 
     assert not result.is_error
@@ -532,7 +546,7 @@ def test_edit_rejects_path_escape(tmp_path):
             "new_text": "new",
             "expected_sha256": FileSnapshotStore.snapshot(outside, outside.read_bytes()).sha256,
         },
-        ToolContext(tmp_path, allow_write=True),
+        ToolContext(tmp_path, approval_handler=approve_all_handler()),
     )
 
     assert result.failure.code == "permission_denied"
@@ -553,7 +567,7 @@ def test_edit_rejects_runtime_secret(tmp_path):
             "new_text": "new",
             "expected_sha256": expected,
         },
-        ToolContext(tmp_path, allow_write=True),
+        ToolContext(tmp_path, approval_handler=approve_all_handler()),
     )
 
     assert result.failure.code == "protected_file"
@@ -570,7 +584,7 @@ def test_edit_reports_missing_file(tmp_path):
             "new_text": "new",
             "expected_sha256": "0" * 64,
         },
-        ToolContext(tmp_path, allow_write=True),
+        ToolContext(tmp_path, approval_handler=approve_all_handler()),
     )
 
     assert result.failure.code == "file_not_found"
@@ -584,7 +598,7 @@ def test_edit_schema_rejects_empty_match_and_invalid_hash(tmp_path):
         default_tools(),
         "edit_file",
         {"path": "app.py", "old_text": "", "new_text": "new"},
-        ToolContext(tmp_path, allow_write=True),
+        ToolContext(tmp_path, approval_handler=approve_all_handler()),
     )
     invalid_hash = execute(
         default_tools(),
@@ -595,7 +609,7 @@ def test_edit_schema_rejects_empty_match_and_invalid_hash(tmp_path):
             "new_text": "new",
             "expected_sha256": "short",
         },
-        ToolContext(tmp_path, allow_write=True),
+        ToolContext(tmp_path, approval_handler=approve_all_handler()),
     )
 
     assert empty.failure.code == "invalid_input"
@@ -605,7 +619,7 @@ def test_edit_schema_rejects_empty_match_and_invalid_hash(tmp_path):
 
 def test_write_file_refreshes_snapshot_for_followup_edit(tmp_path):
     snapshots = FileSnapshotStore()
-    context = ToolContext(tmp_path, allow_write=True, file_snapshots=snapshots)
+    context = ToolContext(tmp_path, approval_handler=approve_all_handler(), file_snapshots=snapshots)
     tools = default_tools()
 
     execute(
@@ -642,7 +656,7 @@ def test_json_schema_is_enforced_before_tool_execution(tmp_path):
         default_tools(),
         "write_file",
         {"path": "answer.txt", "unexpected": True},
-        ToolContext(tmp_path, allow_write=True),
+        ToolContext(tmp_path, approval_handler=approve_all_handler()),
     )
     assert result.is_error
     assert "Invalid arguments" in result.output

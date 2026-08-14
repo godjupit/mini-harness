@@ -14,8 +14,7 @@ class PermissionBehavior(str, Enum):
 
 class PermissionMode(str, Enum):
     DEFAULT = "default"
-    ACCEPT_EDITS = "accept_edits"
-    BYPASS = "bypass"
+    AUTO_REVIEW = "auto_review"
 
 
 @dataclass(frozen=True)

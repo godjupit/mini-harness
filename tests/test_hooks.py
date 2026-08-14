@@ -20,20 +20,36 @@ from mini_openharness.hooks import (
 )
 from mini_openharness.models import ModelReply, ToolCall
 from mini_openharness.permissions import (
+    HumanApprovalHandler,
+    PermissionBehavior,
     PermissionContext,
     PermissionEngine,
     PermissionMode,
+    PermissionRule,
     PermissionRules,
 )
 from mini_openharness.tools import ToolRegistry, ToolResult
 from mini_openharness.trace import TraceStore, TraceWriter
 
 
-def bypass_engine(workspace: Path) -> PermissionEngine:
+async def approve_all(request, decision):
+    del request, decision
+    return True
+
+
+def approve_all_handler() -> HumanApprovalHandler:
+    return HumanApprovalHandler(approve_all)
+
+
+def allow_all_engine(workspace: Path) -> PermissionEngine:
     return PermissionEngine(
         PermissionContext(
-            mode=PermissionMode.BYPASS,
-            rules=PermissionRules(),
+            mode=PermissionMode.DEFAULT,
+            rules=PermissionRules(
+                allow=[
+                    PermissionRule(PermissionBehavior.ALLOW, tool="*", pattern="*")
+                ]
+            ),
             workspace=workspace,
         )
     )
@@ -324,7 +340,7 @@ def test_pre_and_post_tool_hooks_transform_the_real_execution(tmp_path):
             tools=tools,
             workspace=tmp_path,
             hooks=hooks,
-            permission_engine=bypass_engine(tmp_path),
+            permission_engine=allow_all_engine(tmp_path),
         ),
         "go",
     )
@@ -370,7 +386,7 @@ def test_pre_tool_block_becomes_observation_without_side_effect(tmp_path):
             provider=provider,
             tools=tools,
             workspace=tmp_path,
-            allow_write=True,
+            approval_handler=approve_all_handler(),
             hooks=hooks,
         ),
         "go",

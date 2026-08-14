@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shlex
+import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,7 +37,22 @@ def check_safety(
                 PermissionBehavior.DENY,
                 "no workspace configured for path safety check",
             )
-        return check_path_safety(request.path, context.workspace)
+        result = check_path_safety(request.path, context.workspace)
+        if not result.safe:
+            return result
+        if request.effect == "write":
+            if is_sensitive_write_path(request.path, context.workspace):
+                return SafetyResult(
+                    False,
+                    PermissionBehavior.ASK,
+                    f"sensitive file write: {request.path}",
+                )
+            return SafetyResult(
+                True,
+                PermissionBehavior.ALLOW,
+                "workspace edit is allowed",
+            )
+        return SafetyResult(True, reason="")
     return SafetyResult(True, reason="")
 
 
@@ -60,20 +76,28 @@ def check_shell_safety(command: str, workspace: Path | None = None) -> SafetyRes
             "multi-line shell command is not allowed",
         )
     chains = split_command_chain(command)
+    if chains is not None and len(chains) == 1 and matches_safe_builtin(command):
+        return SafetyResult(True, PermissionBehavior.ALLOW, "built-in safe command")
     if chains is None:
         return SafetyResult(
             False,
             PermissionBehavior.ASK,
             "shell command cannot be statically verified",
         )
-    for argv in chains:
-        if not classify_simple_command(argv, workspace):
-            return SafetyResult(
-                False,
-                PermissionBehavior.ASK,
-                f"subcommand is not routine-safe: {' '.join(argv)}",
-            )
-    return SafetyResult(True, PermissionBehavior.ALLOW, "routine shell command")
+    verdicts = [classify_simple_command(argv, workspace) for argv in chains]
+    if any(verdict == "deny" for verdict in verdicts):
+        return SafetyResult(
+            False,
+            PermissionBehavior.DENY,
+            f"destructive subcommand: {' '.join(chains[verdicts.index('deny')])}",
+        )
+    if all(verdict == "allow" for verdict in verdicts):
+        return SafetyResult(True, PermissionBehavior.ALLOW, "routine shell command")
+    return SafetyResult(
+        False,
+        PermissionBehavior.ASK,
+        "subcommand is not routine-safe",
+    )
 
 
 def resolve_safe_path(path: str, workspace: Path) -> Path:
@@ -87,6 +111,35 @@ def resolve_safe_path(path: str, workspace: Path) -> Path:
 def is_dangerous_command(command: str) -> bool:
     """Return True for clear injection boundary violations (hard DENY)."""
     return "\n" in command or "\r" in command
+
+
+SAFE_COMMANDS = frozenset(
+    {"ls", "pwd", "cat", "head", "tail", "grep", "find", "which", "file"}
+)
+SAFE_GIT_SUBCOMMANDS = frozenset({"status", "diff", "log", "show", "branch"})
+SAFE_PYTHON_PATTERNS = (
+    "python --version*",
+    "python3 --version*",
+    "python -m pytest*",
+    "python3 -m pytest*",
+)
+SAFE_NPM_PATTERNS = ("npm test*", "npm run test*")
+
+
+def matches_safe_builtin(command: str) -> bool:
+    """Layer 4: known read-only / routine commands never enter review."""
+    cmd = command.strip()
+    if not cmd:
+        return False
+    tokens = cmd.split()
+    if tokens[0] in SAFE_COMMANDS:
+        return True
+    if tokens[0] == "git" and len(tokens) >= 2:
+        return tokens[1] in SAFE_GIT_SUBCOMMANDS
+    return any(
+        fnmatch.fnmatch(cmd, pattern)
+        for pattern in (*SAFE_PYTHON_PATTERNS, *SAFE_NPM_PATTERNS)
+    )
 
 
 def is_complex_command(command: str) -> bool:
@@ -107,9 +160,9 @@ def is_complex_command(command: str) -> bool:
 
 
 ROUTINE_SAFE_COMMANDS = frozenset(
-    {"pwd", "ls", "cat", "head", "tail", "wc", "which", "grep", "rg"}
+    {"pwd", "ls", "cat", "head", "tail", "wc", "which", "grep", "rg", "find", "file"}
 )
-GIT_SAFE_SUBCOMMANDS = frozenset({"status", "diff", "log", "show"})
+GIT_SAFE_SUBCOMMANDS = frozenset({"status", "diff", "log", "show", "branch"})
 
 
 def split_command_chain(command: str) -> list[list[str]] | None:
@@ -125,11 +178,12 @@ def split_command_chain(command: str) -> list[list[str]] | None:
         tokens = list(lexer)
     except ValueError:
         return None
-    unsupported = {"|", "||", ";", "&", "<", ">", "<<", ">>", "(", ")"}
+    separators = {"&&", "|"}
+    unsupported = {"||", ";", "&", "<", ">", "<<", ">>", "(", ")"}
     chains: list[list[str]] = []
     current: list[str] = []
     for token in tokens:
-        if token == "&&":
+        if token in separators:
             if not current:
                 return None
             chains.append(current)
@@ -144,34 +198,64 @@ def split_command_chain(command: str) -> list[list[str]] | None:
     return chains
 
 
-def classify_simple_command(argv: list[str], workspace: Path | None) -> bool:
-    """Return True when a single command is routine-safe (ALLOW-able)."""
+def classify_simple_command(argv: list[str], workspace: Path | None) -> str:
+    """Classify one command: ``allow``, ``ask``, or ``deny``."""
     parts = _skip_assignments(argv)
     if not parts:
-        return False
+        return "ask"
     name, args = parts[0], parts[1:]
+    if is_destructive_command(name, args):
+        return "deny"
     if name in ROUTINE_SAFE_COMMANDS:
-        return True
+        return "allow"
     if name == "cd":
-        return is_safe_cd(args[0] if args else None, workspace)
+        return "allow" if is_safe_cd(args[0] if args else None, workspace) else "ask"
     if name in {"python", "python3"}:
-        return is_routine_test_command(args)
+        if is_routine_test_command(args) or is_version_command(args):
+            return "allow"
+        return "ask"
     if name == "pytest":
-        return True
+        return "allow"
     if name == "npm":
-        return len(args) >= 1 and args[0] == "test"
+        return "allow" if is_npm_test(args) else "ask"
     if name == "cargo":
-        return len(args) >= 1 and args[0] == "test"
+        return "allow" if args and args[0] == "test" else "ask"
     if name == "go":
-        return len(args) >= 1 and args[0] == "test"
+        return "allow" if args and args[0] == "test" else "ask"
     if name == "git":
-        return len(args) >= 1 and args[0] in GIT_SAFE_SUBCOMMANDS
-    return False
+        return "allow" if args and args[0] in GIT_SAFE_SUBCOMMANDS else "ask"
+    return "ask"
 
 
 def is_routine_test_command(args: list[str]) -> bool:
     """Recognize ``python -m pytest`` (the only auto-allowed python form)."""
     return len(args) >= 2 and args[0] == "-m" and args[1] == "pytest"
+
+
+def is_version_command(args: list[str]) -> bool:
+    return args in (["--version"], ["-V"])
+
+
+def is_npm_test(args: list[str]) -> bool:
+    if not args:
+        return False
+    if args[0] == "test":
+        return True
+    return args[0] == "run" and len(args) >= 2 and args[1] == "test"
+
+
+def is_destructive_command(name: str, args: list[str]) -> bool:
+    """Hard DENY for clearly destructive invocations (e.g. ``rm -rf /``)."""
+    if name not in {"rm", "rmdir"}:
+        return False
+    recursive = any(flag in {"-rf", "-fr"} for flag in args)
+    if not recursive:
+        return False
+    return any(
+        target in {"/", "/*"}
+        for target in args
+        if not target.startswith("-")
+    )
 
 
 def is_safe_cd(path: str | None, workspace: Path | None) -> bool:
@@ -189,6 +273,32 @@ def is_safe_cd(path: str | None, workspace: Path | None) -> bool:
     except ValueError:
         return False
     return True
+
+
+SENSITIVE_WRITE_NAMES = frozenset(
+    {".npmrc", ".pypirc", ".pypirc", "credentials", ".credentials"}
+)
+
+
+def is_sensitive_write_path(path: str, workspace: Path) -> bool:
+    """Layer 5: sensitive writes (secrets/config) stay ASK; plain edits ALLOW."""
+    try:
+        relative = (workspace / path).resolve().relative_to(workspace.resolve())
+    except ValueError:
+        return True  # outside the workspace is DENY'd by check_path_safety
+    parts = relative.parts
+    if not parts:
+        return True
+    name = parts[-1]
+    if name == ".env" or (name.startswith(".env.") and name != ".env.example"):
+        return True
+    if ".git" in parts or ".github" in parts:
+        return True
+    if name in SENSITIVE_WRITE_NAMES:
+        return True
+    if any(part in {"secrets", "credentials"} for part in parts):
+        return True
+    return False
 
 
 def _skip_assignments(argv: list[str]) -> list[str]:

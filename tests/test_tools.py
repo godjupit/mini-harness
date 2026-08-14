@@ -151,7 +151,7 @@ def test_registry_failures_have_stable_codes_and_stages(tmp_path):
     denied = execute(
         default_tools(),
         "write_file",
-        {"path": "answer.txt", "content": "no"},
+        {"path": ".npmrc", "content": "no"},
         ToolContext(tmp_path),
     )
 
@@ -213,7 +213,7 @@ def test_explicit_descriptor_controls_source_effect_and_permission_path(tmp_path
     denied = execute(
         registry,
         "put_document",
-        {"filename": "src/a.py", "content": "no"},
+        {"filename": ".npmrc", "content": "no"},
         ToolContext(tmp_path, permission_engine=engine),
     )
 
@@ -390,15 +390,15 @@ def test_runtime_secrets_are_hidden_from_file_tools(tmp_path):
     assert "remote.json" not in listing.output
 
 
-def test_write_requires_explicit_permission(tmp_path):
+def test_sensitive_write_requires_explicit_permission(tmp_path):
     result = execute(
         default_tools(),
         "write_file",
-        {"path": "answer.txt", "content": "42"},
+        {"path": ".npmrc", "content": "registry=https://x"},
         ToolContext(tmp_path),
     )
     assert result.is_error
-    assert not (tmp_path / "answer.txt").exists()
+    assert not (tmp_path / ".npmrc").exists()
 
 
 def test_write_stays_inside_workspace(tmp_path):

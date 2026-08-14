@@ -56,6 +56,10 @@ class PermissionEngine:
                     result.reason or "routine command is safe",
                 )
             return None
+        if result.behavior == PermissionBehavior.ASK:
+            if find_matching_rule(request, self.context.rules.deny) is not None:
+                return None  # 显式 deny 规则优先于 safety 的 ASK
+            return PermissionDecision(result.behavior, result.reason)
         return PermissionDecision(result.behavior, result.reason)
 
     def _check_deny_rules(self, request: PermissionRequest) -> PermissionDecision | None:

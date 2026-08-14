@@ -71,7 +71,7 @@ def test_engine_rules_safety_and_defaults(tmp_path):
     )
     assert (
         engine.authorize(request("write_file", path="src/a.py", effect="write")).behavior
-        == PermissionBehavior.ASK
+        == PermissionBehavior.ALLOW
     )
     assert (
         engine.authorize(request("list_files", path=".")).behavior
@@ -99,6 +99,35 @@ def test_engine_rules_safety_and_defaults(tmp_path):
         engine.authorize(
             request("sandbox_shell", command="$(rm -rf /)", effect="write")
         ).behavior
+        == PermissionBehavior.ASK
+    )
+
+
+def test_workspace_edits_allowed_and_sensitive_writes_ask(tmp_path):
+    engine = make_engine(tmp_path)
+
+    assert (
+        engine.authorize(
+            request("write_file", path="src/app.py", effect="write")
+        ).behavior
+        == PermissionBehavior.ALLOW
+    )
+    assert (
+        engine.authorize(
+            request("write_file", path="tests/test_x.py", effect="write")
+        ).behavior
+        == PermissionBehavior.ALLOW
+    )
+    assert (
+        engine.authorize(request("write_file", path=".env", effect="write")).behavior
+        == PermissionBehavior.ASK
+    )
+    assert (
+        engine.authorize(request("edit_file", path=".git/config", effect="write")).behavior
+        == PermissionBehavior.ASK
+    )
+    assert (
+        engine.authorize(request("write_file", path=".npmrc", effect="write")).behavior
         == PermissionBehavior.ASK
     )
 
@@ -131,7 +160,7 @@ def test_ask_decision_goes_through_approval_and_is_traced(tmp_path):
     result = asyncio.run(
         default_tools().execute(
             "write_file",
-            {"path": "approved.txt", "content": "ok"},
+            {"path": ".npmrc", "content": "ok"},
             ToolContext(
                 tmp_path,
                 permission_engine=make_engine(tmp_path),
@@ -153,7 +182,7 @@ def test_ask_decision_goes_through_approval_and_is_traced(tmp_path):
     assert event.data["source"] == "local"
     assert event.data["effect"] == "write"
     assert event.data["descriptor_inferred"] is False
-    assert event.data["path"] == "approved.txt"
+    assert event.data["path"] == ".npmrc"
 
 
 def test_explicit_deny_overrides_rules_and_default(tmp_path):
@@ -207,7 +236,15 @@ def test_shell_routine_commands_are_allowed(tmp_path):
         "cd tests && pytest",
         "python -m pytest tests/test_x.py",
         "git diff",
+        "git branch",
+        "python --version",
+        "npm run test",
         "grep abc main.py",
+        "find . -name '*.py'",
+        "file README.md",
+        "git status | head -20",
+        "ls /usr/bin | grep python",
+        "cat file | grep hello",
     ]
     for command in allowed:
         decision = engine.authorize(
@@ -225,8 +262,8 @@ def test_shell_unsafe_or_uncertain_commands_ask(tmp_path):
         "pip install requests",
         "rm file.txt",
         "cd .. && ls",
+        "pytest && rm file",
         "echo hello > file.txt",
-        "cat file | grep hello",
         "cmd1 || cmd2",
     ]
     for command in cases:
@@ -234,6 +271,20 @@ def test_shell_unsafe_or_uncertain_commands_ask(tmp_path):
             request("sandbox_shell", command=command, effect="write")
         )
         assert decision.behavior == PermissionBehavior.ASK, command
+
+
+def test_shell_destructive_commands_deny(tmp_path):
+    engine = make_engine(tmp_path)
+    cases = [
+        "ls && rm -rf /",
+        "rm -rf /*",
+        "cd src && rm -rf /",
+    ]
+    for command in cases:
+        decision = engine.authorize(
+            request("sandbox_shell", command=command, effect="write")
+        )
+        assert decision.behavior == PermissionBehavior.DENY, command
 
 
 def test_shell_multiline_command_is_denied(tmp_path):
@@ -333,7 +384,7 @@ def test_load_rules_from_json(tmp_path):
     denied = engine.authorize(request("write_file", path="src/a.py", effect="write"))
 
     assert allowed.behavior == PermissionBehavior.ALLOW
-    assert denied.behavior == PermissionBehavior.ASK
+    assert denied.behavior == PermissionBehavior.ALLOW
 
 
 def test_load_rules_from_json_maps_command_to_pattern(tmp_path):
@@ -352,8 +403,8 @@ def test_tool_registry_passes_shell_command_to_engine(tmp_path):
     class FakeSandbox:
         called = False
 
-        async def run(self, *, workspace, command, timeout):
-            del workspace, command, timeout
+        async def run(self, *, command, timeout):
+            del command, timeout
             self.called = True
             return ToolResult("ran")
 

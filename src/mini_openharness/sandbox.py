@@ -19,7 +19,7 @@ class SandboxUnavailableError(RuntimeError):
 
 @dataclass(frozen=True)
 class DockerSandboxConfig:
-    image: str = "alpine:3.20"
+    image: str = "python:3.12-slim"
     memory: str = "512m"
     cpus: float = 1.0
     pids_limit: int = 128

@@ -119,7 +119,7 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
         default=True,
         help="Enable Docker-only sandbox_shell (default); use --no-sandbox-shell to disable",
     )
-    parser.add_argument("--sandbox-image", default="alpine:3.20")
+    parser.add_argument("--sandbox-image", default="python:3.12-slim")
     parser.add_argument("--sandbox-memory", default="512m")
     parser.add_argument("--sandbox-cpus", type=float, default=1.0)
     parser.add_argument("--sandbox-pids", type=int, default=128)

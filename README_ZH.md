@@ -385,10 +385,10 @@ mini-oh --skills-dir ./skills --workspace . "Use the available project skills."
 Shell 执行默认关闭，需显式启用：
 
 ```bash
-docker pull alpine:3.20
+docker pull python:3.12-slim
 mini-oh \
   --sandbox-shell \
-  --sandbox-image alpine:3.20 \
+  --sandbox-image python:3.12-slim \
   --workspace . \
   "Run the project checks."
 ```

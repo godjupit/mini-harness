@@ -1,10 +1,16 @@
 import asyncio
 import os
+from types import SimpleNamespace
 
 import pytest
 
 import mini_openharness.cli as cli
 from mini_openharness.cli import _load_environment, build_run_parser
+from mini_openharness.permissions import (
+    PermissionBehavior,
+    PermissionDecision,
+    PermissionRequest,
+)
 from mini_openharness.provider import ProviderError
 
 
@@ -107,3 +113,37 @@ def test_cli_runtime_registers_the_agent_tool(tmp_path):
             await cli._close_runtime(mcp_manager, provider)
 
     asyncio.run(build())
+
+
+def test_reviewer_prompt_includes_request_details(tmp_path):
+    args = build_run_parser().parse_args(["--workspace", str(tmp_path)])
+    captured = {}
+
+    class FakeProvider:
+        async def complete(self, messages, tools):
+            del tools
+            captured["prompt"] = messages[0].content
+            return SimpleNamespace(content="approve")
+
+    reviewer = cli._build_reviewer(args, FakeProvider())
+    request = PermissionRequest(
+        tool_name="sandbox_shell",
+        input={"command": "npm publish"},
+        source="sandbox",
+        effect="write",
+        destructive=True,
+        path=None,
+        command="npm publish",
+    )
+    decision = PermissionDecision(PermissionBehavior.ASK, "needs review")
+
+    approved = asyncio.run(reviewer(request, decision))
+
+    assert approved is True
+    prompt = captured["prompt"]
+    assert "tool: sandbox_shell" in prompt
+    assert "command: npm publish" in prompt
+    assert "path: None" in prompt
+    assert f"workspace: {tmp_path.resolve()}" in prompt
+    assert "effect: write" in prompt
+    assert "reason: needs review" in prompt

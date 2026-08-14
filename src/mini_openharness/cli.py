@@ -461,13 +461,19 @@ def _approval_callback(args: argparse.Namespace):
 
 def _build_reviewer(args: argparse.Namespace, provider):
     """Independent reviewer: one tool-less model call answers approve/reject."""
-    del args
+    workspace = Path(args.workspace).resolve()
 
     async def review(request, decision) -> bool:
         prompt = (
             "You are an independent permission reviewer. Decide whether to approve "
             "the following request. Reply with exactly one word: approve or reject.\n"
             f"tool: {request.tool_name}\n"
+            f"source: {request.source}\n"
+            f"effect: {request.effect}\n"
+            f"destructive: {request.destructive}\n"
+            f"path: {request.path}\n"
+            f"command: {request.command}\n"
+            f"workspace: {workspace}\n"
             f"input: {request.input}\n"
             f"reason: {decision.reason}\n"
         )

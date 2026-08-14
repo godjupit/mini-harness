@@ -1,17 +1,42 @@
 import asyncio
+import json
 import os
+import pty
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
 import mini_openharness.cli as cli
 from mini_openharness.cli import _load_environment, build_run_parser
+from mini_openharness.models import ModelReply
 from mini_openharness.permissions import (
     PermissionBehavior,
     PermissionDecision,
     PermissionRequest,
 )
 from mini_openharness.provider import ProviderError
+
+
+class RecordingDemoProvider:
+    """Drop-in DemoProvider replacement that records every request."""
+
+    last = None
+
+    def __init__(self) -> None:
+        self.requests: list[list[str]] = []
+        type(self).last = self
+
+    async def complete(self, messages, tools):
+        del tools
+        self.requests.append(
+            [message.content for message in messages if message.role in {"user", "assistant"}]
+        )
+        return ModelReply(content="ok")
+
+    async def close(self):
+        pass
 
 
 def test_local_dotenv_is_loaded_without_overriding_shell(tmp_path, monkeypatch):
@@ -147,3 +172,147 @@ def test_reviewer_prompt_includes_request_details(tmp_path):
     assert f"workspace: {tmp_path.resolve()}" in prompt
     assert "effect: write" in prompt
     assert "reason: needs review" in prompt
+
+
+def test_single_shot_with_prompt_does_not_enter_repl(tmp_path, capsys):
+    code = cli.main(
+        [
+            "--demo",
+            "--workspace",
+            str(tmp_path),
+            "--no-trace",
+            "--no-session",
+            "single shot",
+        ]
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "done in" in out
+    assert "workspace:" not in out  # REPL banner must not appear
+
+
+def test_no_prompt_enters_interactive_repl(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "DemoProvider", RecordingDemoProvider)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "/exit")
+
+    code = cli.main(
+        ["--demo", "--workspace", str(tmp_path), "--no-trace", "--no-session"]
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "workspace:" in out
+    assert RecordingDemoProvider.last.requests == []
+
+
+def test_interactive_keeps_conversation_and_one_session(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "DemoProvider", RecordingDemoProvider)
+    inputs = iter(["first turn", "second turn", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+    args = build_run_parser().parse_args(
+        [
+            "--demo",
+            "--workspace",
+            str(tmp_path),
+            "--no-trace",
+            "--session-dir",
+            str(tmp_path / "sessions"),
+        ]
+    )
+
+    code = asyncio.run(cli._interactive(args))
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "workspace:" in out
+    assert "session:" in out
+
+    provider = RecordingDemoProvider.last
+    assert len(provider.requests) == 2
+    # second turn's model request contains the first turn history
+    assert provider.requests[1] == ["first turn", "ok", "second turn"]
+
+    files = list((tmp_path / "sessions").glob("*.jsonl"))
+    assert len(files) == 1
+    lines = [
+        json.loads(line)
+        for line in files[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    user_turns = [
+        line["message"]["content"]
+        for line in lines
+        if line["type"] == "message" and line["message"]["role"] == "user"
+    ]
+    assert user_turns == ["first turn", "second turn"]
+
+
+def test_interactive_help_does_not_call_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "DemoProvider", RecordingDemoProvider)
+    inputs = iter(["/help", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+    args = build_run_parser().parse_args(
+        ["--demo", "--workspace", str(tmp_path), "--no-trace", "--no-session"]
+    )
+
+    code = asyncio.run(cli._interactive(args))
+
+    assert code == 0
+    assert RecordingDemoProvider.last.requests == []
+
+
+def test_interactive_eof_exits_cleanly(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "DemoProvider", RecordingDemoProvider)
+
+    def eof(prompt=""):
+        del prompt
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    args = build_run_parser().parse_args(
+        ["--demo", "--workspace", str(tmp_path), "--no-trace", "--no-session"]
+    )
+
+    code = asyncio.run(cli._interactive(args))
+
+    assert code == 0
+    assert RecordingDemoProvider.last.requests == []
+
+
+def test_interactive_ctrl_c_at_prompt_exits(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "DemoProvider", RecordingDemoProvider)
+
+    def ctrl_c(prompt=""):
+        del prompt
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", ctrl_c)
+    args = build_run_parser().parse_args(
+        ["--demo", "--workspace", str(tmp_path), "--no-trace", "--no-session"]
+    )
+
+    code = asyncio.run(cli._interactive(args))
+
+    assert code == 0
+    assert RecordingDemoProvider.last.requests == []
+
+
+def test_read_line_backspace_removes_full_multibyte_char():
+    master, slave = pty.openpty()
+
+    def type_input():
+        time.sleep(0.05)
+        os.write(master, "你好吗".encode("utf-8"))
+        os.write(master, b"\x7f\x7f")  # 退格两次，应删除"吗"和"好"
+        os.write(master, "!".encode("utf-8"))
+        os.write(master, b"\r")
+
+    threading.Thread(target=type_input, daemon=True).start()
+    try:
+        line = cli._read_line("> ", in_fd=slave, out_fd=slave)
+    finally:
+        os.close(master)
+        os.close(slave)
+
+    assert line == "你!"

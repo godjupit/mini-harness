@@ -184,7 +184,7 @@ def _session_dir(args: argparse.Namespace) -> Path:
 
 async def _run(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
-    prompt = args.prompt or "Inspect this project and summarize its architecture."
+    prompt = args.prompt
     session_log = None
     if not args.no_session:
         session_log = SessionLog(
@@ -200,6 +200,146 @@ async def _run(args: argparse.Namespace) -> int:
         trace_prompt=prompt,
         run_events=lambda loop: loop.run(prompt),
     )
+
+
+async def _interactive(args: argparse.Namespace) -> int:
+    """Continuous REPL: one runtime / AgentLoop / Session for many prompts."""
+    workspace = Path(args.workspace).resolve()
+    session_log = None
+    if not args.no_session:
+        session_log = SessionLog(
+            _session_dir(args),
+            metadata={"first_prompt": "(interactive)", "interactive": True},
+        )
+        global _ACTIVE_SESSION
+        _ACTIVE_SESSION = session_log
+
+    loop = None
+    tracer = None
+    mcp_manager = None
+    provider = None
+    try:
+        loop, tracer, mcp_manager, provider = await _build_runtime(
+            args,
+            session_log=session_log,
+            trace_prompt="(interactive session)",
+        )
+        if mcp_manager:
+            registered = await mcp_manager.connect_and_register(loop.tools)
+            print(f"connected MCP tools: {', '.join(registered) or '(none)'}")
+
+        print("mini-openharness")
+        print(f"workspace: {workspace}")
+        if session_log is not None:
+            print(f"session: {session_log.session_id}")
+        print("commands: /exit, /quit, /help")
+
+        while True:
+            # 上一轮输出可能以不带换行的流式文本结束；先开新行，
+            # 避免提示符粘在残留字符后面（那些字符无法被删除）。
+            print(flush=True)
+            try:
+                raw = _read_line("❯ ")
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print()
+                break
+            prompt = raw.strip()
+            if not prompt:
+                continue
+            if prompt in {"/exit", "/quit"}:
+                break
+            if prompt == "/help":
+                print("commands: /exit, /quit, /help")
+                continue
+            try:
+                await _consume_events(loop, loop.run(prompt), args)
+            except MaxStepsExceeded as exc:
+                print(f"error: {exc}", file=sys.stderr)
+            except KeyboardInterrupt:
+                loop.cancel()
+                print("cancelled", file=sys.stderr)
+    finally:
+        await _close_runtime(mcp_manager, provider)
+        _ACTIVE_SESSION = None
+    if tracer:
+        print(f"trace: {tracer.path}")
+    if session_log is not None:
+        print(f"session: {session_log.session_id}")
+    return 0
+
+
+def _read_line(
+    prompt: str,
+    *,
+    in_fd: int | None = None,
+    out_fd: int | None = None,
+) -> str:
+    """Read one line with full UTF-8 backspace support.
+
+    Canonical terminal input erases one *byte* per backspace, which leaves
+    partial characters behind for multibyte input. This helper switches the
+    terminal to cbreak mode and redraws the line itself, so backspace always
+    removes one complete character. Non-TTY input (pipes, tests) falls back to
+    plain ``input()``.
+    """
+    if in_fd is None:
+        if not sys.stdin.isatty():
+            return input(prompt)
+        in_fd = sys.stdin.fileno()
+    if out_fd is None:
+        out_fd = sys.stdout.fileno()
+    try:
+        import contextlib
+        import tty
+    except ImportError:
+        return input(prompt)
+
+    buffer = bytearray()
+    try:
+        with contextlib.ExitStack() as stack:
+            previous = tty.tcgetattr(in_fd)
+            stack.callback(tty.tcsetattr, in_fd, tty.TCSADRAIN, previous)
+            tty.setcbreak(in_fd)
+            os.write(out_fd, prompt.encode("utf-8"))
+            while True:
+                chunk = os.read(in_fd, 1)
+                if not chunk:
+                    raise EOFError
+                byte = chunk[0]
+                if byte in (13, 10):
+                    os.write(out_fd, b"\r\n")
+                    break
+                if byte in (127, 8):  # DEL / backspace: erase one full character
+                    if buffer:
+                        text = buffer.decode("utf-8", errors="ignore")
+                        previous_text = text
+                        text = text[:-1]
+                        buffer = bytearray(text.encode("utf-8"))
+                        erase = " " * (len(previous_text) - len(text) + 1)
+                        os.write(
+                            out_fd,
+                            f"\r{prompt}{text}{erase}\r{prompt}{text}".encode("utf-8"),
+                        )
+                    continue
+                if byte == 4 and not buffer:  # Ctrl+D on an empty line = EOF
+                    raise EOFError
+                if byte == 27:  # ignore escape sequences (arrow keys etc.)
+                    seq = os.read(in_fd, 2)
+                    if seq and seq[0] == 91:
+                        while True:
+                            tail = os.read(in_fd, 1)
+                            if not tail or 64 <= tail[0] < 127:
+                                break
+                    continue
+                buffer.append(byte)
+                os.write(out_fd, bytes([byte]))
+    except KeyboardInterrupt:
+        os.write(out_fd, b"\r\n")
+        raise
+    return buffer.decode("utf-8", errors="replace").strip()
 
 
 async def _resume_command(args: argparse.Namespace) -> int:
@@ -572,11 +712,7 @@ def _print_event(event: AgentEvent) -> None:
     elif event.kind in {"error", "cancelled"}:
         print(f"{event.kind}: {event.message}", file=sys.stderr)
     elif event.kind == "done":
-        print(
-            f"done in {event.data['steps']} model step(s), "
-            f"tokens={event.data['input_tokens'] + event.data['output_tokens']}, "
-            f"estimated_cost=${event.data['estimated_cost']:.6f}"
-        )
+        print(f"done in {event.data['steps']} model step(s)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -598,7 +734,10 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(
                 _resume_command(build_resume_parser().parse_args(arguments[1:]))
             )
-        return asyncio.run(_run(build_run_parser().parse_args(arguments)))
+        args = build_run_parser().parse_args(arguments)
+        if args.prompt:
+            return asyncio.run(_run(args))
+        return asyncio.run(_interactive(args))
     except KeyboardInterrupt:
         _print_resume_hint()
         print("cancelled", file=sys.stderr)

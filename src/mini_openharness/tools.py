@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import os
 import stat
@@ -536,9 +537,13 @@ class ReadFileTool:
         return (ResourceAccess(f"fs:{path}", "read"),)
 
 
-class ListFilesTool:
-    name = "list_files"
-    description = "List files below a directory in the workspace."
+class ListDirTool:
+    name = "list_dir"
+    description = (
+        "List the files and directories directly inside a directory in the "
+        "workspace. Directories are suffixed with '/'. Use find_files to search "
+        "recursively for files by name."
+    )
     read_only = True
     descriptor = ToolDescriptor(effect="read", path_argument="path")
     parameters = {
@@ -551,21 +556,73 @@ class ListFilesTool:
         path = _safe_path(context.workspace, str(arguments.get("path", ".")))
         if not path.is_dir():
             return ToolResult(f"Directory not found: {arguments.get('path', '.')}", is_error=True)
-        files = sorted(
-            str(item.relative_to(context.workspace.resolve()))
-            for item in path.rglob("*")
-            if item.is_file()
-            and not _is_runtime_secret(context.workspace, item)
-            and not any(
-                part in {".git", ".mini-oh", ".pytest_cache", ".ruff_cache", "__pycache__", ".venv"}
-                for part in item.relative_to(context.workspace.resolve()).parts
-            )
-        )
-        return ToolResult("\n".join(files[:500]) or "(empty workspace)")
+        entries = []
+        for item in sorted(path.iterdir(), key=lambda candidate: candidate.name):
+            if not _is_listable(context.workspace, item):
+                continue
+            relative = str(item.relative_to(context.workspace.resolve()))
+            entries.append(relative + ("/" if item.is_dir() else ""))
+        return ToolResult("\n".join(entries[:500]) or "(empty directory)")
 
     def resources(self, arguments: dict[str, Any], context: ToolContext):
         path = _safe_path(context.workspace, str(arguments.get("path", ".")))
         return (ResourceAccess(f"fs:{path}", "read", tree=True),)
+
+
+class FindFilesTool:
+    name = "find_files"
+    description = (
+        "Recursively search for files inside the workspace whose name matches a "
+        "glob pattern (e.g. 'cli.py' or '*.py')."
+    )
+    read_only = True
+    descriptor = ToolDescriptor(effect="read", path_argument="path")
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "default": "."},
+            "pattern": {"type": "string", "minLength": 1},
+        },
+        "required": ["pattern"],
+        "additionalProperties": False,
+    }
+
+    async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+        root = _safe_path(context.workspace, str(arguments.get("path", ".")))
+        if not root.is_dir():
+            return ToolResult(
+                f"Directory not found: {arguments.get('path', '.')}",
+                is_error=True,
+            )
+        pattern = str(arguments["pattern"])
+        matches = sorted(
+            str(item.relative_to(context.workspace.resolve()))
+            for item in root.rglob("*")
+            if item.is_file()
+            and fnmatch.fnmatch(item.name, pattern)
+            and _is_listable(context.workspace, item)
+        )
+        return ToolResult(
+            "\n".join(matches[:500]) or f"(no files match {pattern!r})"
+        )
+
+    def resources(self, arguments: dict[str, Any], context: ToolContext):
+        root = _safe_path(context.workspace, str(arguments.get("path", ".")))
+        return (ResourceAccess(f"fs:{root}", "read", tree=True),)
+
+
+def _is_listable(workspace: Path, path: Path) -> bool:
+    """Files/dirs the model may list: no runtime secrets or internal state."""
+    if _is_runtime_secret(workspace, path):
+        return False
+    try:
+        relative = path.relative_to(workspace.resolve())
+    except ValueError:
+        return False
+    return not any(
+        part in {".git", ".mini-oh", ".pytest_cache", ".ruff_cache", "__pycache__", ".venv"}
+        for part in relative.parts
+    )
 
 
 class WriteFileTool:
@@ -728,7 +785,8 @@ class EditFileTool:
 def default_tools() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(ReadFileTool())
-    registry.register(ListFilesTool())
+    registry.register(ListDirTool())
+    registry.register(FindFilesTool())
     registry.register(WriteFileTool())
     registry.register(EditFileTool())
     return registry

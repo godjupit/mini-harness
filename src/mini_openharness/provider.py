@@ -535,7 +535,7 @@ class DemoProvider:
         if not tool_messages:
             return ModelReply(
                 content="我先查看工作区。",
-                tool_calls=(ToolCall("demo-list", "list_files", {"path": "."}),),
+                tool_calls=(ToolCall("demo-list", "list_dir", {"path": "."}),),
             )
         invoked = {message.name for message in tool_messages}
         if "load_skill" in tool_names and "load_skill" not in invoked:

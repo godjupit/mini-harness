@@ -324,6 +324,26 @@ def test_tool_start_does_not_print_write_content(capsys):
     assert "write_file notes/ok.txt (14 chars)" in out
 
 
+def test_sandbox_shell_output_is_hidden(capsys):
+    cli._print_event(
+        AgentEvent(
+            "tool_end",
+            "huge output that should not be shown\nmore lines",
+            {
+                "name": "sandbox_shell",
+                "input": {"command": "ls"},
+                "is_error": False,
+                "elapsed_ms": 5,
+                "returncode": 0,
+            },
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert "huge output" not in out
+    assert "exit 0" in out
+
+
 def test_interactive_ctrl_c_at_prompt_exits(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "DemoProvider", RecordingDemoProvider)
 

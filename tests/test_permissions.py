@@ -74,7 +74,7 @@ def test_engine_rules_safety_and_defaults(tmp_path):
         == PermissionBehavior.ALLOW
     )
     assert (
-        engine.authorize(request("list_files", path=".")).behavior
+        engine.authorize(request("list_dir", path=".")).behavior
         == PermissionBehavior.ALLOW
     )
     assert (

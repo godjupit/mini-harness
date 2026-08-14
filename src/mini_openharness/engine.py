@@ -38,6 +38,8 @@ from mini_openharness.trace import TraceSink
 
 EventKind = Literal[
     "model_start",
+    "first_token",
+    "model_response_end",
     "assistant_delta",
     "assistant",
     "provider_retry",
@@ -290,6 +292,8 @@ class AgentLoop:
             model_attempt = 0
             while True:
                 model_attempt += 1
+                step_started = time.monotonic()
+                first_token_ms: float | None = None
                 yield AgentEvent("model_start", data={"step": step, "attempt": model_attempt})
                 if self.tracer:
                     self.tracer.emit(
@@ -313,6 +317,18 @@ class AgentLoop:
                             cancel_event=state.cancel_event,
                         ):
                             if isinstance(provider_event, ProviderTextDelta):
+                                if first_token_ms is None:
+                                    first_token_ms = (
+                                        time.monotonic() - step_started
+                                    ) * 1000
+                                    ttft_data = {
+                                        "step": step,
+                                        "attempt": model_attempt,
+                                        "ttft_ms": round(first_token_ms, 1),
+                                    }
+                                    if self.tracer:
+                                        self.tracer.emit("first_token", ttft_data)
+                                    yield AgentEvent("first_token", data=ttft_data)
                                 streamed = True
                                 if self.tracer:
                                     self.tracer.emit(
@@ -377,6 +393,23 @@ class AgentLoop:
                     self.tracer.finish(status="failed", data={"reason": error})
                 yield AgentEvent("error", error, {"step": step})
                 return
+
+            total_ms = (time.monotonic() - step_started) * 1000
+            if first_token_ms is None:
+                first_token_ms = total_ms  # 非流式：首 token 即响应完成
+            generation_ms = max(0.0, total_ms - first_token_ms)
+            response_data = {
+                "step": step,
+                "attempt": model_attempt,
+                "ttft_ms": round(first_token_ms, 1),
+                "generation_ms": round(generation_ms, 1),
+                "total_ms": round(total_ms, 1),
+                "input_tokens": reply.input_tokens,
+                "output_tokens": reply.output_tokens,
+            }
+            if self.tracer:
+                self.tracer.emit("model_response_end", response_data)
+            yield AgentEvent("model_response_end", data=response_data)
 
             self._conversation.input_tokens += reply.input_tokens
             self._conversation.output_tokens += reply.output_tokens

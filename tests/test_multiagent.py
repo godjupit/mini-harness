@@ -88,7 +88,7 @@ def test_run_agent_only_exposes_the_subset_of_tools(tmp_path):
     run_agent(manager, explore_agent, "explore")
 
     exposed_names = {tool["name"] for tool in provider.requests[0][1]}
-    assert exposed_names == {"read_file", "list_files"}
+    assert exposed_names == {"read_file", "list_dir", "find_files"}
     assert "write_file" not in exposed_names
 
 
@@ -163,7 +163,8 @@ def test_agent_tool_dispatches_to_subagent_and_returns_result(tmp_path):
     # the subagent loop only saw the subset of tools its definition declares
     assert {item["name"] for item in sub_provider.requests[0][1]} == {
         "read_file",
-        "list_files",
+        "list_dir",
+        "find_files",
     }
 
 
@@ -253,7 +254,11 @@ def test_build_agent_tool_defaults_to_explore_agent(tmp_path):
 
     assert result.output == "explored"
     assert result.is_error is False
-    assert {item["name"] for item in provider.requests[0][1]} == {"read_file", "list_files"}
+    assert {item["name"] for item in provider.requests[0][1]} == {
+        "read_file",
+        "list_dir",
+        "find_files",
+    }
     assert tool.descriptor.timeout_seconds == 300.0
 
 
@@ -291,7 +296,8 @@ def test_build_agent_tool_defaults_include_registered_agents(tmp_path):
     assert result.output == "planned"
     assert {item["name"] for item in provider.requests[0][1]} == {
         "read_file",
-        "list_files",
+        "list_dir",
+        "find_files",
     }
 
 

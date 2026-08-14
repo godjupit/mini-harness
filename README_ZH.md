@@ -218,8 +218,8 @@ Mini Harness 向主模型暴露 `agent` 工具。子 Agent 拥有自己的 `Agen
 
 | Agent | 用途 | 默认工具 |
 | --- | --- | --- |
-| `explore_agent` | 搜索并理解代码库 | `read_file`, `list_files` |
-| `plan_agent` | 基于已有上下文产出实施方案 | `read_file`, `list_files` |
+| `explore_agent` | 搜索并理解代码库 | `read_file`, `list_dir`, `find_files` |
+| `plan_agent` | 基于已有上下文产出实施方案 | `read_file`, `list_dir`, `find_files` |
 
 默认子 Agent 只拿到只读工具，从结构上把“调查/规划”与“变更”分开。通过 `AgentRegistry` 注册自定义 Agent：
 
@@ -233,7 +233,7 @@ agents.register(
         description="reviews implementation changes",
         system_prompt="You are a focused code review agent.",
         max_turns=20,
-        tools=("read_file", "list_files"),
+        tools=("read_file", "list_dir", "find_files"),
     )
 )
 ```
@@ -247,7 +247,8 @@ agents.register(
 | 工具 | 用途 |
 | --- | --- |
 | `read_file` | 读取 workspace 内的 UTF-8 文本文件 |
-| `list_files` | 列出目录下的文件 |
+| `list_dir` | 列出目录内的条目（单层，目录以 `/` 结尾） |
+| `find_files` | 按文件名模式递归搜索（`cli.py`、`*.py`） |
 | `write_file` | 写入 UTF-8 文本文件 |
 | `edit_file` | 带快照校验的就地编辑 |
 

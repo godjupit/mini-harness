@@ -102,7 +102,7 @@ def test_same_agent_loop_rejects_overlapping_runs_and_recovers_after_close(tmp_p
 def test_run_guard_is_released_after_exception(tmp_path):
     provider = ScriptedProvider(
         [
-            ModelReply(tool_calls=(ToolCall("x", "list_files", {}),)),
+            ModelReply(tool_calls=(ToolCall("x", "list_dir", {}),)),
             ModelReply(content="recovered"),
         ]
     )
@@ -176,9 +176,11 @@ def test_model_tool_model_loop(tmp_path):
 
     assert [event.kind for event in events] == [
         "model_start",
+        "model_response_end",
         "tool_start",
         "tool_end",
         "model_start",
+        "model_response_end",
         "assistant",
         "done",
     ]
@@ -476,7 +478,7 @@ def test_repeated_tool_batch_is_blocked_but_model_can_recover(tmp_path):
 
 def test_loop_guard_counter_resets_for_each_user_run(tmp_path):
     tools = default_tools()
-    call = ModelReply(tool_calls=(ToolCall("same", "list_files", {}),))
+    call = ModelReply(tool_calls=(ToolCall("same", "list_dir", {}),))
     provider = ScriptedProvider(
         [call, ModelReply(content="first"), call, ModelReply(content="second")]
     )
@@ -510,7 +512,7 @@ def test_unknown_tool_becomes_observation(tmp_path):
 def test_max_steps_is_a_hard_guard(tmp_path):
     provider = ScriptedProvider(
         [
-            ModelReply(tool_calls=(ToolCall("x", "list_files", {}),)),
+            ModelReply(tool_calls=(ToolCall("x", "list_dir", {}),)),
         ]
     )
     loop = AgentLoop(provider=provider, tools=default_tools(), workspace=tmp_path, max_steps=1)
@@ -772,6 +774,30 @@ def test_stream_deltas_retries_and_provider_failure_are_traced(tmp_path):
     trace_events = list(TraceStore(tmp_path / "traces").read("failed"))
     assert events[-1].kind == "error"
     assert trace_events[-1].data["status"] == "failed"
+
+
+def test_model_ttft_and_response_events_are_tracked(tmp_path):
+    class StreamingProvider:
+        async def stream(self, messages, tools, *, cancel_event=None):
+            del messages, tools, cancel_event
+            yield ProviderTextDelta("hello")
+            yield ProviderComplete(
+                ModelReply(content="hello", input_tokens=10, output_tokens=5)
+            )
+
+    loop = AgentLoop(provider=StreamingProvider(), tools=default_tools(), workspace=tmp_path)
+
+    events = collect(loop, "hi")
+
+    kinds = [event.kind for event in events]
+    assert "model_start" in kinds
+    assert "first_token" in kinds
+    assert "model_response_end" in kinds
+    end = next(event for event in events if event.kind == "model_response_end")
+    assert end.data["ttft_ms"] >= 0
+    assert end.data["generation_ms"] >= 0
+    assert end.data["input_tokens"] == 10
+    assert end.data["output_tokens"] == 5
 
 
 def test_context_error_forces_one_compaction_and_retries_same_model_step(tmp_path):

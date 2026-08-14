@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import signal
+import shutil
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -66,6 +67,7 @@ def _positive_float(value: str) -> float:
 
 
 _ACTIVE_SESSION: SessionLog | None = None
+_THINKING_LINE_OPEN = False
 
 
 def _print_resume_hint() -> None:
@@ -337,14 +339,10 @@ def _read_line(
                 if byte in (127, 8):  # DEL / backspace: erase one full character
                     if buffer:
                         text = buffer.decode("utf-8", errors="ignore")
-                        previous_text = text
+                        up = _visual_lines(text) - 1
                         text = text[:-1]
                         buffer = bytearray(text.encode("utf-8"))
-                        erase = " " * (len(previous_text) - len(text) + 1)
-                        os.write(
-                            out_fd,
-                            f"\r{prompt}{text}{erase}\r{prompt}{text}".encode("utf-8"),
-                        )
+                        _redraw(out_fd, prompt, text, up_lines=up)
                     continue
                 if byte == 4 and not buffer:  # Ctrl+D on an empty line = EOF
                     raise EOFError
@@ -354,6 +352,27 @@ def _read_line(
         os.write(out_fd, b"\r\n")
         raise
     return buffer.decode("utf-8", errors="replace").strip()
+
+
+def _visual_lines(text: str) -> int:
+    width = shutil.get_terminal_size((80, 24)).columns
+    return sum(
+        max(1, (len(line) + width - 1) // width)
+        for line in (text or "").split("\n")
+    )
+
+
+def _redraw(out_fd: int, prompt: str, text: str, up_lines: int = 0) -> None:
+    """Return the cursor to the start of the input and redraw it.
+
+    A plain ``\\r`` only reaches the start of the current *visual* line, so
+    long or pasted multi-line input would pile lines downward on every
+    backspace. Move up by the number of visual lines first, then clear the
+    rest of the screen and redraw.
+    """
+    if up_lines > 0:
+        os.write(out_fd, f"\x1b[{up_lines}A".encode("utf-8"))
+    os.write(out_fd, f"\r\x1b[J{prompt}{text}".encode("utf-8"))
 
 
 async def _resume_command(args: argparse.Namespace) -> int:
@@ -480,7 +499,9 @@ async def _build_runtime(
             "- Use workspace-relative paths (e.g. src/app.py), not absolute paths.\n"
             "\n"
             "TOOLS\n"
-            "- read_file / list_files / write_file / edit_file: workspace file tools; "
+            "- read_file / list_dir / find_files / write_file / edit_file: workspace "
+            "file tools; list_dir shows one directory level, find_files searches "
+            "recursively by name; "
             "edit_file requires reading the file first so the runtime can reject stale edits.\n"
             "- agent: delegate substantial self-contained investigation to explore_agent "
             "or planning to plan_agent.\n"
@@ -737,7 +758,27 @@ def _trace_command(args: argparse.Namespace) -> int:
 
 
 def _print_event(event: AgentEvent) -> None:
-    if event.kind == "assistant_delta":
+    global _THINKING_LINE_OPEN
+    if event.kind == "model_start":
+        _THINKING_LINE_OPEN = True
+        print("⏳ model thinking...", end="", flush=True)
+    elif event.kind == "first_token":
+        _THINKING_LINE_OPEN = False
+        ttft = event.data.get("ttft_ms", 0)
+        print(f"\r⏳ model thinking... {ttft / 1000:.1f}s")
+    elif event.kind == "model_response_end":
+        if _THINKING_LINE_OPEN:
+            _THINKING_LINE_OPEN = False
+            print()
+        data = event.data
+        print(
+            "Model:\n"
+            f"  TTFT:           {data.get('ttft_ms', 0):>10.0f} ms\n"
+            f"  generation:     {data.get('generation_ms', 0):>10.0f} ms\n"
+            f"  input_tokens:   {data.get('input_tokens', 0):>10d}\n"
+            f"  output_tokens:  {data.get('output_tokens', 0):>10d}"
+        )
+    elif event.kind == "assistant_delta":
         print(event.message, end="", flush=True)
     elif event.kind == "assistant":
         if event.data.get("streamed"):
@@ -784,16 +825,23 @@ def _tool_end_summary(event: AgentEvent) -> str:
     if name in {"read_file", "write_file", "edit_file"}:
         path = tool_input.get("path")
         return path if isinstance(path, str) else "(no path)"
-    if name == "list_files":
+    if name in {"list_dir", "find_files"}:
         count = sum(
             1
             for line in event.message.splitlines()
             if line and not line.startswith("(empty")
+            and not line.startswith("(no files")
         )
-        return f"{tool_input.get('path', '.')} ({count} files)"
+        detail = tool_input.get("path", ".")
+        if name == "find_files":
+            detail = f"{tool_input.get('pattern')} in {detail}"
+        return f"{detail} ({count} files)"
     if name == "load_skill":
         skill = tool_input.get("name")
         return f"skill {skill}" if isinstance(skill, str) else "skill"
+    if name == "sandbox_shell":
+        code = event.data.get("returncode")
+        return f"exit {code}" if code is not None else "ran"
     preview = event.message.replace("\n", " ")[:80]
     return preview or "(no output)"
 
@@ -810,6 +858,12 @@ def _tool_start_summary(event: AgentEvent) -> str:
             if isinstance(content, str):
                 detail += f" ({len(content)} chars)"
         return f"{name} {detail}"
+    if name == "sandbox_shell":
+        command = tool_input.get("command")
+        preview = command if isinstance(command, str) else str(command)
+        if len(preview) > 80:
+            preview = preview[:80] + "…"
+        return f"{name} {preview}"
     return f"{name} {tool_input}"
 
 

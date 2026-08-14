@@ -218,8 +218,8 @@ Two agents are registered by default:
 
 | Agent | Purpose | Default tools |
 | --- | --- | --- |
-| `explore_agent` | Search and understand the codebase | `read_file`, `list_files` |
-| `plan_agent` | Produce an implementation plan from gathered context | `read_file`, `list_files` |
+| `explore_agent` | Search and understand the codebase | `read_file`, `list_dir`, `find_files` |
+| `plan_agent` | Produce an implementation plan from gathered context | `read_file`, `list_dir`, `find_files` |
 
 Default subagents only receive read tools, so investigation and planning are separated from mutation by construction. Add a custom agent through `AgentRegistry`:
 
@@ -233,7 +233,7 @@ agents.register(
         description="reviews implementation changes",
         system_prompt="You are a focused code review agent.",
         max_turns=20,
-        tools=("read_file", "list_files"),
+        tools=("read_file", "list_dir", "find_files"),
     )
 )
 ```
@@ -247,7 +247,8 @@ Built-in local tools:
 | Tool | Purpose |
 | --- | --- |
 | `read_file` | Read a UTF-8 text file inside the workspace |
-| `list_files` | List files below a directory |
+| `list_dir` | List the entries inside a directory (one level, `/` marks directories) |
+| `find_files` | Recursively search for files by name pattern (`cli.py`, `*.py`) |
 | `write_file` | Write a UTF-8 text file |
 | `edit_file` | Snapshot-checked in-place edit |
 

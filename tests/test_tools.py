@@ -319,7 +319,8 @@ def test_all_builtin_tools_have_explicit_descriptors():
     registry = default_tools()
 
     assert registry.descriptor_inferred("read_file") is False
-    assert registry.descriptor_inferred("list_files") is False
+    assert registry.descriptor_inferred("list_dir") is False
+    assert registry.descriptor_inferred("find_files") is False
     assert registry.descriptor_inferred("write_file") is False
     assert registry.descriptor("read_file").path_argument == "path"
     assert registry.descriptor("write_file").destructive is True
@@ -382,7 +383,7 @@ def test_runtime_secrets_are_hidden_from_file_tools(tmp_path):
     example_result = execute(
         tools, "read_file", {"path": ".env.example"}, ToolContext(tmp_path)
     )
-    listing = execute(tools, "list_files", {}, ToolContext(tmp_path))
+    listing = execute(tools, "list_dir", {}, ToolContext(tmp_path))
 
     assert env_result.is_error and token_result.is_error
     assert example_result.output == "OPENAI_API_KEY="

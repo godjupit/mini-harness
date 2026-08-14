@@ -230,7 +230,7 @@ explore_agent = AgentDefinition(
         "final structured result — never stop with an intermediate status."
     ),
     max_turns=40,
-    tools=("read_file", "list_files"),
+    tools=("read_file", "list_dir", "find_files"),
     description="searches and understands the codebase",
 )
 
@@ -243,7 +243,7 @@ plan_agent = AgentDefinition(
         "final plan — never stop with an intermediate status."
     ),
     max_turns=40,
-    tools=("read_file", "list_files"),
+    tools=("read_file", "list_dir", "find_files"),
     description="analyzes a task and produces an implementation plan",
 )    
 

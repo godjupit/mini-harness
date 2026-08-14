@@ -194,6 +194,26 @@ def test_agent_tool_wired_into_main_loop_delegates_to_subagent(tmp_path):
     assert sub_provider.requests  # subagent loop was invoked at least once
 
 
+def test_agent_tool_failure_returns_tool_error_result(tmp_path):
+    class FailingManager:
+        async def run_agent(self, definition, task_prompt):
+            del definition, task_prompt
+            raise RuntimeError("provider exploded")
+
+    tool = AgentTool(manager=FailingManager(), definitions={"explore_agent": explore_agent})
+
+    result = asyncio.run(
+        tool.run({"task": "go", "agent_type": "explore_agent"}, ToolContext(tmp_path))
+    )
+
+    assert result.is_error is True
+    assert result.failure is not None
+    assert result.failure.code == "subagent_error"
+    assert result.failure.retryable is True
+    assert "provider exploded" in result.output
+    assert result.failure.detail["agent_type"] == "explore_agent"
+
+
 def test_build_agent_tool_defaults_to_explore_agent(tmp_path):
     provider = ScriptedProvider([ModelReply(content="explored")])
     tool = build_agent_tool(provider=provider, tools=default_tools(), workspace=tmp_path)

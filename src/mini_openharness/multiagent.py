@@ -129,7 +129,16 @@ class AgentTool:
                 code="unknown_agent",
                 stage="execute",
             )
-        result = await self._manager.run_agent(definition=definition, task_prompt=task)
+        try:
+            result = await self._manager.run_agent(definition=definition, task_prompt=task)
+        except Exception as exc:
+            return ToolResult.fail(
+                f"subagent {agent_type} failed: {type(exc).__name__}: {exc}",
+                code="subagent_error",
+                stage="execute",
+                retryable=True,
+                detail={"agent_type": agent_type, "exception_type": type(exc).__name__},
+            )
         return ToolResult(result)
 
 

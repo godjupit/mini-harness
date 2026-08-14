@@ -69,12 +69,6 @@ def check_path_safety(path: str, workspace: Path) -> SafetyResult:
 
 
 def check_shell_safety(command: str, workspace: Path | None = None) -> SafetyResult:
-    if is_dangerous_command(command):
-        return SafetyResult(
-            False,
-            PermissionBehavior.DENY,
-            "multi-line shell command is not allowed",
-        )
     chains = split_command_chain(command)
     if chains is not None and len(chains) == 1 and matches_safe_builtin(command):
         return SafetyResult(True, PermissionBehavior.ALLOW, "built-in safe command")
@@ -106,11 +100,6 @@ def resolve_safe_path(path: str, workspace: Path) -> Path:
     if not candidate.is_relative_to(root):
         raise ValueError(f"path escapes workspace: {path}")
     return candidate
-
-
-def is_dangerous_command(command: str) -> bool:
-    """Return True for clear injection boundary violations (hard DENY)."""
-    return "\n" in command or "\r" in command
 
 
 SAFE_COMMANDS = frozenset(
@@ -166,36 +155,40 @@ GIT_SAFE_SUBCOMMANDS = frozenset({"status", "diff", "log", "show", "branch"})
 
 
 def split_command_chain(command: str) -> list[list[str]] | None:
-    """Split a command on ``&&`` into argv lists; ``None`` for unsupported syntax."""
-    if not command.strip():
+    """Split a command on newlines / ``&&`` / ``|``; ``None`` for unsupported syntax."""
+    normalized = command.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.strip():
         return []
-    if "$(" in command or "`" in command:
-        return None
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except ValueError:
+    if "$(" in normalized or "`" in normalized:
         return None
     separators = {"&&", "|"}
     unsupported = {"||", ";", "&", "<", ">", "<<", ">>", "(", ")"}
     chains: list[list[str]] = []
-    current: list[str] = []
-    for token in tokens:
-        if token in separators:
-            if not current:
-                return None
-            chains.append(current)
-            current = []
+    for line in normalized.split("\n"):
+        if not line.strip():
             continue
-        if token in unsupported or any(char in token for char in "<>()"):
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|<>()")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+        except ValueError:
             return None
-        current.append(token)
-    if not current:
-        return None
-    chains.append(current)
-    return chains
+        current: list[str] = []
+        for token in tokens:
+            if token in separators:
+                if not current:
+                    return None
+                chains.append(current)
+                current = []
+                continue
+            if token in unsupported or any(char in token for char in "<>()"):
+                return None
+            current.append(token)
+        if not current:
+            return None
+        chains.append(current)
+    return chains or None
 
 
 def classify_simple_command(argv: list[str], workspace: Path | None) -> str:

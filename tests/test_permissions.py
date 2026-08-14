@@ -245,6 +245,7 @@ def test_shell_routine_commands_are_allowed(tmp_path):
         "git status | head -20",
         "ls /usr/bin | grep python",
         "cat file | grep hello",
+        "cd src\nls",
     ]
     for command in allowed:
         decision = engine.authorize(

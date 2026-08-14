@@ -10,6 +10,7 @@ import pytest
 
 import mini_openharness.cli as cli
 from mini_openharness.cli import _load_environment, build_run_parser
+from mini_openharness.engine import AgentEvent
 from mini_openharness.models import ModelReply
 from mini_openharness.permissions import (
     PermissionBehavior,
@@ -306,6 +307,23 @@ def test_interactive_eof_exits_cleanly(tmp_path, monkeypatch):
     assert RecordingDemoProvider.last.requests == []
 
 
+def test_tool_start_does_not_print_write_content(capsys):
+    cli._print_event(
+        AgentEvent(
+            "tool_start",
+            "",
+            {
+                "name": "write_file",
+                "input": {"path": "notes/ok.txt", "content": "SECRET CONTENT"},
+            },
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert "SECRET CONTENT" not in out
+    assert "write_file notes/ok.txt (14 chars)" in out
+
+
 def test_interactive_ctrl_c_at_prompt_exits(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "DemoProvider", RecordingDemoProvider)
 
@@ -342,3 +360,23 @@ def test_read_line_backspace_removes_full_multibyte_char():
         os.close(slave)
 
     assert line == "你!"
+
+
+def test_read_line_bracketed_paste_keeps_multiline():
+    master, slave = pty.openpty()
+
+    def type_paste():
+        time.sleep(0.05)
+        os.write(
+            master,
+            b"\x1b[200~first line\nsecond line\x1b[201~\r",
+        )
+
+    threading.Thread(target=type_paste, daemon=True).start()
+    try:
+        line = cli._read_line("> ", in_fd=slave, out_fd=slave)
+    finally:
+        os.close(master)
+        os.close(slave)
+
+    assert line == "first line\nsecond line"

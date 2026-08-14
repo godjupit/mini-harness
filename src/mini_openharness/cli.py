@@ -301,13 +301,36 @@ def _read_line(
         with contextlib.ExitStack() as stack:
             previous = tty.tcgetattr(in_fd)
             stack.callback(tty.tcsetattr, in_fd, tty.TCSADRAIN, previous)
+            stack.callback(os.write, out_fd, b"\x1b[?2004l")
             tty.setcbreak(in_fd)
+            os.write(out_fd, b"\x1b[?2004h")  # 开启 bracketed paste
             os.write(out_fd, prompt.encode("utf-8"))
+            in_paste = False
             while True:
                 chunk = os.read(in_fd, 1)
                 if not chunk:
                     raise EOFError
                 byte = chunk[0]
+                if byte == 27:  # escape sequences: arrows ignored, paste markers tracked
+                    head = os.read(in_fd, 1)
+                    if head == b"[":
+                        middle = b""
+                        while True:
+                            tail = os.read(in_fd, 1)
+                            if not tail:
+                                break
+                            if 64 <= tail[0] < 127:
+                                break
+                            middle += tail
+                        if middle == b"200":
+                            in_paste = True
+                        elif middle == b"201":
+                            in_paste = False
+                    continue
+                if in_paste:
+                    buffer.append(byte)
+                    os.write(out_fd, bytes([byte]))
+                    continue
                 if byte in (13, 10):
                     os.write(out_fd, b"\r\n")
                     break
@@ -325,14 +348,6 @@ def _read_line(
                     continue
                 if byte == 4 and not buffer:  # Ctrl+D on an empty line = EOF
                     raise EOFError
-                if byte == 27:  # ignore escape sequences (arrow keys etc.)
-                    seq = os.read(in_fd, 2)
-                    if seq and seq[0] == 91:
-                        while True:
-                            tail = os.read(in_fd, 1)
-                            if not tail or 64 <= tail[0] < 127:
-                                break
-                    continue
                 buffer.append(byte)
                 os.write(out_fd, bytes([byte]))
     except KeyboardInterrupt:
@@ -448,12 +463,44 @@ async def _build_runtime(
     workspace = Path(args.workspace).resolve()
     skills = SkillCatalog(args.skills_dir or workspace / "skills")
     system_parts = [
-        "You are a concise coding assistant. Inspect before editing.",
         (
-            "Goal discipline: the latest user request is the authoritative goal. "
-            "Do not inspect .mini-oh internal state unless explicitly asked. "
-            "When implementation and verification satisfy the request: "
-            "STOP TOOL CALLING and RETURN FINAL."
+            "You are Mini Harness, a concise coding agent operating in a workspace.\n"
+            "\n"
+            "TASK DISCIPLINE\n"
+            "- The latest user request is the authoritative goal. Do not expand scope "
+            "or add unrelated features.\n"
+            "- Once implementation and verification satisfy the request: "
+            "STOP TOOL CALLING and RETURN FINAL.\n"
+            "\n"
+            "WORKFLOW\n"
+            "- Inspect before editing: read the relevant files first, then change them.\n"
+            "- After modifying code, verify with the appropriate tests or by running it.\n"
+            "- If verification is impossible in this environment, say so explicitly "
+            "instead of claiming success.\n"
+            "- Use workspace-relative paths (e.g. src/app.py), not absolute paths.\n"
+            "\n"
+            "TOOLS\n"
+            "- read_file / list_files / write_file / edit_file: workspace file tools; "
+            "edit_file requires reading the file first so the runtime can reject stale edits.\n"
+            "- agent: delegate substantial self-contained investigation to explore_agent "
+            "or planning to plan_agent.\n"
+            "- sandbox_shell: run host shell commands in a bubblewrap sandbox. Host "
+            "python/pytest/git/.venv are available; the workspace is writable, the rest "
+            "of the filesystem is read-only, /tmp is fresh, and the working directory "
+            "persists across calls. Install and run in one command when needed.\n"
+            "- load_skill: load a project skill body on demand.\n"
+            "- mcp__*: tools exposed by configured MCP servers.\n"
+            "\n"
+            "SAFETY\n"
+            "- Respect permission decisions (ALLOW / ASK / DENY). Never try to bypass "
+            "a denied operation.\n"
+            "- ASK decisions are reviewed automatically; do not circumvent them.\n"
+            "- Avoid destructive commands and writing sensitive files (.env, .git, "
+            "publish/CI config) unless the user explicitly asks.\n"
+            "\n"
+            "INTERNAL RUNTIME\n"
+            "- Do not inspect .mini-oh sessions, traces, or artifacts unless the user "
+            "is explicitly debugging Mini Harness itself."
         ),
     ]
     skill_prompt = skills.prompt()
@@ -703,7 +750,7 @@ def _print_event(event: AgentEvent) -> None:
             file=sys.stderr,
         )
     elif event.kind == "tool_start":
-        print(f"→ {event.data['name']} {event.data['input']}")
+        print(f"→ {_tool_start_summary(event)}")
     elif event.kind == "tool_end":
         marker = "✗" if event.data["is_error"] else "✓"
         print(
@@ -749,6 +796,21 @@ def _tool_end_summary(event: AgentEvent) -> str:
         return f"skill {skill}" if isinstance(skill, str) else "skill"
     preview = event.message.replace("\n", " ")[:80]
     return preview or "(no output)"
+
+
+def _tool_start_summary(event: AgentEvent) -> str:
+    """Compact tool_start line; file writes never print their content."""
+    name = event.data["name"]
+    tool_input = event.data.get("input", {})
+    if name in {"write_file", "edit_file"}:
+        path = tool_input.get("path")
+        detail = path if isinstance(path, str) else "(no path)"
+        if name == "write_file":
+            content = tool_input.get("content")
+            if isinstance(content, str):
+                detail += f" ({len(content)} chars)"
+        return f"{name} {detail}"
+    return f"{name} {tool_input}"
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,4 +1,6 @@
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,12 +23,7 @@ class AgentDefinition:
     max_turns: int
     tools: tuple[str, ...]
     
-explore_agent = AgentDefinition(
-    type="explore_agent",
-    system_prompt="you are an explore agent that explores the codebase",
-    max_turns=40,
-    tools=("read_file", "list_files")
-)
+
 
 class AgentManager:
     def __init__(self, provider, tools, workspace):
@@ -80,7 +77,11 @@ class AgentTool:
             "additionalProperties": False,
     }
     
-    def __init__(self, manager: AgentManager, definitions: dict[str,AgentDefinition]):
+    def __init__(
+        self,
+        manager: AgentManager,
+        definitions: AgentRegistry | dict[str, AgentDefinition],
+    ):
         self._manager = manager
         self._definitions = definitions
 
@@ -108,14 +109,60 @@ def build_agent_tool(
     provider: ModelProvider,
     tools: ToolRegistry,
     workspace: str | Path,
-    definitions: dict[str, AgentDefinition] | None = None,
+    definitions: AgentRegistry | dict[str, AgentDefinition] | None = None,
 ) -> AgentTool:
-    """Compose an AgentTool wired to the runtime provider/registry/workspace."""
+    """Compose an AgentTool wired to the runtime provider/registry/workspace.
+
+    When ``definitions`` is omitted, :func:`default_agents` (explore_agent and
+    plan_agent) is used. The tool keeps a reference to the given registry, so
+    later ``registry.register(...)`` calls are visible without rebuilding.
+    """
     manager = AgentManager(provider=provider, tools=tools, workspace=workspace)
-    return AgentTool(
-        manager=manager,
-        definitions=definitions or {"explore_agent": explore_agent},
-    )
+    if definitions is None:
+        definitions = default_agents()
+    return AgentTool(manager=manager, definitions=definitions)
     
 
+explore_agent = AgentDefinition(
+    type="explore_agent",
+    system_prompt="you are an explore agent that explores the codebase",
+    max_turns=40,
+    tools=("read_file", "list_files")
+)
+
+
+plan_agent = AgentDefinition(
+    type="plan_agent",
+    system_prompt="you are a plan agent that plan how to write code next step",
+    max_turns=40,
+    tools=("read_file", "list_files"),
+)    
+
+
     
+class AgentRegistry:
+    def __init__(self):
+        self._agents: dict[str, AgentDefinition] = {}
+        
+    def register(self, definition: AgentDefinition):
+        if definition.type in self._agents:
+            raise ValueError(f"same type agent")
+        self._agents[definition.type] = definition
+
+    def get(self, agent_type: str) -> AgentDefinition | None:
+        return self._agents.get(agent_type)
+        
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._agents.keys())
+
+    def __iter__(self):
+        return iter(self._agents)
+    
+    
+    
+def default_agents() -> AgentRegistry:
+    registry = AgentRegistry()
+    registry.register(explore_agent)
+    registry.register(plan_agent)
+    return registry
+        

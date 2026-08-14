@@ -4,8 +4,10 @@ from mini_openharness.engine import AgentEvent, AgentLoop, RunAlreadyActiveError
 from mini_openharness.multiagent import (
     AgentDefinition,
     AgentManager,
+    AgentRegistry,
     AgentTool,
     build_agent_tool,
+    default_agents,
 )
 from mini_openharness.provider import (
     ModelProvider,
@@ -38,8 +40,10 @@ __all__ = [
     "RunAlreadyActiveError",
     "AgentDefinition",
     "AgentManager",
+    "AgentRegistry",
     "AgentTool",
     "build_agent_tool",
+    "default_agents",
     "ModelProvider",
     "OpenAICompatibleProvider",
     "OpenAIResponsesProvider",

@@ -12,7 +12,9 @@ from mini_openharness.multiagent import (
     AgentManager,
     AgentTool,
     build_agent_tool,
+    default_agents,
     explore_agent,
+    plan_agent,
 )
 from mini_openharness.models import ModelReply, ToolCall
 from mini_openharness.provider import DemoProvider, ProviderError
@@ -225,3 +227,77 @@ def test_build_agent_tool_accepts_custom_definitions(tmp_path):
 
     assert result.output == "written"
     assert {item["name"] for item in provider.requests[0][1]} == {"write_file"}
+
+
+def test_build_agent_tool_defaults_include_registered_agents(tmp_path):
+    provider = ScriptedProvider([ModelReply(content="planned")])
+    tool = build_agent_tool(provider=provider, tools=default_tools(), workspace=tmp_path)
+
+    result = asyncio.run(
+        tool.run({"task": "plan", "agent_type": "plan_agent"}, ToolContext(tmp_path))
+    )
+
+    assert result.output == "planned"
+    assert {item["name"] for item in provider.requests[0][1]} == {
+        "read_file",
+        "list_files",
+    }
+
+
+def test_registry_can_be_passed_to_build_agent_tool(tmp_path):
+    researcher = AgentDefinition(
+        type="researcher",
+        system_prompt="you research",
+        max_turns=5,
+        tools=("read_file",),
+    )
+    registry = default_agents()
+    registry.register(researcher)
+    provider = ScriptedProvider([ModelReply(content="found")])
+    tool = build_agent_tool(
+        provider=provider,
+        tools=default_tools(),
+        workspace=tmp_path,
+        definitions=registry,
+    )
+
+    result = asyncio.run(
+        tool.run({"task": "research", "agent_type": "researcher"}, ToolContext(tmp_path))
+    )
+
+    assert result.output == "found"
+    assert {item["name"] for item in provider.requests[0][1]} == {"read_file"}
+
+
+def test_registry_registration_visible_without_rebuilding(tmp_path):
+    researcher = AgentDefinition(
+        type="researcher",
+        system_prompt="you research",
+        max_turns=5,
+        tools=("read_file",),
+    )
+    registry = default_agents()
+    provider = ScriptedProvider([ModelReply(content="found")])
+    tool = build_agent_tool(
+        provider=provider,
+        tools=default_tools(),
+        workspace=tmp_path,
+        definitions=registry,
+    )
+
+    # Register after the tool was built; the shared registry makes it live.
+    registry.register(researcher)
+    result = asyncio.run(
+        tool.run({"task": "research", "agent_type": "researcher"}, ToolContext(tmp_path))
+    )
+
+    assert result.output == "found"
+
+
+def test_registry_defaults_and_unknown_lookup():
+    registry = default_agents()
+
+    assert registry.names() == ("explore_agent", "plan_agent")
+    assert registry.get("explore_agent") is explore_agent
+    assert registry.get("plan_agent") is plan_agent
+    assert registry.get("nope") is None

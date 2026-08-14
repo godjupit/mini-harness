@@ -1,353 +1,704 @@
-# Mini Harness
+<div align="center">
 
-一个可以在面试中讲清楚、现场跑通的精简 coding-agent runtime。它保留 Agent Loop、Hooks、Skills、MCP、权限审批、effect-aware 工具调度、上下文压缩、流式 Provider、Trace/Replay 和 Docker 自测。
+Mini Harness
 
-```text
-Skills catalog ─────→ AgentLoop ───→ Streaming ModelProvider
-                         ↑                    │
-HookRegistry ─────────────┤ prompt / pre-tool / post-tool / stop
-                         │              text / tool calls
-                         │                    ↓
-                  observations ← PermissionPolicy
-                         ↑          allow / deny / ask
-                         │                    ↓
-                  ToolRegistry ← local / skill / MCP
-                         │
-                  artifacts + compaction
+A compact, safety-aware runtime for building and studying coding agents
 
-TraceSink observes model, hooks, permission, tool, MCP, cost and final state.
-```
 
-`AgentLoop` 可以按顺序复用为多轮会话：消息和累计 token 保留，每次 `run()` 的取消事件、
-资源锁和重复调用计数则由独立 `RunState` 持有。同一个实例同一时刻只允许一个 active run；
-重叠消费第二个 `run()` 会抛出 `RunAlreadyActiveError`。需要并发会话时应创建不同的
-`AgentLoop` 实例。`cancel()` 只影响当前 active run，没有运行时是幂等 no-op。
 
-工具通过不可变 `ToolDescriptor` 显式声明来源、效应、破坏性和权限路径字段；权限、资源
-fallback、AgentEvent 与 Trace 共用这份元数据，不再由核心循环解析工具名。失败同时保留模型
-可读的 `output` 和机器可读的 `ToolFailure(code, stage, retryable)`：
 
-```python
-from mini_openharness import ToolDescriptor, ToolResult
 
-class PublishTool:
-    name = "publish"
-    description = "Publish one document."
-    parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
-    descriptor = ToolDescriptor(
-        source="extension", effect="write", destructive=True, path_argument="path"
-    )
 
-    async def run(self, arguments, context):
-        return ToolResult("published")
-```
+Agent loop · permission engine · auto-review · subagents · hooks · MCP · skills · context compaction · trace/replay · Docker sandbox
 
-没有 descriptor 的旧 Tool 暂时兼容：Registry 会集中推断旧 `read_only`/命名惯例，Trace 标记
-`descriptor_inferred=true`，未知 effect 和 resource resolver 失败仍按 mutation/global write lock
-处理。新扩展应始终声明 descriptor。
+</div>
 
-## 30 秒运行
+Mini Harness is a small but complete coding-agent runtime focused on the parts that are usually hidden behind a product interface: model/tool orchestration, permission decisions, safe execution boundaries, lifecycle hooks, context management, observability, resumable sessions, and delegated subagents.
 
-要求 Python 3.10+：
+The project intentionally keeps the runtime understandable. Instead of reproducing a full IDE or terminal product, it concentrates on the control plane required to make an agent observable, permissioned, recoverable, and extensible.
 
-```bash
+Status: active development. The runtime is suitable for learning, experimentation, interviews, and local agent prototyping. It is not intended to be a hardened multi-tenant execution platform.
+
+Why Mini Harness?
+
+A useful coding agent is more than a loop that repeatedly calls an LLM. Once tools can read files, modify a workspace, call remote services, or execute shell commands, the runtime must answer harder questions:
+
+Which actions are allowed, denied, or require review?
+
+Can independent tool calls run concurrently without racing on the same files?
+
+What happens when a tool times out or the model repeats the same action forever?
+
+How do large tool outputs and long conversations fit inside the context window?
+
+How can a run be inspected later without replaying its side effects?
+
+How can specialized agents investigate or plan without giving every agent every tool?
+
+How can organization-specific checks run at reliable lifecycle boundaries?
+
+Mini Harness implements those concerns as explicit runtime components rather than burying them inside one monolithic agent function.
+
+Architecture
+
+                                   ┌──────────────────────┐
+                                   │    Model Provider    │
+                                   │ Responses / Chat API │
+                                   └──────────┬───────────┘
+                                              │
+                                   text / tool calls
+                                              │
+┌──────────────┐     prompt hooks      ┌──────▼───────┐
+│ User / CLI   ├──────────────────────►│  AgentLoop   │
+└──────────────┘                       └──────┬───────┘
+                                            │
+                              ┌─────────────┼──────────────┐
+                              │             │              │
+                              ▼             ▼              ▼
+                       Context/Artifacts  Sessions     Trace Sink
+                              │                            │
+                              │                       JSONL audit
+                              │                       + safe replay
+                              │
+                              ▼
+                     pre-tool hook
+                              │
+                              ▼
+                     resource resolution
+                       + async RW locks
+                              │
+                              ▼
+                     ┌─────────────────┐
+                     │  Tool Registry  │◄──────── Skills / MCP
+                     │ schema validate │
+                     └────────┬────────┘
+                              │
+                              ▼
+                     ┌─────────────────┐
+                     │ PermissionEngine│
+                     │ safety → rules  │
+                     └────────┬────────┘
+                              │
+                  ALLOW ──────┼────── ASK
+                              │        │
+                              │        ▼
+                              │   Human approval
+                              │        or
+                              │   Auto-review agent
+                              │
+                              ▼
+                       actual tool run
+                              │
+                              ▼
+                         post-tool hook
+                              │
+                              └──────────────► observation → AgentLoop
+
+The built-in `agent` tool can delegate read-only investigation or planning to
+specialized subagent AgentLoops with a restricted tool subset.
+
+Core capabilities
+
+Area
+
+What the runtime provides
+
+Agent loop
+
+Model → tool calls → observations → model, with typed events, cancellation, max-step limits, and strict tool-call/result pairing.
+
+Permission engine
+
+Ordered safety → deny → ask → allow → default evaluation with workspace containment and conservative shell checks.
+
+Auto-review
+
+ASK decisions can be sent to an independent tool-less reviewer model; failures and ambiguous responses fail closed.
+
+Subagents
+
+Built-in Explore and Plan agents run their own AgentLoop with restricted tools; custom agent definitions can be registered.
+
+Tool system
+
+JSON Schema validation, immutable security metadata, structured failures, timeouts, and source/effect attribution.
+
+Concurrency
+
+Effect-aware resource locking allows independent work to run concurrently while conflicting file access is serialized.
+
+Hooks
+
+user_prompt_submit, pre_tool_use, post_tool_use, and stop lifecycle hooks with priority, matching, timeouts, and fail-open/fail-closed behavior.
+
+Verification gate
+
+A stop hook can block completion, return test/lint feedback to the model, and let the agent repair before trying to finish again.
+
+Context management
+
+Atomic tool-turn compaction, model-generated handoff summaries with deterministic fallback, reactive context-window recovery, and large-output artifacts.
+
+Tracing
+
+Append-only JSONL traces with secret redaction, timing, permission/tool/provider events, cost accounting, pruning, and side-effect-free replay.
+
+Sessions
+
+Persistent conversations with interruption detection and resume / continue support.
+
+MCP
+
+stdio and Streamable HTTP transports, schema validation, conservative annotation trust, and OAuth support.
+
+Sandbox
+
+Optional Docker-only shell with no host fallback, no network, read-only root filesystem, dropped capabilities, and resource limits.
+
+Requirements
+
+Python 3.10+
+
+An OpenAI-compatible API key for real model runs
+
+Docker only if sandbox_shell is enabled
+
+Installation
+
+Clone the repository and install it in editable mode:
+
+git clone <your-repository-url>
+cd mini-harness
+
 python -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+source .venv/bin/activate
+pip install -e '.[dev]'
+
+On Windows PowerShell, activate the environment with:
+
+.\.venv\Scripts\Activate.ps1
+
+Create a local environment file:
+
 cp .env.example .env
-# 编辑 .env，填入 OPENAI_API_KEY
-.venv/bin/mini-oh --demo --workspace . "解释这个项目"
-```
 
-CLI 会自动读取当前目录的 `.env`，但不会覆盖 shell 中已经设置的环境变量。真实 `.env` 已被 Git 忽略。
+Then set your provider configuration:
 
-`--demo` 不需要 API Key，但真实经过 Agent Loop、skill 渐进加载、文件工具调用、结果回填、Trace 和最终回答。
+OPENAI_API_KEY=your_key_here
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_MODE=responses
 
-官方 OpenAI 默认使用 Responses API；兼容端点可切回 Chat Completions：
+The CLI loads .env from the current directory without overriding variables already present in the shell environment.
 
-```bash
-export OPENAI_API_KEY=...
-export OPENAI_MODEL=gpt-4.1-mini
-mini-oh --api-mode responses --workspace /path/to/project "分析架构"
-mini-oh --api-mode chat --base-url https://compatible.example/v1 "分析架构"
-```
+Quick start
 
-若第三方端点没有实现 `POST /responses`，CLI 会在 HTTP 404 时提示切换
-`--api-mode chat`，并以非零状态退出。`done` 返回 0，provider error、max steps
-返回 1，取消返回 130，便于 CI 正确判断结果。
+Offline demo
 
-## 1. Trace、可观测性与安全 Replay
+The deterministic demo exercises the real runtime path without requiring an API key:
 
-每次运行默认写入 `.mini-oh/traces/<run-id>.jsonl`，包括：
+mini-oh --demo --workspace . "Inspect this project and summarize its architecture."
 
-- model request/response 与流式 token delta；
-- tool 参数、来源、耗时、输出与错误；
-- resource wait/acquire/release，以及 `waited_ms`、`held_ms`；
-- skill 加载和 MCP server（start/end 均保留归因）；
-- permission 决策与人工审批结果；
-- hook start/end、阻断、失败、耗时和 payload 改写；
-- compaction 前后 token 估算；
-- token usage、估算费用及最终成功/失败/取消原因。
+Real model run
 
-Trace 默认递归遮盖 `api_key`、`Authorization`、password/token 等敏感字段，并识别常见
-Bearer/OpenAI key 文本。本地 JSONL 以 owner-only `0600` 创建；只有明确使用
-`--unsafe-trace-secrets` 才会关闭脱敏。脱敏与文件权限仍不能替代磁盘加密和合理的保留周期。
+mini-oh --workspace . "Inspect the repository and explain the agent runtime."
 
-```bash
+The default provider path uses the Responses API. A compatible Chat Completions endpoint can be selected explicitly:
+
+mini-oh \
+  --api-mode chat \
+  --base-url https://compatible.example/v1 \
+  --workspace . \
+  "Analyze the codebase."
+
+Permission model
+
+Every tool execution is converted into a PermissionRequest carrying the tool's declared source, effect, destructive flag, path, and/or shell command.
+
+The decision order is intentionally simple and explicit:
+
+1. Safety boundary
+2. Explicit DENY rules
+3. Explicit ASK rules
+4. Explicit ALLOW rules
+5. Runtime default
+
+The runtime defaults are:
+
+read / compute          → ALLOW
+write / remote / unknown→ ASK
+
+Safety checks happen before configurable rules. In the current implementation:
+
+workspace path escape is a hard DENY;
+
+multi-line shell input is a hard DENY;
+
+shell syntax that cannot be statically verified is forced to ASK.
+
+Default human approval
+
+When a request resolves to ASK, the normal CLI mode asks the user for approval in an interactive terminal:
+
+mini-oh --workspace . "Create docs/design.md"
+
+If no approval callback is available, an ASK decision fails closed.
+
+Auto-review mode
+
+--auto-review replaces the human decision for ASK with an independent reviewer model call:
+
+mini-oh --auto-review --workspace . "Refactor the parser and update the tests."
+
+The reviewer receives the requested tool, effect, path/command, workspace, arguments, and the permission reason. It can only return an approval decision for that specific ASK request.
+
+Important invariants:
+
+an explicit DENY is never sent to the reviewer and cannot be overridden;
+
+safety DENY remains final;
+
+reviewer errors, timeouts, or invalid responses reject the action;
+
+the reviewer is invoked without tools, so it cannot execute the requested operation itself.
+
+Permission rules
+
+A JSON rule file can provide explicit deny, ask, and allow behavior:
+
+{
+  "rules": [
+    {
+      "tool": "write_file",
+      "path": "secrets/*",
+      "action": "deny"
+    },
+    {
+      "tool": "write_file",
+      "path": "docs/*",
+      "action": "allow"
+    },
+    {
+      "tool": "sandbox_shell",
+      "command": "npm publish*",
+      "action": "ask"
+    }
+  ]
+}
+
+Run with:
+
+mini-oh --permission-config examples/permissions.json --workspace . "Update the docs."
+
+Rule patterns use fnmatch-style matching. When a permission config is supplied, its rules become the active explicit rule set; unmatched requests still fall through to the runtime default decision policy and non-bypassable safety checks.
+
+Subagent delegation
+
+Mini Harness exposes an agent tool to the main model. Delegation is intentionally lightweight: a subagent gets its own AgentLoop, a specialized system prompt, a turn limit, and only the tools declared by its definition.
+
+Two agents are registered by default:
+
+Agent
+
+Purpose
+
+Default tools
+
+explore_agent
+
+Search and understand the codebase
+
+read_file, list_files
+
+plan_agent
+
+Produce an implementation plan from gathered context
+
+read_file, list_files
+
+Because the default subagents only receive read tools, investigation and planning are separated from mutation by construction.
+
+A custom agent can be added through AgentRegistry:
+
+from mini_openharness.multiagent import AgentDefinition, default_agents
+
+agents = default_agents()
+agents.register(
+    AgentDefinition(
+        type="reviewer",
+        description="reviews implementation changes",
+        system_prompt="You are a focused code review agent.",
+        max_turns=20,
+        tools=("read_file", "list_files"),
+    )
+)
+
+The delegation layer is deliberately not a distributed multi-agent framework: there is no implicit shared memory, autonomous agent swarm, or background scheduler. The goal is explicit, inspectable task delegation.
+
+Tool execution and concurrency
+
+Built-in local tools include:
+
+read_file
+list_files
+write_file
+edit_file
+
+Additional tools are registered at runtime:
+
+agent           specialized subagent delegation
+load_skill      when a skill catalog is configured
+sandbox_shell   when Docker sandboxing is explicitly enabled
+mcp__...        tools discovered from configured MCP servers
+
+Each tool can declare a ToolDescriptor describing its source and effect:
+
+ToolDescriptor(
+    source="extension",
+    effect="write",
+    destructive=True,
+    path_argument="path",
+)
+
+That metadata is reused by permission evaluation, resource scheduling, tracing, and attribution instead of repeatedly guessing behavior from tool names.
+
+Resource-aware scheduling
+
+A model may return several tool calls in one response. Mini Harness resolves each call to logical ResourceAccess entries and uses asynchronous read/write locks:
+
+same resource: read + read   → concurrent
+same resource: read + write  → serialized
+same resource: write + write → serialized
+different files              → may run concurrently
+unknown mutation             → global write lock
+
+Tool observations are returned to the model in the original call order even when execution finishes out of order.
+
+The maximum number of concurrent tools can be controlled with:
+
+mini-oh --max-concurrent-tools 4 --workspace . "Inspect several files."
+
+Safe editing
+
+edit_file uses optimistic concurrency protection:
+
+read_file records a SHA-256 snapshot for the current run;
+
+edit_file requires that snapshot or an explicit expected_sha256;
+
+a stale file is rejected instead of overwritten;
+
+replacement is exact and ambiguous matches are rejected by default;
+
+the final replacement uses a same-directory temporary file and os.replace.
+
+This protects against accidental stale edits without pretending to provide a cross-process database transaction.
+
+Hooks and verification gates
+
+Hooks are trusted runtime extensions that the model cannot opt out of.
+
+Supported lifecycle events:
+
+Event
+
+Runs when
+
+Typical use
+
+user_prompt_submit
+
+before the prompt enters history
+
+normalization, policy checks
+
+pre_tool_use
+
+before resource resolution and tool execution
+
+argument rewriting, blocking
+
+post_tool_use
+
+after a tool finishes, before the result returns to the model
+
+auditing, output filtering
+
+stop
+
+before a final answer becomes done
+
+tests, lint, security verification
+
+A stop hook can act as a verification gate. If the hook blocks completion, its failure output is returned to the agent as feedback so the model can fix the problem and attempt completion again.
+
+Example:
+
+mini-oh \
+  --hooks-config examples/hooks-verification.json \
+  --workspace . \
+  "Implement the change and make the tests pass."
+
+Command hooks execute with argv directly rather than through a shell, use the workspace as their working directory, and support explicit timeout and fail-open/fail-closed behavior.
+
+Context compaction and artifacts
+
+Before model calls, the runtime estimates context size. Once the configured threshold is exceeded, older conversation units can be replaced by a handoff summary while recent units remain verbatim.
+
+Tool turns are treated atomically: an assistant tool-call message and its tool results are kept together so compaction does not create dangling protocol state.
+
+The normal compaction path requests a no-tools summary from the configured model. If that secondary request fails or returns unusable output, a deterministic summary is used as the fallback.
+
+Large tool outputs are offloaded to:
+
+.mini-oh/artifacts/<run-id>/
+
+The conversation keeps a head/tail preview and the artifact path instead of carrying the entire output inline.
+
+Useful controls:
+
+mini-oh \
+  --context-threshold 12000 \
+  --keep-recent 6 \
+  --max-inline-output 8000 \
+  "Work through a long repository task."
+
+If the provider explicitly reports a context-window error, the runtime can force one compaction and retry the same logical model step once.
+
+Trace and replay
+
+Unless disabled, each run writes an append-only JSONL trace under:
+
+.mini-oh/traces/<run-id>.jsonl
+
+Trace events cover model requests/responses, streaming deltas, tool lifecycle, permission decisions, resource waits, hooks, compaction, MCP attribution, usage, estimated cost, and the final run state.
+
+Sensitive field names and common credential patterns are redacted by default. Local trace files are created with owner-only permissions where supported.
+
+Inspect traces with:
+
 mini-oh trace list
 mini-oh trace show <run-id>
 mini-oh trace replay <run-id>
-mini-oh trace prune --older-than 30              # 只预览
-mini-oh trace prune --max-runs 100 --apply       # 明确执行
-```
 
-`trace replay` 只按时间线渲染已记录事件，绝不重新请求模型或执行工具，因此不会重复写文件或调用远程 MCP 副作用。
+trace replay only renders the recorded timeline. It does not call the model again and does not execute tools again.
 
-Runtime 只依赖 `TraceSink` 协议；默认的 `LocalJsonlTraceSink` 保留 `TraceWriter` 兼容别名，
-也提供不写盘的 `MemoryTraceSink`。交互运行默认采用 best-effort：写盘失败会告警一次并关闭该
-sink，不改变已发生的工具副作用；CI 或审计场景可使用 `--strict-trace`，让写失败抛出
-`TraceWriteError`。`trace prune` 永不删除仍处于 running 状态的 Trace，且没有 `--apply` 时只做
-dry-run。
+Pruning is dry-run by default:
 
-可用 `--input-cost`、`--output-cost` 设置每百万 token 的美元价格；`--no-trace` 可关闭记录。
+mini-oh trace prune --older-than 30
+mini-oh trace prune --max-runs 100 --apply
 
-## 2. 权限策略与人工审批
+Sessions and resume
 
-默认行为：
+Conversation history can be persisted independently from traces. This lets an interrupted run be continued without pretending that an unfinished tool call completed successfully.
 
-- read-only 工具自动允许；
-- 文件写入默认询问；
-- MCP 工具因为远端副作用未知，默认询问；
-- 非交互环境无法询问时安全拒绝。
+List sessions:
 
-交互批准、一次性全批准和规则配置：
+mini-oh sessions
 
-```bash
-# 交互终端会显示 y/N 审批
-mini-oh --workspace . "创建 docs/design.md"
+Resume one:
 
-# 自动批准所有 ask 决策
-mini-oh --yes --workspace . "创建 docs/design.md"
+mini-oh resume <session-id>
 
-# default + tool/path glob 规则
-mini-oh --permission-config examples/permissions.json --workspace . "更新文档"
+Or resume the latest session:
 
-# 兼容旧用法：默认允许 mutation，但显式 deny 规则仍优先
-mini-oh --allow-write --permission-config examples/permissions.json "执行任务"
-```
+mini-oh resume --latest
 
-Shell 权限还可用 `command` 做命令级匹配。例如
-`{"tool":"sandbox_shell","command":"npm test*","action":"allow"}`。复合命令会拆成子命令逐项检查，任一 `deny` 会拒绝整条命令；没有规则或无法安全分析的复杂 Shell 语法默认进入 `ask`。需要有意允许重定向、命令替换等复杂语法时，应配置完整命令的精确规则，而不是宽泛通配符。
+continue is accepted as an alias for resume.
 
-示例规则：
+MCP and Skills
 
-```json
-{
-  "default": "ask",
-  "rules": [
-    {"tool": "write_file", "path": "secrets/*", "action": "deny"},
-    {"tool": "write_file", "path": "docs/*", "action": "allow"},
-    {"tool": "mcp__*", "path": "*", "action": "ask"}
-  ]
-}
-```
+MCP
 
-## 3. 可扩展 Hook 与 Verification Gate
+MCP servers can be configured through JSON and exposed to the same tool registry, permission, timeout, and trace boundaries as local tools.
 
-Hook 是 Agent 生命周期上的受信任扩展点，和模型工具不同：模型不能选择跳过 Hook。Mini 暴露四个稳定事件：
+mini-oh --mcp-config examples/mcp.json --workspace . "Inspect available MCP tools."
 
-| 事件 | 时机 | 典型用途 |
-|---|---|---|
-| `user_prompt_submit` | prompt 进入 history 前 | 输入规范化、任务策略拒绝 |
-| `pre_tool_use` | 权限判断和真实工具执行前 | 参数改写、敏感操作拦截 |
-| `post_tool_use` | 工具完成后、结果回填模型前 | 输出审计、脱敏、结果拒绝 |
-| `stop` | Agent 准备返回成功前 | 强制测试、lint、安全扫描 |
+The implementation supports:
 
-命令 Hook 通过 JSON 配置启用，`matcher` 使用 glob，`priority` 越大越先运行，同优先级保持注册顺序：
+stdio MCP servers;
 
-```bash
-mini-oh --hooks-config examples/hooks-verification.json \
-  --yes --workspace . "实现功能并运行测试"
-```
+Streamable HTTP transport;
 
-示例 `stop` Hook 会执行当前 Python 环境中的 `pytest -q`。退出码为 0 才允许 `done`；失败时 Agent 收到测试输出，继续修复并再次申请完成：
+input and output schema validation;
 
-```json
-{
-  "hooks": {
-    "stop": [
-      {
-        "name": "pytest-verification-gate",
-        "type": "command",
-        "command": ["{python}", "-m", "pytest", "-q"],
-        "timeout_seconds": 120,
-        "failure_mode": "block"
-      }
-    ]
-  }
-}
-```
+structured content preservation;
 
-命令不经过 shell，工作目录固定为 workspace。Runtime 将 `{"event": ..., "payload": ...}` 写入 stdin；普通命令只需以退出码表达成功/失败。需要改写 payload 时设置 `expect_json: true`，stdout 返回：
+conservative handling of readOnlyHint annotations;
 
-```json
-{
-  "decision": "allow",
-  "updated_payload": {"tool_input": {"path": "safe.txt"}},
-  "output": "optional audit detail"
-}
-```
+OAuth flows including PKCE-oriented safety checks and local token persistence.
 
-`decision` 也可为 `block` 并带 `reason`。Hook 异常、无效 JSON 或超时由 `failure_mode` 决定：`block` 是 fail-closed，`continue` 是 fail-open。默认不会继承 API key 等完整宿主环境；确实需要时可显式设置 `inherit_environment: true`，因此 Hook 配置和脚本必须按受信任代码管理。
+Remote tools are not implicitly trusted merely because they are reachable.
 
-Python 扩展只需实现 `Hook` Protocol；最常用方式是注册同步或异步 callback，不需要修改 Executor 的类型分支：
+Skills
 
-```python
-from mini_openharness.hooks import CallbackHook, HookEvent, HookRegistry, HookResult
+A skill directory follows the form:
 
-hooks = HookRegistry()
-hooks.register(
-    HookEvent.PRE_TOOL_USE,
-    CallbackHook(
-        "protect-secrets",
-        lambda ctx: HookResult(blocked=True, reason="protected path"),
-        matcher="write_file",
-        priority=100,
-    ),
-)
+skills/
+└── my-skill/
+    └── SKILL.md
 
-loop = AgentLoop(..., hooks=hooks)
-```
+When a skill catalog is configured, only lightweight metadata is exposed initially. The model loads the full skill body through load_skill when it is actually needed.
 
-Permission 回答“这个 capability 是否允许执行”，Hook 回答“在这个业务生命周期点还要执行什么组织策略”；两者都不能互相替代。Hook 的每次开始、结束、耗时、失败和改写都会进入 Trace。
+mini-oh --skills-dir ./skills --workspace . "Use the available project skills."
 
-## 4. Context Compaction 与 Artifacts
+Docker sandbox shell
 
-每次模型调用前估算 context token。超过阈值后：
+Shell execution is disabled by default.
 
-1. 发起一次不带工具的模型调用，把旧消息折叠成面向继续执行的结构化 handoff summary；
-2. 保留最近若干 atomic units；
-3. assistant tool calls 与其所有 tool results 永远作为同一个 unit，避免产生孤儿消息；
-4. 大型工具输出保存到 `.mini-oh/artifacts/<run-id>/`，history 只保留头尾和 artifact 路径。
+Enable it explicitly:
 
-```bash
-mini-oh --context-threshold 12000 --keep-recent 6 --max-inline-output 8000 "长任务"
-```
-
-摘要要求保留用户目标、重要决策、文件/工具发现、错误修复和待办事项；摘要调用失败或返回无效内容时，自动回退到确定性摘要，保证主任务仍能继续。该实现借鉴 Claude Code 的核心思路，但没有引入其 Session Memory、prompt cache 复用和多轮历史裁剪等完整机制。
-
-若 Provider 明确返回 context-window 超限，Runtime 会忽略普通阈值强制压缩一次，并在同一个逻辑 model step 重试；无法压缩或第二次仍失败则终止。该恢复只接受 typed `ProviderContextWindowError`，不会把任意 HTTP 400 当成可重试错误。
-
-## 5. Provider 可靠性
-
-Provider boundary 同时实现 OpenAI Responses 与 Chat Completions-compatible 协议：
-
-- SSE token streaming；
-- Responses typed Items、`function_call_output.call_id`，以及 arguments delta/done 重组；
-- 对符合官方严格子集的 function schema 启用 `strict: true`；不兼容 schema 省略该字段，由 Responses 自动规范化或回退，runtime 仍再次校验；
-- Chat Completions message/tool-call 兼容路径；
-- Chat `finish_reason=length` 和 Responses `response.incomplete` 不会被误报为成功；
-- 429、5xx、timeout、network error 指数退避；
-- 认证、限流、超时、网络、无效响应和取消的统一错误类型；
-- `Ctrl-C`/cancel event；
-- usage 跨 step 累计和费用估算。
-
-为了避免内容重复，如果连接已经输出 token 后才失败，本轮不会自动重试。
-
-## 6. Effect-aware 工具调度与熔断
-
-模型可在一轮返回多个 tool calls。Runtime 为调用解析层级 `ResourceAccess`，再通过 async read/write lock 调度：
-
-- 同资源 read/read 可并发，read/write 与 write/write 串行；
-- 不同文件的写操作可以并发；目录 tree lock 会与其所有子路径冲突；
-- 未知或无法解析的 mutation 使用全局写锁，fail-closed；
-- 无论实际完成顺序如何，observation 仍按模型 call 顺序回填；
-- Trace 直接记录锁等待和持有时间，可证明冲突调用确实串行；
-- 每次调用有统一超时（默认 30 秒），超时转换为模型可恢复的 error observation；
-- 连续相同的 tool-call batch 默认最多真实执行 3 次，之后由 loop guard 熔断，但仍把错误回填给模型，让模型有机会换方案。
-- 每轮最多同时执行 8 个工具；`--max-concurrent-tools` 可调整，slot 等待与资源锁等待分别进入 Trace。
-
-```bash
-mini-oh --tool-timeout 20 --max-repeated-tool-batches 2 \
-  --max-concurrent-tools 4 "检查并修改项目"
-```
-
-### 安全文件编辑
-
-`read_file` 会在本轮 RunState 中记录文件 SHA-256 快照。`edit_file` 只做严格文本替换：默认要求
-old_text 唯一匹配；多匹配必须显式 `replace_all=true`；文件在读取后被编辑器或其他进程修改时
-返回 `file_changed`，绝不覆盖。调用方也可提供 `expected_sha256`，无需依赖本轮 read。
-
-成功编辑通过同目录临时文件写入、flush/fsync、保留原 mode 后 `os.replace`；替换前再次校验
-目标 hash，失败会清理临时文件并保留原内容。这个机制是乐观并发控制，不是跨进程事务锁；
-外部进程仍应避免在同一瞬间写同一文件。
-
-## 7. Skills 与 MCP
-
-- Skills：启动时只注入 name/description，模型调用 `load_skill` 后正文才进入 history。
-- MCP：同时支持 stdio 与 Streamable HTTP。远程 input/output schema 被校验，structured content 被保留。HTTP OAuth 使用 SDK discovery、动态注册/Client Metadata URL、PKCE S256、state、RFC 8707 resource audience、refresh token 与 scope step-up；token 以 `0600` 原子文件保存。远端 `readOnlyHint` 默认不受信任。
-
-真实 MCP 示例：
-
-```bash
-mini-oh --demo --yes --mcp-config examples/mcp.json
-```
-
-MCP 配置中的 `{python}` 会解析为运行 `mini-oh` 的 Python，避免写死虚拟环境路径。
-
-Streamable HTTP + OAuth 示例：
-
-```json
-{
-  "mcpServers": {
-    "remote": {
-      "url": "https://mcp.example.com/mcp",
-      "oauth": {
-        "redirectUri": "http://127.0.0.1:8765/callback",
-        "tokenFile": ".mini-oh/oauth/remote.json",
-        "scopes": "tools:read tools:write"
-      }
-    }
-  }
-}
-```
-
-首次收到 401 时会启动 loopback callback 并打开授权 URL。Authorization server metadata 未声明 PKCE `S256` 时拒绝继续。已有 bearer token 可通过 `headersEnv` 从环境变量注入，避免把 secret 写进配置。
-
-## Docker sandbox shell
-
-Shell 默认不注册，只有显式启用且本地镜像已存在时才可用：
-
-```bash
 docker pull alpine:3.20
-mini-oh --sandbox-shell --yes --workspace . \
-  --sandbox-image alpine:3.20 "运行测试并修复失败"
-```
 
-每次调用创建 disposable container：只把 workspace 挂载为可写，root filesystem 只读，network 为 `none`，drop all Linux capabilities，启用 `no-new-privileges`，并限制 CPU、memory、PID 与 tmpfs。workspace 内的真实 `.env*`（保留 `.env.example`）会覆盖为 `/dev/null`，`.mini-oh/oauth` 会用不可读 tmpfs 遮蔽；普通 `read_file/list_files` 也执行同样的 secret deny。Docker 或镜像不可用时直接失败，绝不回退宿主机 shell。工具仍经过 mutation permission、resource lock、timeout、Trace 和 artifact 链路。
+mini-oh \
+  --sandbox-shell \
+  --sandbox-image alpine:3.20 \
+  --workspace . \
+  "Run the project checks."
 
-容器内 workspace 固定显示为 `/workspace`；后续传给 `read_file/write_file` 时必须转换为相对路径，例如把 `/workspace/report.txt` 写成 `report.txt`。
+The sandbox has no host-shell fallback. If Docker or the configured image is unavailable, startup fails instead of silently executing on the host.
 
-## 核心代码导航
+Each invocation uses a disposable container with controls including:
 
-| 文件 | 职责 | 面试重点 |
-|---|---|---|
-| `engine.py` | agent loop、事件与编排 | effect-aware 调度、熔断、终止/取消 |
-| `provider.py` | Responses/Chat streaming provider | typed Items、SSE、重试、错误分类 |
-| `tools.py` | schema、resource lock 与统一执行 | capability/effect boundary |
-| `permissions.py` | allow/deny/ask 规则 | 最小权限、人工介入 |
-| `hooks.py` | Hook Protocol、Registry、Executor 与命令配置 | 生命周期扩展、fail-open/closed、Verification Gate |
-| `trace.py` | JSONL trace/replay | 可观测、审计、无副作用回放 |
-| `compaction.py` | summary 与 artifacts | 协议不变量、context 成本 |
-| `skills.py` | skill 渐进加载 | progressive disclosure |
-| `mcp.py` / `mcp_auth.py` | stdio/HTTP MCP 与 OAuth | PKCE、audience、token storage |
-| `sandbox.py` | Docker-only shell | OS 隔离、fail-closed、资源限制 |
+--network none;
 
-## 安全边界与非目标
+read-only container root filesystem;
 
-普通文件工具依赖 workspace containment；只有 `sandbox_shell` 运行在 OS/Docker 隔离中。Docker boundary 包含默认 seccomp、只读 rootfs、无网络、capability/资源限制，但仍不应把 Docker daemon socket 暴露给容器，也不能把它当作恶意多租户执行平台。HTTP MCP 会访问远端开放世界，必须结合权限规则、可信 server 清单和最小 OAuth scope。
+writable workspace bind mount;
 
-Python callback 与命令 Hook 都是受信任扩展代码：前者与 Agent 同进程，后者可在 workspace 中启动进程；它们不是安全沙箱。命令默认使用最小环境且不经过 shell，但若 Hook 本身不可信，仍应放入 Docker 或更强的隔离执行器。
+all Linux capabilities dropped;
 
-项目有意不实现 TUI、插件市场和多 Agent，以保持面试主线集中在 runtime 的可靠性与可验证性。
+no-new-privileges;
 
-实现依据、设计取舍和验证方法统一记录在 [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md)。
+CPU, memory, PID, and tmpfs limits;
+
+host UID/GID mapping where applicable;
+
+masking of selected runtime credential locations.
+
+This is a local development safety boundary, not a malicious multi-tenant sandbox.
+
+Reliability controls
+
+Mini Harness includes several small mechanisms that prevent common agent-runtime failure modes:
+
+per-tool wall-clock timeout;
+
+configurable model retry policy;
+
+repeated identical tool-batch circuit breaker;
+
+maximum model-step limit;
+
+maximum concurrent tool limit;
+
+fail-closed permission and reviewer failures;
+
+typed provider errors for truncation and context overflow;
+
+cancellation propagation;
+
+one active run per AgentLoop instance;
+
+structured ToolFailure(code, stage, retryable) metadata.
+
+Example:
+
+mini-oh \
+  --tool-timeout 20 \
+  --max-repeated-tool-batches 2 \
+  --max-concurrent-tools 4 \
+  --max-steps 16 \
+  "Diagnose and repair the project."
+
+Project layout
+
+mini-harness/
+├── src/mini_openharness/
+│   ├── engine.py              # agent state machine and tool orchestration
+│   ├── provider.py            # Responses + Chat-compatible providers
+│   ├── tools.py               # registry, descriptors, locks, file tools
+│   ├── permissions/           # safety, rules, engine, approval handlers
+│   ├── multiagent.py          # subagent definitions, registry, delegation tool
+│   ├── hooks.py               # lifecycle hook registry and executor
+│   ├── compaction.py          # summaries and artifact offloading
+│   ├── trace.py               # JSONL tracing, replay, pruning
+│   ├── session.py             # persistent sessions and resume logic
+│   ├── skills.py              # progressive skill loading
+│   ├── mcp.py                 # MCP integration
+│   ├── mcp_auth.py            # HTTP MCP OAuth support
+│   ├── sandbox.py             # Docker-only shell execution
+│   ├── models.py              # messages and tool-call data structures
+│   └── cli.py                 # `mini-oh` command-line interface
+├── tests/                     # runtime and protocol tests
+├── examples/                  # permissions, hooks, MCP, reviewer demos
+├── docs/                      # guided code-reading notes
+├── TECHNICAL_DESIGN.md        # design rationale and implementation details
+├── pyproject.toml
+└── LICENSE
+
+Development
+
+Install development dependencies:
+
+pip install -e '.[dev]'
+
+Run the test suite:
+
+pytest -q
+
+Run Ruff:
+
+ruff check .
+
+The current repository contains tests covering the agent loop, tools, permissions, auto-review behavior, hooks, provider contracts, compaction, tracing, sessions, skills, MCP, sandboxing, and subagent delegation.
+
+Design principles
+
+Mini Harness is built around a few explicit rules:
+
+Side effects need a control plane. Validation, permission checks, hooks, and resource scheduling happen before execution.
+
+Unknown behavior fails conservatively. Unknown mutations receive restrictive defaults rather than optimistic concurrency or implicit permission.
+
+The model receives recoverable failures. Tool errors are observations whenever possible, so the agent can change strategy instead of crashing the runtime.
+
+Tool protocol state must remain valid. Tool calls and tool results stay paired through execution, compaction, interruption, and resume.
+
+Observability must not replay side effects. Trace replay renders evidence; it does not re-run the agent.
+
+Security claims should match the implementation. Docker isolation, permission policy, and OAuth boundaries are documented with their limitations.
+
+Complexity should earn its place. The project prefers small, inspectable mechanisms over hidden framework behavior.
+
+Current scope and limitations
+
+The project intentionally does not try to provide every feature of a commercial coding-agent product.
+
+Current boundaries include:
+
+resource locking is process-local;
+
+Docker remains part of the trusted computing base;
+
+local OAuth token files are permission-protected but not OS-keychain encrypted;
+
+hooks are trusted extensions, not sandboxed plugins;
+
+default subagents are lightweight delegated loops rather than autonomous distributed workers;
+
+there is no TUI, plugin marketplace, or remote multi-user execution service;
+
+permission rules are intentionally simple glob-based rules rather than a full policy language.
+
+For deeper implementation notes and trade-offs, see TECHNICAL_DESIGN.md.
+
+License
+
+Mini Harness is released under the MIT License.
+
+<div align="center">
+
+Small enough to understand. Complete enough to expose the real problems in agent runtimes.
+
+</div>

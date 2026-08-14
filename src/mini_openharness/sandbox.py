@@ -27,6 +27,7 @@ class DockerSandboxConfig:
     network: bool = False
     writable: bool = False
     root: bool = False
+    persistent: bool = False
 
     def __post_init__(self) -> None:
         if not self.image.strip():
@@ -41,6 +42,7 @@ class DockerSandbox:
     def __init__(self, config: DockerSandboxConfig | None = None) -> None:
         self.config = config or DockerSandboxConfig()
         self.docker = shutil.which("docker")
+        self._name: str | None = None
 
     async def ensure_available(self) -> None:
         if self.docker is None:
@@ -60,14 +62,9 @@ class DockerSandbox:
                 f"Docker image {self.config.image!r} is unavailable; pull it explicitly. {detail}"
             )
 
-    def build_argv(self, *, workspace: Path, command: str, name: str) -> list[str]:
-        if self.docker is None:
-            raise SandboxUnavailableError("Docker CLI is required for sandbox shell")
+    def _container_flags(self, *, workspace: Path, name: str) -> list[str]:
         root = workspace.resolve()
-        argv = [
-            self.docker,
-            "run",
-            "--rm",
+        flags = [
             "--init",
             "--name",
             name,
@@ -89,19 +86,19 @@ class DockerSandbox:
             "/workspace",
         ]
         if not self.config.root:
-            argv.insert(argv.index("--mount"), "--user")
-            argv.insert(
-                argv.index("--mount"),
+            flags.insert(flags.index("--mount"), "--user")
+            flags.insert(
+                flags.index("--mount"),
                 f"{_host_id('getuid')}:{_host_id('getgid')}",
             )
         if not self.config.network:
-            argv.insert(argv.index("--cpus"), "--network")
-            argv.insert(argv.index("--cpus"), "none")
+            flags.insert(flags.index("--cpus"), "--network")
+            flags.insert(flags.index("--cpus"), "none")
         if not self.config.writable:
-            argv.insert(argv.index("--tmpfs"), "--read-only")
+            flags.insert(flags.index("--tmpfs"), "--read-only")
         for secret in _workspace_secret_files(root):
             destination = Path("/workspace") / secret.relative_to(root)
-            argv.extend(
+            flags.extend(
                 [
                     "--mount",
                     f"type=bind,src=/dev/null,dst={destination},readonly",
@@ -109,26 +106,108 @@ class DockerSandbox:
             )
         oauth_dir = root / ".mini-oh" / "oauth"
         if oauth_dir.exists():
-            argv.extend(
+            flags.extend(
                 [
                     "--mount",
                     "type=tmpfs,dst=/workspace/.mini-oh/oauth,tmpfs-mode=000",
                 ]
             )
-        argv.extend(
-            [
+        return flags
+
+    def build_argv(self, *, workspace: Path, command: str, name: str) -> list[str]:
+        if self.docker is None:
+            raise SandboxUnavailableError("Docker CLI is required for sandbox shell")
+        return [
+            self.docker,
+            "run",
+            "--rm",
+            *self._container_flags(workspace=workspace, name=name),
+            self.config.image,
+            "/bin/sh",
+            "-lc",
+            command,
+        ]
+
+    def _container_name(self) -> str:
+        if self._name is None:
+            self._name = f"mini-oh-sandbox-{uuid4().hex[:12]}"
+        return self._name
+
+    async def _container_state(self, name: str) -> bool | None:
+        process = await asyncio.create_subprocess_exec(
+            self.docker,
+            "inspect",
+            "-f",
+            "{{.State.Running}}",
+            name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        output, _ = await process.communicate()
+        if process.returncode != 0:
+            return None
+        return output.decode("utf-8", errors="replace").strip() == "true"
+
+    async def ensure_container(self, workspace: Path) -> None:
+        """Lazily create the session-scoped container and start it if stopped."""
+        if self.docker is None:
+            raise SandboxUnavailableError("Docker CLI is required for sandbox shell")
+        name = self._container_name()
+        state = await self._container_state(name)
+        if state is None:
+            argv = [
+                self.docker,
+                "run",
+                "-d",
+                *self._container_flags(workspace=workspace, name=name),
                 self.config.image,
+                "sleep",
+                "infinity",
+            ]
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
+            if process.returncode != 0:
+                raise SandboxUnavailableError(
+                    "failed to create sandbox container: "
+                    + stderr.decode("utf-8", errors="replace").strip()
+                )
+        elif state is False:
+            start = await asyncio.create_subprocess_exec(
+                self.docker,
+                "start",
+                name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await start.communicate()
+            if start.returncode != 0:
+                raise SandboxUnavailableError(
+                    "failed to start sandbox container: "
+                    + stderr.decode("utf-8", errors="replace").strip()
+                )
+
+    async def run(self, *, workspace: Path, command: str, timeout: float) -> ToolResult:
+        await self.ensure_available()
+        if self.config.persistent:
+            await self.ensure_container(workspace)
+            name = self._container_name()
+            argv = [
+                self.docker,
+                "exec",
+                name,
                 "/bin/sh",
                 "-lc",
                 command,
             ]
-        )
-        return argv
-
-    async def run(self, *, workspace: Path, command: str, timeout: float) -> ToolResult:
-        await self.ensure_available()
-        name = f"mini-oh-{uuid4().hex[:12]}"
-        argv = self.build_argv(workspace=workspace, command=command, name=name)
+            disposable = False
+        else:
+            name = f"mini-oh-{uuid4().hex[:12]}"
+            argv = self.build_argv(workspace=workspace, command=command, name=name)
+            disposable = True
         process = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.DEVNULL,
@@ -138,7 +217,8 @@ class DockerSandbox:
         try:
             output, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            await self._remove(name)
+            if disposable:
+                await self._remove(name)
             await _stop_process(process)
             return ToolResult(
                 f"Sandbox command timed out after {timeout:g} seconds",
@@ -146,7 +226,8 @@ class DockerSandbox:
                 metadata={"timed_out": True, "sandbox": "docker"},
             )
         except asyncio.CancelledError:
-            await self._remove(name)
+            if disposable:
+                await self._remove(name)
             await _stop_process(process)
             raise
         text = output.decode("utf-8", errors="replace").replace("\r\n", "\n").strip()
@@ -155,8 +236,16 @@ class DockerSandbox:
         return ToolResult(
             text or "(no output)",
             is_error=process.returncode != 0,
-            metadata={"returncode": process.returncode, "sandbox": "docker"},
+            metadata={
+                "returncode": process.returncode,
+                "sandbox": "docker-persistent" if self.config.persistent else "docker",
+            },
         )
+
+    async def close(self) -> None:
+        """Remove the session-scoped container; no-op for disposable mode."""
+        if self.config.persistent and self._name is not None:
+            await self._remove(self._name)
 
     async def _remove(self, name: str) -> None:
         if self.docker is None:

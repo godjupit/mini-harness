@@ -120,6 +120,29 @@ def test_real_docker_shell_writes_only_workspace_and_has_no_network(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker CLI unavailable")
+def test_persistent_sandbox_keeps_state_across_commands(tmp_path):
+    sandbox = DockerSandbox(DockerSandboxConfig(persistent=True))
+    try:
+        first = asyncio.run(
+            sandbox.run(
+                workspace=tmp_path,
+                command="echo install > state.txt",
+                timeout=30,
+            )
+        )
+        assert not first.is_error, first.output
+
+        second = asyncio.run(
+            sandbox.run(workspace=tmp_path, command="cat state.txt", timeout=30)
+        )
+        assert not second.is_error, second.output
+        assert second.output.strip() == "install"
+        assert second.metadata["sandbox"] == "docker-persistent"
+    finally:
+        asyncio.run(sandbox.close())
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker CLI unavailable")
 def test_docker_shell_timeout_removes_container(tmp_path):
     sandbox = DockerSandbox(DockerSandboxConfig(image="alpine:3.20"))
     before = _mini_container_names()

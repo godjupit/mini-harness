@@ -109,7 +109,7 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--permission-config", help="JSON allow/deny/ask rules")
     parser.add_argument("--hooks-config", help="JSON lifecycle command hooks")
-    parser.add_argument("--max-steps", type=int, default=12)
+    parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--tool-timeout", type=float, default=30.0)
     parser.add_argument("--max-repeated-tool-batches", type=int, default=3)
     parser.add_argument("--max-concurrent-tools", type=_positive_int, default=8)
@@ -125,18 +125,26 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sandbox-pids", type=int, default=128)
     parser.add_argument(
         "--sandbox-network",
-        action="store_true",
-        help="Allow network access inside the sandbox (default: none)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow network access inside the sandbox (default); use --no-sandbox-network to disable",
     )
     parser.add_argument(
         "--sandbox-writable",
-        action="store_true",
-        help="Writable container rootfs so apk/pip can install packages (default: read-only)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Writable container rootfs so apk/pip can install (default); use --no-sandbox-writable for read-only",
     )
     parser.add_argument(
         "--sandbox-root",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run the sandbox as root so package managers can install (default); use --no-sandbox-root for host uid",
+    )
+    parser.add_argument(
+        "--sandbox-persistent",
         action="store_true",
-        help="Run the sandbox as root so package managers can install (default: host uid)",
+        help="Session-scoped persistent container: install once, exec per command (default: disposable)",
     )
     parser.add_argument("--context-threshold", type=int, default=12_000)
     parser.add_argument("--keep-recent", type=int, default=6)
@@ -237,8 +245,9 @@ async def _interactive(args: argparse.Namespace) -> int:
     tracer = None
     mcp_manager = None
     provider = None
+    sandbox = None
     try:
-        loop, tracer, mcp_manager, provider = await _build_runtime(
+        loop, tracer, mcp_manager, provider, sandbox = await _build_runtime(
             args,
             session_log=session_log,
             trace_prompt="(interactive session)",
@@ -281,7 +290,7 @@ async def _interactive(args: argparse.Namespace) -> int:
                 loop.cancel()
                 print("cancelled", file=sys.stderr)
     finally:
-        await _close_runtime(mcp_manager, provider)
+        await _close_runtime(mcp_manager, provider, sandbox)
         _ACTIVE_SESSION = None
     if tracer:
         print(f"trace: {tracer.path}")
@@ -407,9 +416,10 @@ async def _drive_session(
     tracer = None
     mcp_manager = None
     provider = None
+    sandbox = None
     exit_code = 1
     try:
-        loop, tracer, mcp_manager, provider = await _build_runtime(
+        loop, tracer, mcp_manager, provider, sandbox = await _build_runtime(
             args,
             session_log=session_log,
             messages=messages,
@@ -435,7 +445,7 @@ async def _drive_session(
         _print_resume_hint()
         raise
     finally:
-        await _close_runtime(mcp_manager, provider)
+        await _close_runtime(mcp_manager, provider, sandbox)
         _ACTIVE_SESSION = None
     if tracer:
         print(f"trace: {tracer.path}")
@@ -505,6 +515,7 @@ async def _build_runtime(
             },
         )
 
+    sandbox = None
     tools = default_tools()
     if args.sandbox_shell:
         sandbox = DockerSandbox(
@@ -516,6 +527,7 @@ async def _build_runtime(
                 network=args.sandbox_network,
                 writable=args.sandbox_writable,
                 root=args.sandbox_root,
+                persistent=args.sandbox_persistent,
             )
         )
         try:
@@ -567,15 +579,21 @@ async def _build_runtime(
         messages=messages,
         session=session_log,
     )
-    return loop, tracer, mcp_manager, provider
+    return loop, tracer, mcp_manager, provider, sandbox
 
 
-async def _close_runtime(mcp_manager: McpManager | None, provider: Any) -> None:
+async def _close_runtime(
+    mcp_manager: McpManager | None,
+    provider: Any,
+    sandbox: DockerSandbox | None = None,
+) -> None:
     if mcp_manager:
         await mcp_manager.close()
     close = getattr(provider, "close", None)
     if close is not None:
         await close()
+    if sandbox is not None:
+        await sandbox.close()
 
 
 def _sessions_command(args: argparse.Namespace) -> int:
@@ -725,8 +743,10 @@ def _print_event(event: AgentEvent) -> None:
         print(f"→ {event.data['name']} {event.data['input']}")
     elif event.kind == "tool_end":
         marker = "✗" if event.data["is_error"] else "✓"
-        preview = event.message.replace("\n", " ")[:100]
-        print(f"{marker} {event.data['name']} ({event.data['elapsed_ms']}ms): {preview}")
+        print(
+            f"{marker} {event.data['name']} ({event.data['elapsed_ms']}ms): "
+            f"{_tool_end_summary(event)}"
+        )
     elif event.kind == "compact":
         print(
             f"compacted context: {event.data['before_tokens']} → "
@@ -743,6 +763,29 @@ def _print_event(event: AgentEvent) -> None:
         print(f"{event.kind}: {event.message}", file=sys.stderr)
     elif event.kind == "done":
         print(f"done in {event.data['steps']} model step(s)")
+
+
+def _tool_end_summary(event: AgentEvent) -> str:
+    """Build a compact tool_end line; file tools never print their content."""
+    name = event.data["name"]
+    tool_input = event.data.get("input", {})
+    if event.data["is_error"]:
+        return event.message.replace("\n", " ")[:120] or "(no output)"
+    if name in {"read_file", "write_file", "edit_file"}:
+        path = tool_input.get("path")
+        return path if isinstance(path, str) else "(no path)"
+    if name == "list_files":
+        count = sum(
+            1
+            for line in event.message.splitlines()
+            if line and not line.startswith("(empty")
+        )
+        return f"{tool_input.get('path', '.')} ({count} files)"
+    if name == "load_skill":
+        skill = tool_input.get("name")
+        return f"skill {skill}" if isinstance(skill, str) else "skill"
+    preview = event.message.replace("\n", " ")[:80]
+    return preview or "(no output)"
 
 
 def main(argv: list[str] | None = None) -> int:

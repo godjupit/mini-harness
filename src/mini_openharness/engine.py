@@ -499,6 +499,7 @@ class AgentLoop:
                 data = {
                     "id": call.id,
                     "name": call.name,
+                    "input": call.arguments,
                     **self.tools.attribution(call.name),
                     "is_error": stored_result.is_error,
                     "elapsed_ms": elapsed_ms,

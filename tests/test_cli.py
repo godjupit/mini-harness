@@ -67,10 +67,14 @@ def test_cli_defaults_sandbox_shell_on_and_can_be_disabled(monkeypatch):
     assert disabled.sandbox_shell is False
     assert defaults.auto_review is True
     assert build_run_parser().parse_args(["--no-auto-review"]).auto_review is False
-    assert defaults.sandbox_network is False
-    assert defaults.sandbox_writable is False
-    assert build_run_parser().parse_args(["--sandbox-network"]).sandbox_network is True
-    assert build_run_parser().parse_args(["--sandbox-writable"]).sandbox_writable is True
+    assert defaults.sandbox_network is True
+    assert defaults.sandbox_writable is True
+    assert defaults.sandbox_root is True
+    assert build_run_parser().parse_args(["--no-sandbox-network"]).sandbox_network is False
+    assert build_run_parser().parse_args(["--no-sandbox-writable"]).sandbox_writable is False
+    assert build_run_parser().parse_args(["--no-sandbox-root"]).sandbox_root is False
+    assert defaults.sandbox_persistent is False
+    assert build_run_parser().parse_args(["--sandbox-persistent"]).sandbox_persistent is True
     assert strict_trace.strict_trace is True
 
 
@@ -131,7 +135,7 @@ def test_cli_runtime_registers_the_agent_tool(tmp_path):
     )
 
     async def build():
-        loop, tracer, mcp_manager, provider = await cli._build_runtime(
+        loop, tracer, mcp_manager, provider, sandbox = await cli._build_runtime(
             args,
             session_log=None,
             trace_prompt="probe",
@@ -141,7 +145,7 @@ def test_cli_runtime_registers_the_agent_tool(tmp_path):
             assert "agent" in names
             assert loop.tools.descriptor("agent").effect == "compute"
         finally:
-            await cli._close_runtime(mcp_manager, provider)
+            await cli._close_runtime(mcp_manager, provider, sandbox)
 
     asyncio.run(build())
 

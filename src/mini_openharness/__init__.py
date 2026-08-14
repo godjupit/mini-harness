@@ -1,6 +1,12 @@
 """Mini OpenHarness: the smallest useful coding-agent runtime."""
 
 from mini_openharness.engine import AgentEvent, AgentLoop, RunAlreadyActiveError
+from mini_openharness.multiagent import (
+    AgentDefinition,
+    AgentManager,
+    AgentTool,
+    build_agent_tool,
+)
 from mini_openharness.provider import (
     ModelProvider,
     OpenAICompatibleProvider,
@@ -30,6 +36,10 @@ __all__ = [
     "AgentEvent",
     "AgentLoop",
     "RunAlreadyActiveError",
+    "AgentDefinition",
+    "AgentManager",
+    "AgentTool",
+    "build_agent_tool",
     "ModelProvider",
     "OpenAICompatibleProvider",
     "OpenAIResponsesProvider",

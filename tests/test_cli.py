@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import pytest
@@ -85,3 +86,24 @@ def test_cli_provider_error_returns_nonzero_and_hints_on_responses_404(
     assert exit_code == 1
     assert "error: HTTP 404" in captured.err
     assert "--api-mode chat" in captured.err
+
+
+def test_cli_runtime_registers_the_agent_tool(tmp_path):
+    args = build_run_parser().parse_args(
+        ["--demo", "--workspace", str(tmp_path), "--no-trace"]
+    )
+
+    async def build():
+        loop, tracer, mcp_manager, provider = await cli._build_runtime(
+            args,
+            session_log=None,
+            trace_prompt="probe",
+        )
+        try:
+            names = {schema["name"] for schema in loop.tools.schemas()}
+            assert "agent" in names
+            assert loop.tools.descriptor("agent").effect == "read"
+        finally:
+            await cli._close_runtime(mcp_manager, provider)
+
+    asyncio.run(build())

@@ -244,6 +244,16 @@ class ToolRegistry:
             }
             for tool in self._tools.values()
         ]
+    
+    def subset(self, names: tuple[str, ...]) -> ToolRegistry:
+        registry = ToolRegistry()
+        for name in names:
+            if name not in self._tools:
+                raise KeyError(f"unknown tool: {name}")
+            registry.register(self._tools[name])
+        
+        return registry
+        
 
     def source(self, name: str) -> str:
         return self.descriptor(name).source

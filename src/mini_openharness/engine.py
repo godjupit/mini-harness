@@ -476,7 +476,7 @@ class AgentLoop:
                 yield self._cancelled_event()
                 return
             for call, (result, elapsed_ms) in zip(reply.tool_calls, timed_results):
-                inline_output, artifact_path = self._offload(call.id, result.output)
+                inline_output, artifact_path = self._offload(call, result.output)
                 stored_failure = result.failure
                 if stored_failure is not None and inline_output != result.output:
                     stored_failure = ToolFailure(
@@ -737,11 +737,31 @@ class AgentLoop:
             state.repeated_tool_batches = 1
         return state.repeated_tool_batches
 
-    def _offload(self, call_id: str, output: str) -> tuple[str, Path | None]:
+    def _offload(self, call: ToolCall, output: str) -> tuple[str, Path | None]:
         if self.artifact_store is None:
             return output, None
+        if self._is_artifact_path(call):
+            limit = self.artifact_store.max_inline_chars
+            inline = output[:limit] + "\n...[artifact file; content stays in the original artifact]"
+            return inline, None
         run_id = self.tracer.run_id if self.tracer else "untraced"
-        return self.artifact_store.offload(run_id=run_id, tool_call_id=call_id, output=output)
+        return self.artifact_store.offload(run_id=run_id, tool_call_id=call.id, output=output)
+
+    def _is_artifact_path(self, call: ToolCall) -> bool:
+        """True when the tool call reads a file inside the artifact store."""
+        arguments = call.arguments if isinstance(call.arguments, dict) else {}
+        raw_path = arguments.get("path")
+        if not isinstance(raw_path, str):
+            return False
+        try:
+            candidate = (self.workspace / raw_path).resolve()
+        except OSError:
+            return False
+        try:
+            candidate.relative_to(self.artifact_store.root)
+        except ValueError:
+            return False
+        return True
 
     async def _compact_if_needed(
         self,

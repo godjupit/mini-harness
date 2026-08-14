@@ -270,7 +270,9 @@ class SandboxedShellTool:
     description = (
         "Run a non-interactive shell command in a disposable Docker container. "
         "Only the workspace is mounted writable at /workspace; network is disabled "
-        "unless --sandbox-network is set. "
+        "unless --sandbox-network is set. The container is disposable per command "
+        "unless --sandbox-persistent is used: install and run in the same command, "
+        "or use an image that already has your tools. "
         "For read_file/write_file after this tool, convert /workspace/example.txt "
         "to the workspace-relative path example.txt."
     )

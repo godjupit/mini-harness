@@ -706,6 +706,36 @@ def test_cancel_stops_in_flight_tool_task(tmp_path):
     assert cancelled
 
 
+def test_artifact_file_read_is_not_reoffloaded(tmp_path):
+    store = ArtifactStore(tmp_path / ".mini-oh" / "artifacts", max_inline_chars=100)
+    artifact = tmp_path / ".mini-oh" / "artifacts" / "run1" / "x.txt"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("A" * 500, encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            ModelReply(
+                tool_calls=(
+                    ToolCall("1", "read_file", {"path": str(artifact.relative_to(tmp_path))}),
+                )
+            ),
+            ModelReply(content="done"),
+        ]
+    )
+    loop = AgentLoop(
+        provider=provider,
+        tools=default_tools(),
+        workspace=tmp_path,
+        artifact_store=store,
+    )
+
+    events = collect(loop, "read artifact")
+
+    tool_end = next(event for event in events if event.kind == "tool_end")
+    assert "artifact_path" not in tool_end.data
+    assert "original artifact" in tool_end.data["output"]
+    assert list((tmp_path / ".mini-oh" / "artifacts").rglob("*.txt")) == [artifact]
+
+
 def test_stream_deltas_retries_and_provider_failure_are_traced(tmp_path):
     class StreamingProvider:
         async def stream(self, messages, tools, *, cancel_event=None):

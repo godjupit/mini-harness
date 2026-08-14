@@ -150,6 +150,29 @@ def test_cli_runtime_registers_the_agent_tool(tmp_path):
     asyncio.run(build())
 
 
+def test_runtime_system_prompt_has_goal_discipline(tmp_path):
+    args = build_run_parser().parse_args(
+        ["--demo", "--workspace", str(tmp_path), "--no-trace", "--no-session"]
+    )
+
+    async def build():
+        loop, tracer, mcp_manager, provider, sandbox = await cli._build_runtime(
+            args,
+            session_log=None,
+            trace_prompt="probe",
+        )
+        try:
+            system = loop.messages[0].content
+            assert "authoritative goal" in system
+            assert "STOP TOOL CALLING" in system
+            assert "RETURN FINAL" in system
+            assert ".mini-oh" in system
+        finally:
+            await cli._close_runtime(mcp_manager, provider, sandbox)
+
+    asyncio.run(build())
+
+
 def test_reviewer_prompt_includes_request_details(tmp_path, capsys):
     args = build_run_parser().parse_args(["--workspace", str(tmp_path)])
     captured = {}

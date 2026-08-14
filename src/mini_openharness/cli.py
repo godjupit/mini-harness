@@ -146,7 +146,7 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Session-scoped persistent container: install once, exec per command (default: disposable)",
     )
-    parser.add_argument("--context-threshold", type=int, default=12_000)
+    parser.add_argument("--context-threshold", type=int, default=800_000)
     parser.add_argument("--keep-recent", type=int, default=6)
     parser.add_argument("--max-inline-output", type=int, default=8_000)
     parser.add_argument("--input-cost", type=float, default=0.0, help="USD per million tokens")
@@ -477,7 +477,15 @@ async def _build_runtime(
 ) -> tuple[AgentLoop, TraceWriter | None, McpManager | None, Any]:
     workspace = Path(args.workspace).resolve()
     skills = SkillCatalog(args.skills_dir or workspace / "skills")
-    system_parts = ["You are a concise coding assistant. Inspect before editing."]
+    system_parts = [
+        "You are a concise coding assistant. Inspect before editing.",
+        (
+            "Goal discipline: the latest user request is the authoritative goal. "
+            "Do not inspect .mini-oh internal state unless explicitly asked. "
+            "When implementation and verification satisfy the request: "
+            "STOP TOOL CALLING and RETURN FINAL."
+        ),
+    ]
     skill_prompt = skills.prompt()
     if skill_prompt:
         system_parts.append(skill_prompt)

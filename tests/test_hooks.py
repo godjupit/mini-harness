@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -18,8 +19,24 @@ from mini_openharness.hooks import (
     load_hook_registry,
 )
 from mini_openharness.models import ModelReply, ToolCall
+from mini_openharness.permissions import (
+    PermissionContext,
+    PermissionEngine,
+    PermissionMode,
+    PermissionRules,
+)
 from mini_openharness.tools import ToolRegistry, ToolResult
 from mini_openharness.trace import TraceStore, TraceWriter
+
+
+def bypass_engine(workspace: Path) -> PermissionEngine:
+    return PermissionEngine(
+        PermissionContext(
+            mode=PermissionMode.BYPASS,
+            rules=PermissionRules(),
+            workspace=workspace,
+        )
+    )
 
 
 class ScriptedProvider:
@@ -301,7 +318,16 @@ def test_pre_and_post_tool_hooks_transform_the_real_execution(tmp_path):
         ]
     )
 
-    collect(AgentLoop(provider=provider, tools=tools, workspace=tmp_path, hooks=hooks), "go")
+    collect(
+        AgentLoop(
+            provider=provider,
+            tools=tools,
+            workspace=tmp_path,
+            hooks=hooks,
+            permission_engine=bypass_engine(tmp_path),
+        ),
+        "go",
+    )
 
     assert executed == ["safe"]
     assert provider.requests[1][0][-1].content == "safe:checked"

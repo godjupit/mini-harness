@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
 from mini_openharness.engine import AgentLoop, MaxStepsExceeded, RunAlreadyActiveError
 from mini_openharness.models import Message, ModelReply, ToolCall
+from mini_openharness.permissions import (
+    PermissionContext,
+    PermissionEngine,
+    PermissionMode,
+    PermissionRules,
+)
 from mini_openharness.provider import (
     ProviderAuthenticationError,
     ProviderComplete,
@@ -23,6 +30,16 @@ from mini_openharness.tools import (
     default_tools,
 )
 from mini_openharness.trace import TraceStore, TraceWriter
+
+
+def bypass_engine(workspace: Path) -> PermissionEngine:
+    return PermissionEngine(
+        PermissionContext(
+            mode=PermissionMode.BYPASS,
+            rules=PermissionRules(),
+            workspace=workspace,
+        )
+    )
 
 
 class ScriptedProvider:
@@ -431,6 +448,7 @@ def test_repeated_tool_batch_is_blocked_but_model_can_recover(tmp_path):
         tools=tools,
         workspace=tmp_path,
         max_repeated_tool_batches=2,
+        permission_engine=bypass_engine(tmp_path),
     )
 
     events = collect(loop, "do not loop")
@@ -586,7 +604,13 @@ def test_tool_failure_is_exposed_on_agent_and_trace_events(tmp_path):
         ]
     )
     tracer = TraceWriter(tmp_path / "traces", run_id="structured-failure")
-    loop = AgentLoop(provider=provider, tools=tools, workspace=tmp_path, tracer=tracer)
+    loop = AgentLoop(
+        provider=provider,
+        tools=tools,
+        workspace=tmp_path,
+        tracer=tracer,
+        permission_engine=bypass_engine(tmp_path),
+    )
 
     events = collect(loop, "fail safely")
 
@@ -650,6 +674,7 @@ def test_cancel_stops_in_flight_tool_task(tmp_path):
         provider=ScriptedProvider([ModelReply(tool_calls=(ToolCall("slow", "slow", {}),))]),
         tools=tools,
         workspace=tmp_path,
+        permission_engine=bypass_engine(tmp_path),
     )
 
     async def run():

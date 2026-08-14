@@ -14,13 +14,21 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from jsonschema import SchemaError, ValidationError, validate
 
-from mini_openharness.permissions import ApprovalCallback, PermissionPolicy
+from mini_openharness.permissions import (
+    ApprovalHandler,
+    PermissionBehavior,
+    PermissionContext,
+    PermissionEngine,
+    PermissionMode,
+    PermissionRequest,
+    build_default_rules,
+)
 
 if TYPE_CHECKING:
     from mini_openharness.trace import TraceSink
 
 JsonSchema = dict[str, Any]
-ToolEffect = Literal["read", "write", "remote", "unknown"]
+ToolEffect = Literal["read", "write", "remote", "compute", "unknown"]
 FailureStage = Literal["lookup", "validate", "authorize", "execute", "postprocess"]
 
 
@@ -116,8 +124,8 @@ class FileSnapshotStore:
 class ToolContext:
     workspace: Path
     allow_write: bool = False
-    permission_policy: PermissionPolicy | None = None
-    approval_callback: ApprovalCallback | None = None
+    permission_engine: PermissionEngine | None = None
+    approval_handler: ApprovalHandler | None = None
     tracer: TraceSink | None = None
     tool_timeout_seconds: float = 30.0
     file_snapshots: FileSnapshotStore | None = None
@@ -135,7 +143,7 @@ class ToolDescriptor:
     command_argument: str | None = None
 
     def __post_init__(self) -> None:
-        if self.effect not in {"read", "write", "remote", "unknown"}:
+        if self.effect not in {"read", "write", "remote", "compute", "unknown"}:
             raise ValueError(f"Unsupported tool effect: {self.effect}")
         if not self.source:
             raise ValueError("tool descriptor source must not be empty")
@@ -353,29 +361,40 @@ class ToolRegistry:
         permission_path = self.permission_path(name, arguments)
         permission_command = self.permission_command(name, arguments)
         try:
-            policy = context.permission_policy or PermissionPolicy(
-                default_mutation="allow" if context.allow_write else "ask"
-            )
-            decision = policy.evaluate(
+            engine = context.permission_engine
+            if engine is None:
+                engine = PermissionEngine(
+                    PermissionContext(
+                        mode=(
+                            PermissionMode.ACCEPT_EDITS
+                            if context.allow_write
+                            else PermissionMode.DEFAULT
+                        ),
+                        rules=build_default_rules(),
+                        workspace=context.workspace,
+                    )
+                )
+            request = PermissionRequest(
                 tool_name=name,
-                read_only=descriptor.effect == "read",
-                path=permission_path,
+                input=arguments,
                 source=descriptor.source,
+                effect=descriptor.effect,
+                destructive=descriptor.destructive,
+                path=permission_path,
                 command=permission_command,
             )
-            allowed = decision.action == "allow"
-            if decision.action == "ask" and context.approval_callback is not None:
-                allowed = await context.approval_callback(
-                    name,
-                    f"{decision.reason}; arguments={arguments}",
-                )
+            decision = engine.authorize(request)
+            allowed = decision.behavior == PermissionBehavior.ALLOW
+            if decision.behavior == PermissionBehavior.ASK and context.approval_handler is not None:
+                approval = await context.approval_handler.request(request, decision)
+                allowed = approval.approved
             if context.tracer is not None:
                 context.tracer.emit(
                     "permission_decision",
                     {
                         "tool": name,
                         **self.attribution(name),
-                        "requested_action": decision.action,
+                        "requested_action": decision.behavior.value,
                         "allowed": allowed,
                         "reason": decision.reason,
                         "path": permission_path,
@@ -386,7 +405,8 @@ class ToolRegistry:
             if not allowed:
                 reason = (
                     "approval was denied"
-                    if decision.action == "ask" and context.approval_callback is not None
+                    if decision.behavior == PermissionBehavior.ASK
+                    and context.approval_handler is not None
                     else decision.reason
                 )
                 return ToolResult.fail(

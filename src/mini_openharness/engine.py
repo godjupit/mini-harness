@@ -14,7 +14,7 @@ from uuid import uuid4
 from mini_openharness.compaction import ArtifactStore, ContextCompactor
 from mini_openharness.hooks import HookEvent, HookExecutor, HookRegistry
 from mini_openharness.models import Message, ModelReply, ToolCall
-from mini_openharness.permissions import ApprovalCallback, PermissionPolicy
+from mini_openharness.permissions import ApprovalHandler, PermissionEngine
 from mini_openharness.session import SessionLog
 from mini_openharness.provider import (
     ModelProvider,
@@ -101,8 +101,8 @@ class AgentLoop:
         system_prompt: str = "You are a concise coding assistant. Inspect before editing.",
         max_steps: int = 12,
         allow_write: bool = False,
-        permission_policy: PermissionPolicy | None = None,
-        approval_callback: ApprovalCallback | None = None,
+        permission_engine: PermissionEngine | None = None,
+        approval_handler: ApprovalHandler | None = None,
         tracer: TraceSink | None = None,
         compactor: ContextCompactor | None = None,
         artifact_store: ArtifactStore | None = None,
@@ -128,8 +128,8 @@ class AgentLoop:
         self.workspace = Path(workspace).resolve()
         self.max_steps = max_steps
         self.allow_write = allow_write
-        self.permission_policy = permission_policy
-        self.approval_callback = approval_callback
+        self.permission_engine = permission_engine
+        self.approval_handler = approval_handler
         self.tracer = tracer
         self.compactor = compactor
         self.artifact_store = artifact_store
@@ -259,8 +259,8 @@ class AgentLoop:
         return ToolContext(
             self.workspace,
             allow_write=self.allow_write,
-            permission_policy=self.permission_policy,
-            approval_callback=self.approval_callback,
+            permission_engine=self.permission_engine,
+            approval_handler=self.approval_handler,
             tracer=self.tracer,
             tool_timeout_seconds=self.tool_timeout_seconds,
             file_snapshots=state.file_snapshots,

@@ -65,7 +65,7 @@ class LoadSkillTool:
     name = "load_skill"
     description = "Load the full instructions for one available skill."
     read_only = True
-    descriptor = ToolDescriptor(source="skill", effect="read")
+    descriptor = ToolDescriptor(source="skill", effect="compute")
     parameters = {
         "type": "object",
         "properties": {"name": {"type": "string"}},

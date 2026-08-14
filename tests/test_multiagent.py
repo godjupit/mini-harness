@@ -18,8 +18,24 @@ from mini_openharness.multiagent import (
     plan_agent,
 )
 from mini_openharness.models import ModelReply, ToolCall
+from mini_openharness.permissions import (
+    PermissionContext,
+    PermissionEngine,
+    PermissionMode,
+    PermissionRules,
+)
 from mini_openharness.provider import DemoProvider, ProviderError
 from mini_openharness.tools import ToolContext, ToolRegistry, default_tools
+
+
+def bypass_engine(workspace) -> PermissionEngine:
+    return PermissionEngine(
+        PermissionContext(
+            mode=PermissionMode.BYPASS,
+            rules=PermissionRules(),
+            workspace=workspace,
+        )
+    )
 
 
 class ScriptedProvider:
@@ -184,7 +200,12 @@ def test_agent_tool_wired_into_main_loop_delegates_to_subagent(tmp_path):
             ModelReply(content="main done"),
         ]
     )
-    loop = AgentLoop(provider=main_provider, tools=registry, workspace=tmp_path)
+    loop = AgentLoop(
+        provider=main_provider,
+        tools=registry,
+        workspace=tmp_path,
+        permission_engine=bypass_engine(tmp_path),
+    )
 
     events = collect_loop(loop, "delegate this")
 

@@ -20,7 +20,14 @@ from mini_openharness.hooks import load_hook_registry
 from mini_openharness.mcp import McpManager
 from mini_openharness.models import Message
 from mini_openharness.multiagent import build_agent_tool
-from mini_openharness.permissions import PermissionPolicy
+from mini_openharness.permissions import (
+    ApprovalHandler,
+    PermissionContext,
+    PermissionEngine,
+    PermissionMode,
+    build_default_rules,
+    load_rules_from_json,
+)
 from mini_openharness.provider import (
     DemoProvider,
     OpenAICompatibleProvider,
@@ -351,9 +358,9 @@ async def _build_runtime(
         tools.register(LoadSkillTool(skills))
     tools.register(build_agent_tool(provider=provider, tools=tools, workspace=workspace))
     mcp_manager = McpManager.from_file(args.mcp_config) if args.mcp_config else None
-    policy = _permission_policy(args)
+    permission_engine = PermissionEngine(_permission_context(args))
     hooks = load_hook_registry(args.hooks_config) if args.hooks_config else None
-    approval = _approval_callback(args)
+    approval = ApprovalHandler(_approval_callback(args))
     loop = AgentLoop(
         provider=provider,
         tools=tools,
@@ -361,8 +368,8 @@ async def _build_runtime(
         system_prompt="\n\n".join(system_parts),
         max_steps=args.max_steps,
         allow_write=args.allow_write,
-        permission_policy=policy,
-        approval_callback=approval,
+        permission_engine=permission_engine,
+        approval_handler=approval,
         tracer=tracer,
         compactor=ContextCompactor(
             threshold_tokens=args.context_threshold,
@@ -419,28 +426,38 @@ def _print_provider_hint(args: argparse.Namespace, event: AgentEvent) -> None:
         )
 
 
-def _permission_policy(args: argparse.Namespace) -> PermissionPolicy:
+def _permission_context(args: argparse.Namespace) -> PermissionContext:
+    rules = build_default_rules()
     if args.permission_config:
-        configured = PermissionPolicy.from_file(args.permission_config)
-        if args.allow_write:
-            return PermissionPolicy(configured.rules, default_mutation="allow")
-        return configured
-    return PermissionPolicy(default_mutation="allow" if args.allow_write else "ask")
+        rules = load_rules_from_json(args.permission_config)
+    if args.yes:
+        mode = PermissionMode.BYPASS
+    elif args.allow_write:
+        mode = PermissionMode.ACCEPT_EDITS
+    else:
+        mode = PermissionMode.DEFAULT
+    return PermissionContext(
+        mode=mode,
+        rules=rules,
+        workspace=Path(args.workspace).resolve(),
+    )
 
 
 def _approval_callback(args: argparse.Namespace):
     if args.yes:
 
-        async def approve_all(tool: str, reason: str) -> bool:
-            del tool, reason
+        async def approve_all(request, decision) -> bool:
+            del request, decision
             return True
 
         return approve_all
     if not sys.stdin.isatty():
         return None
 
-    async def ask(tool: str, reason: str) -> bool:
-        answer = await asyncio.to_thread(input, f"Approve {tool}? {reason} [y/N] ")
+    async def ask(request, decision) -> bool:
+        answer = await asyncio.to_thread(
+            input, f"Approve {request.tool_name}? {decision.reason} [y/N] "
+        )
         return answer.strip().lower() in {"y", "yes"}
 
     return ask

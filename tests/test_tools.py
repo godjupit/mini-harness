@@ -3,8 +3,16 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+from pathlib import Path
 
-from mini_openharness.permissions import PermissionPolicy, PermissionRule
+from mini_openharness.permissions import (
+    PermissionBehavior,
+    PermissionContext,
+    PermissionEngine,
+    PermissionMode,
+    PermissionRule,
+    PermissionRules,
+)
 from mini_openharness.tools import (
     ResourceAccess,
     ResourceLockManager,
@@ -16,6 +24,16 @@ from mini_openharness.tools import (
     ToolResult,
     default_tools,
 )
+
+
+def bypass_engine(workspace: Path) -> PermissionEngine:
+    return PermissionEngine(
+        PermissionContext(
+            mode=PermissionMode.BYPASS,
+            rules=PermissionRules(),
+            workspace=workspace,
+        )
+    )
 
 
 def test_tool_timeout_becomes_recoverable_observation(tmp_path):
@@ -34,7 +52,13 @@ def test_tool_timeout_becomes_recoverable_observation(tmp_path):
     registry.register(SlowTool())
     result = asyncio.run(
         registry.execute(
-            "slow", {}, ToolContext(tmp_path, tool_timeout_seconds=0.01)
+            "slow",
+            {},
+            ToolContext(
+                tmp_path,
+                tool_timeout_seconds=0.01,
+                permission_engine=bypass_engine(tmp_path),
+            ),
         )
     )
 
@@ -116,22 +140,33 @@ def test_explicit_descriptor_controls_source_effect_and_permission_path(tmp_path
 
     registry = ToolRegistry()
     registry.register(NamedPathTool())
-    policy = PermissionPolicy(
-        [PermissionRule("allow", tool="put_document", path="docs/*")],
-        default_mutation="deny",
+    engine = PermissionEngine(
+        PermissionContext(
+            mode=PermissionMode.DEFAULT,
+            rules=PermissionRules(
+                allow=[
+                    PermissionRule(
+                        PermissionBehavior.ALLOW,
+                        tool="put_document",
+                        pattern="docs/*",
+                    )
+                ]
+            ),
+            workspace=tmp_path,
+        )
     )
 
     allowed = execute(
         registry,
         "put_document",
         {"filename": "docs/a.md", "content": "ok"},
-        ToolContext(tmp_path, permission_policy=policy),
+        ToolContext(tmp_path, permission_engine=engine),
     )
     denied = execute(
         registry,
         "put_document",
         {"filename": "src/a.py", "content": "no"},
-        ToolContext(tmp_path, permission_policy=policy),
+        ToolContext(tmp_path, permission_engine=engine),
     )
 
     assert not allowed.is_error
@@ -155,7 +190,12 @@ def test_legacy_tool_gets_fail_closed_inferred_descriptor(tmp_path):
     registry = ToolRegistry()
     registry.register(LegacyTool())
 
-    result = execute(registry, "legacy", {}, ToolContext(tmp_path))
+    result = execute(
+        registry,
+        "legacy",
+        {},
+        ToolContext(tmp_path, permission_engine=bypass_engine(tmp_path)),
+    )
 
     assert result.output == "ok"
     assert registry.descriptor("legacy").effect == "read"
@@ -210,8 +250,18 @@ def test_invalid_and_legacy_error_results_are_normalized(tmp_path):
     registry.register(InvalidResultTool())
     registry.register(LegacyErrorTool())
 
-    invalid = execute(registry, "invalid_result", {}, ToolContext(tmp_path))
-    legacy = execute(registry, "legacy_error", {}, ToolContext(tmp_path))
+    invalid = execute(
+        registry,
+        "invalid_result",
+        {},
+        ToolContext(tmp_path, permission_engine=bypass_engine(tmp_path)),
+    )
+    legacy = execute(
+        registry,
+        "legacy_error",
+        {},
+        ToolContext(tmp_path, permission_engine=bypass_engine(tmp_path)),
+    )
 
     assert (invalid.failure.code, invalid.failure.stage) == ("invalid_result", "postprocess")
     assert (legacy.failure.code, legacy.failure.stage) == ("tool_reported_error", "execute")
@@ -485,7 +535,7 @@ def test_edit_rejects_path_escape(tmp_path):
         ToolContext(tmp_path, allow_write=True),
     )
 
-    assert result.failure.code == "invalid_path"
+    assert result.failure.code == "permission_denied"
     assert outside.read_text(encoding="utf-8") == "old"
 
 

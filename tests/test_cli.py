@@ -102,7 +102,7 @@ def test_cli_runtime_registers_the_agent_tool(tmp_path):
         try:
             names = {schema["name"] for schema in loop.tools.schemas()}
             assert "agent" in names
-            assert loop.tools.descriptor("agent").effect == "read"
+            assert loop.tools.descriptor("agent").effect == "compute"
         finally:
             await cli._close_runtime(mcp_manager, provider)
 

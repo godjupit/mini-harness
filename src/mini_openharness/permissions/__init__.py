@@ -1,19 +1,38 @@
 """Rule-based permission decisions with optional human approval."""
 
-from mini_openharness.permissions.policy import PermissionPolicy
+from mini_openharness.permissions.approval import ApprovalHandler, ApprovalResult
+from mini_openharness.permissions.engine import PermissionEngine
+from mini_openharness.permissions.rules import (
+    build_default_rules,
+    find_matching_rule,
+    load_rules_from_json,
+    match_rule,
+)
+from mini_openharness.permissions.safety import SafetyResult
 from mini_openharness.permissions.types import (
-    ApprovalCallback,
-    PermissionAction,
+    PermissionBehavior,
+    PermissionContext,
     PermissionDecision,
+    PermissionMode,
+    PermissionRequest,
     PermissionRule,
-    extract_path,
+    PermissionRules,
 )
 
 __all__ = [
-    "ApprovalCallback",
-    "PermissionAction",
+    "ApprovalHandler",
+    "ApprovalResult",
+    "PermissionBehavior",
+    "PermissionContext",
     "PermissionDecision",
-    "PermissionPolicy",
+    "PermissionEngine",
+    "PermissionMode",
+    "PermissionRequest",
     "PermissionRule",
-    "extract_path",
+    "PermissionRules",
+    "SafetyResult",
+    "build_default_rules",
+    "find_matching_rule",
+    "load_rules_from_json",
+    "match_rule",
 ]

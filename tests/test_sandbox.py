@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from mini_openharness.permissions import ApprovalHandler
 from mini_openharness.sandbox import (
     DockerSandbox,
     DockerSandboxConfig,
@@ -14,6 +15,11 @@ from mini_openharness.sandbox import (
     SandboxUnavailableError,
 )
 from mini_openharness.tools import ToolContext, ToolRegistry
+
+
+async def approve_all(request, decision):
+    del request, decision
+    return True
 
 
 def test_docker_sandbox_argv_enforces_core_isolation(tmp_path):
@@ -70,7 +76,12 @@ def test_real_docker_shell_writes_only_workspace_and_has_no_network(tmp_path):
         return await tools.execute(
             "sandbox_shell",
             {"command": command, "timeout_seconds": 15},
-            ToolContext(tmp_path, allow_write=True, tool_timeout_seconds=20),
+            ToolContext(
+                tmp_path,
+                allow_write=True,
+                tool_timeout_seconds=20,
+                approval_handler=ApprovalHandler(approve_all),
+            ),
         )
 
     result = asyncio.run(exercise())

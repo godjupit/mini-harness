@@ -77,7 +77,7 @@ class AgentTool:
     # Subagents run read-only AgentLoops (write tools default to ask/deny), so
     # the delegating tool itself is a read effect. Revisit if subagents are
     # ever granted write access.
-    descriptor = ToolDescriptor(effect="read", destructive=False)
+    descriptor = ToolDescriptor(effect="compute", destructive=False)
     
     def __init__(
         self,

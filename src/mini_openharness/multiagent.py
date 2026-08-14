@@ -22,6 +22,7 @@ class AgentDefinition:
     system_prompt: str
     max_turns: int
     tools: tuple[str, ...]
+    description: str = ""
     
 
 
@@ -61,21 +62,22 @@ class AgentManager:
 
 class AgentTool:
     name = "agent"
-    description = "use subagent to solve problems"
+    description = """
+        Delegate a task to a specialized subagent.
+
+        Use explore_agent for codebase investigation, locating implementations,
+        tracing architecture, and gathering information across multiple files.
+
+        Use plan_agent after enough context is available when a task requires
+        an implementation plan.
+
+        Prefer delegation for substantial self-contained investigation or planning
+        tasks that can be performed independently.
+    """
     # Subagents run read-only AgentLoops (write tools default to ask/deny), so
     # the delegating tool itself is a read effect. Revisit if subagents are
     # ever granted write access.
     descriptor = ToolDescriptor(effect="read", destructive=False)
-    
-    parameters = {
-            "type": "object",
-            "properties": {
-                "task": {"type": "string"},
-                "agent_type": {"type": "string"}
-            },
-            "required": ["task", "agent_type"],
-            "additionalProperties": False,
-    }
     
     def __init__(
         self,
@@ -84,6 +86,32 @@ class AgentTool:
     ):
         self._manager = manager
         self._definitions = definitions
+        self.parameters = self._build_parameters()
+
+    def _iter_definitions(self) -> tuple[AgentDefinition, ...]:
+        if isinstance(self._definitions, AgentRegistry):
+            return self._definitions.all()
+        return tuple(self._definitions.values())
+
+    def _build_parameters(self) -> dict[str, Any]:
+        agents = self._iter_definitions()
+        purpose_parts = [
+            f"{agent.type} {agent.description or agent.system_prompt}"
+            for agent in agents
+        ]
+        return {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "agent_type": {
+                    "type": "string",
+                    "enum": [agent.type for agent in agents],
+                    "description": "Type of subagent to use. " + " ".join(purpose_parts),
+                },
+            },
+            "required": ["task", "agent_type"],
+            "additionalProperties": False,
+        }
 
         
     async def run(
@@ -127,7 +155,8 @@ explore_agent = AgentDefinition(
     type="explore_agent",
     system_prompt="you are an explore agent that explores the codebase",
     max_turns=40,
-    tools=("read_file", "list_files")
+    tools=("read_file", "list_files"),
+    description="searches and understands the codebase",
 )
 
 
@@ -136,6 +165,7 @@ plan_agent = AgentDefinition(
     system_prompt="you are a plan agent that plan how to write code next step",
     max_turns=40,
     tools=("read_file", "list_files"),
+    description="analyzes a task and produces an implementation plan",
 )    
 
 
@@ -146,12 +176,15 @@ class AgentRegistry:
         
     def register(self, definition: AgentDefinition):
         if definition.type in self._agents:
-            raise ValueError(f"same type agent")
+            raise ValueError("same type agent")
         self._agents[definition.type] = definition
 
     def get(self, agent_type: str) -> AgentDefinition | None:
         return self._agents.get(agent_type)
         
+    def all(self) -> tuple[AgentDefinition, ...]:
+        return tuple(self._agents.values())
+
     def names(self) -> tuple[str, ...]:
         return tuple(self._agents.keys())
 

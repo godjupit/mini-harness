@@ -10,6 +10,7 @@ from mini_openharness.engine import AgentLoop
 from mini_openharness.multiagent import (
     AgentDefinition,
     AgentManager,
+    AgentRegistry,
     AgentTool,
     build_agent_tool,
     default_agents,
@@ -301,3 +302,43 @@ def test_registry_defaults_and_unknown_lookup():
     assert registry.get("explore_agent") is explore_agent
     assert registry.get("plan_agent") is plan_agent
     assert registry.get("nope") is None
+
+
+def test_agent_tool_parameters_expose_registered_agent_types(tmp_path):
+    registry = default_agents()
+    provider = ScriptedProvider([ModelReply(content="done")])
+    tool = build_agent_tool(
+        provider=provider,
+        tools=default_tools(),
+        workspace=tmp_path,
+        definitions=registry,
+    )
+
+    agent_type_schema = tool.parameters["properties"]["agent_type"]
+    assert agent_type_schema["type"] == "string"
+    assert agent_type_schema["enum"] == ["explore_agent", "plan_agent"]
+    assert "searches and understands the codebase" in agent_type_schema["description"]
+    assert "produces an implementation plan" in agent_type_schema["description"]
+
+
+def test_agent_tool_parameters_follow_custom_registry(tmp_path):
+    writer = AgentDefinition(
+        type="writer",
+        system_prompt="you write files",
+        max_turns=3,
+        tools=("write_file",),
+        description="writes files from a plan",
+    )
+    registry = AgentRegistry()
+    registry.register(writer)
+    provider = ScriptedProvider([ModelReply(content="ok")])
+    tool = build_agent_tool(
+        provider=provider,
+        tools=default_tools(),
+        workspace=tmp_path,
+        definitions=registry,
+    )
+
+    agent_type_schema = tool.parameters["properties"]["agent_type"]
+    assert agent_type_schema["enum"] == ["writer"]
+    assert "writes files from a plan" in agent_type_schema["description"]

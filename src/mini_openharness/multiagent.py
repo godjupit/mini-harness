@@ -129,7 +129,11 @@ class AgentTool:
     # Subagents run read-only AgentLoops (write tools default to ask/deny), so
     # the delegating tool itself is a read effect. Revisit if subagents are
     # ever granted write access.
-    descriptor = ToolDescriptor(effect="compute", destructive=False)
+    descriptor = ToolDescriptor(
+        effect="compute",
+        destructive=False,
+        timeout_seconds=300.0,
+    )
     
     def __init__(
         self,
@@ -220,7 +224,11 @@ def build_agent_tool(
 
 explore_agent = AgentDefinition(
     type="explore_agent",
-    system_prompt="you are an explore agent that explores the codebase",
+    system_prompt=(
+        "You are an explore agent that explores the codebase. "
+        "Work autonomously until the task is complete, then reply with the "
+        "final structured result — never stop with an intermediate status."
+    ),
     max_turns=40,
     tools=("read_file", "list_files"),
     description="searches and understands the codebase",
@@ -229,7 +237,11 @@ explore_agent = AgentDefinition(
 
 plan_agent = AgentDefinition(
     type="plan_agent",
-    system_prompt="you are a plan agent that plan how to write code next step",
+    system_prompt=(
+        "You are a plan agent that produces implementation plans. "
+        "Work autonomously until the plan is complete, then reply with the "
+        "final plan — never stop with an intermediate status."
+    ),
     max_turns=40,
     tools=("read_file", "list_files"),
     description="analyzes a task and produces an implementation plan",

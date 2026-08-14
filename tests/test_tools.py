@@ -5,6 +5,8 @@ import os
 import stat
 from pathlib import Path
 
+import pytest
+
 from mini_openharness.permissions import (
     HumanApprovalHandler,
     PermissionBehavior,
@@ -85,6 +87,38 @@ def test_tool_timeout_becomes_recoverable_observation(tmp_path):
     )
     assert result.metadata["timed_out"] is True
     assert "timed out" in result.output
+
+
+def test_descriptor_timeout_overrides_context_timeout(tmp_path):
+    class SlowTool:
+        name = "slow_desc"
+        description = "slow"
+        parameters = {"type": "object", "additionalProperties": False}
+        descriptor = ToolDescriptor(effect="read", timeout_seconds=0.5)
+
+        async def run(self, arguments, context):
+            del arguments, context
+            await asyncio.sleep(0.2)
+            return ToolResult("done")
+
+    registry = ToolRegistry()
+    registry.register(SlowTool())
+
+    result = asyncio.run(
+        registry.execute(
+            "slow_desc",
+            {},
+            ToolContext(tmp_path, tool_timeout_seconds=0.05),
+        )
+    )
+
+    assert not result.is_error
+    assert result.output == "done"
+
+
+def test_descriptor_timeout_rejects_non_positive():
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        ToolDescriptor(effect="read", timeout_seconds=0)
 
 
 def test_tool_failure_factory_enforces_error_invariant():

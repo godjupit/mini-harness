@@ -38,6 +38,32 @@ def test_docker_sandbox_argv_enforces_core_isolation(tmp_path):
     assert argv[-3:] == ["/bin/sh", "-lc", "echo ok"]
 
 
+def test_docker_sandbox_argv_allows_network_and_writable_rootfs(tmp_path):
+    sandbox = DockerSandbox(DockerSandboxConfig(network=True, writable=True))
+    sandbox.docker = "/usr/bin/docker"
+
+    argv = sandbox.build_argv(workspace=tmp_path, command="echo ok", name="test-box")
+
+    assert "--network" not in argv
+    assert "--read-only" not in argv
+    assert argv[argv.index("--cap-drop") + 1] == "ALL"
+
+
+def test_docker_sandbox_argv_root_drops_host_uid_mapping(tmp_path):
+    sandbox = DockerSandbox(DockerSandboxConfig(root=True))
+    sandbox.docker = "/usr/bin/docker"
+
+    argv = sandbox.build_argv(workspace=tmp_path, command="echo ok", name="test-box")
+
+    assert "--user" not in argv
+    sandbox2 = DockerSandbox(DockerSandboxConfig())
+    sandbox2.docker = "/usr/bin/docker"
+    default_argv = sandbox2.build_argv(
+        workspace=tmp_path, command="echo ok", name="test-box"
+    )
+    assert "--user" in default_argv
+
+
 def test_sandbox_tool_explains_container_to_workspace_path_mapping():
     assert "/workspace/example.txt" in SandboxedShellTool.description
     assert "workspace-relative path example.txt" in SandboxedShellTool.description

@@ -54,17 +54,23 @@ def test_local_dotenv_is_loaded_without_overriding_shell(tmp_path, monkeypatch):
     assert os.environ["OPENAI_MODEL"] == "from-shell"
 
 
-def test_cli_defaults_to_responses_and_sandbox_shell_is_opt_in(monkeypatch):
+def test_cli_defaults_sandbox_shell_on_and_can_be_disabled(monkeypatch):
     monkeypatch.delenv("OPENAI_API_MODE", raising=False)
 
     defaults = build_run_parser().parse_args([])
-    sandboxed = build_run_parser().parse_args(["--sandbox-shell"])
+    disabled = build_run_parser().parse_args(["--no-sandbox-shell"])
     strict_trace = build_run_parser().parse_args(["--strict-trace"])
 
     assert defaults.api_mode == "responses"
-    assert defaults.sandbox_shell is False
+    assert defaults.sandbox_shell is True
     assert defaults.strict_trace is False
-    assert sandboxed.sandbox_shell is True
+    assert disabled.sandbox_shell is False
+    assert defaults.auto_review is True
+    assert build_run_parser().parse_args(["--no-auto-review"]).auto_review is False
+    assert defaults.sandbox_network is False
+    assert defaults.sandbox_writable is False
+    assert build_run_parser().parse_args(["--sandbox-network"]).sandbox_network is True
+    assert build_run_parser().parse_args(["--sandbox-writable"]).sandbox_writable is True
     assert strict_trace.strict_trace is True
 
 
@@ -140,7 +146,7 @@ def test_cli_runtime_registers_the_agent_tool(tmp_path):
     asyncio.run(build())
 
 
-def test_reviewer_prompt_includes_request_details(tmp_path):
+def test_reviewer_prompt_includes_request_details(tmp_path, capsys):
     args = build_run_parser().parse_args(["--workspace", str(tmp_path)])
     captured = {}
 
@@ -172,6 +178,7 @@ def test_reviewer_prompt_includes_request_details(tmp_path):
     assert f"workspace: {tmp_path.resolve()}" in prompt
     assert "effect: write" in prompt
     assert "reason: needs review" in prompt
+    assert "⚖ reviewer: approve — sandbox_shell npm publish (needs review)" in capsys.readouterr().out
 
 
 def test_single_shot_with_prompt_does_not_enter_repl(tmp_path, capsys):

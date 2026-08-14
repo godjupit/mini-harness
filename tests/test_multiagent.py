@@ -254,6 +254,7 @@ def test_build_agent_tool_defaults_to_explore_agent(tmp_path):
     assert result.output == "explored"
     assert result.is_error is False
     assert {item["name"] for item in provider.requests[0][1]} == {"read_file", "list_files"}
+    assert tool.descriptor.timeout_seconds == 300.0
 
 
 def test_build_agent_tool_accepts_custom_definitions(tmp_path):

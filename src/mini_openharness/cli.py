@@ -37,6 +37,7 @@ from mini_openharness.provider import (
 from mini_openharness.sandbox import (
     DockerSandbox,
     DockerSandboxConfig,
+    SandboxUnavailableError,
     SandboxedShellTool,
 )
 from mini_openharness.session import (
@@ -101,8 +102,10 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument(
         "--auto-review",
-        action="store_true",
-        help="AUTO_REVIEW mode: ASK decisions go to an independent reviewer agent",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="AUTO_REVIEW mode (default): ASK decisions go to an independent reviewer agent; "
+        "use --no-auto-review to ask the user",
     )
     parser.add_argument("--permission-config", help="JSON allow/deny/ask rules")
     parser.add_argument("--hooks-config", help="JSON lifecycle command hooks")
@@ -112,13 +115,29 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-concurrent-tools", type=_positive_int, default=8)
     parser.add_argument(
         "--sandbox-shell",
-        action="store_true",
-        help="Enable Docker-only sandbox_shell; never falls back to the host",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Docker-only sandbox_shell (default); use --no-sandbox-shell to disable",
     )
     parser.add_argument("--sandbox-image", default="alpine:3.20")
     parser.add_argument("--sandbox-memory", default="512m")
     parser.add_argument("--sandbox-cpus", type=float, default=1.0)
     parser.add_argument("--sandbox-pids", type=int, default=128)
+    parser.add_argument(
+        "--sandbox-network",
+        action="store_true",
+        help="Allow network access inside the sandbox (default: none)",
+    )
+    parser.add_argument(
+        "--sandbox-writable",
+        action="store_true",
+        help="Writable container rootfs so apk/pip can install packages (default: read-only)",
+    )
+    parser.add_argument(
+        "--sandbox-root",
+        action="store_true",
+        help="Run the sandbox as root so package managers can install (default: host uid)",
+    )
     parser.add_argument("--context-threshold", type=int, default=12_000)
     parser.add_argument("--keep-recent", type=int, default=6)
     parser.add_argument("--max-inline-output", type=int, default=8_000)
@@ -494,10 +513,17 @@ async def _build_runtime(
                 memory=args.sandbox_memory,
                 cpus=args.sandbox_cpus,
                 pids_limit=args.sandbox_pids,
+                network=args.sandbox_network,
+                writable=args.sandbox_writable,
+                root=args.sandbox_root,
             )
         )
-        await sandbox.ensure_available()
-        tools.register(SandboxedShellTool(sandbox))
+        try:
+            await sandbox.ensure_available()
+        except SandboxUnavailableError as exc:
+            print(f"warning: sandbox_shell disabled: {exc}", file=sys.stderr)
+        else:
+            tools.register(SandboxedShellTool(sandbox))
     if skills.list():
         tools.register(LoadSkillTool(skills))
     tools.register(
@@ -629,7 +655,11 @@ def _build_reviewer(args: argparse.Namespace, provider):
         except Exception:
             return False
         text = (reply.content or "").strip().lower()
-        return text.startswith("approve")
+        parsed = "approve" if text.startswith("approve") else "reject"
+        target = request.path or request.command or ""
+        detail = f" {target}" if target else ""
+        print(f"⚖ reviewer: {parsed} — {request.tool_name}{detail} ({decision.reason})")
+        return parsed == "approve"
 
     return review
 

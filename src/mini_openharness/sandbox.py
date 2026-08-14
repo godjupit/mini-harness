@@ -24,6 +24,9 @@ class DockerSandboxConfig:
     cpus: float = 1.0
     pids_limit: int = 128
     tmpfs_size: str = "64m"
+    network: bool = False
+    writable: bool = False
+    root: bool = False
 
     def __post_init__(self) -> None:
         if not self.image.strip():
@@ -68,8 +71,6 @@ class DockerSandbox:
             "--init",
             "--name",
             name,
-            "--network",
-            "none",
             "--cpus",
             str(self.config.cpus),
             "--memory",
@@ -80,16 +81,24 @@ class DockerSandbox:
             "ALL",
             "--security-opt",
             "no-new-privileges",
-            "--read-only",
             "--tmpfs",
             f"/tmp:rw,noexec,nosuid,nodev,size={self.config.tmpfs_size}",
-            "--user",
-            f"{_host_id('getuid')}:{_host_id('getgid')}",
             "--mount",
             f"type=bind,src={root},dst=/workspace",
             "--workdir",
             "/workspace",
         ]
+        if not self.config.root:
+            argv.insert(argv.index("--mount"), "--user")
+            argv.insert(
+                argv.index("--mount"),
+                f"{_host_id('getuid')}:{_host_id('getgid')}",
+            )
+        if not self.config.network:
+            argv.insert(argv.index("--cpus"), "--network")
+            argv.insert(argv.index("--cpus"), "none")
+        if not self.config.writable:
+            argv.insert(argv.index("--tmpfs"), "--read-only")
         for secret in _workspace_secret_files(root):
             destination = Path("/workspace") / secret.relative_to(root)
             argv.extend(
@@ -171,7 +180,8 @@ class SandboxedShellTool:
     name = "sandbox_shell"
     description = (
         "Run a non-interactive shell command in a disposable Docker container. "
-        "Only the workspace is mounted writable at /workspace; network is disabled. "
+        "Only the workspace is mounted writable at /workspace; network is disabled "
+        "unless --sandbox-network is set. "
         "For read_file/write_file after this tool, convert /workspace/example.txt "
         "to the workspace-relative path example.txt."
     )

@@ -4,7 +4,7 @@
 
 > 一个紧凑、安全感知的 Coding Agent 运行时，用于构建和学习 Agent。
 
-Agent Loop · 权限引擎 · 自动审批 · 子 Agent · Hooks · MCP · Skills · 上下文压缩 · Trace/Replay · Docker Sandbox
+Agent Loop · 权限引擎 · 自动审批 · 子 Agent · Hooks · MCP · Skills · 上下文压缩 · Trace/Replay · Bwrap Sandbox
 
 Mini Harness 是一个小型但完整的 Coding Agent 运行时，专注于通常被产品界面隐藏起来的控制平面：模型与工具编排、权限决策、安全执行边界、生命周期 Hooks、上下文管理、可观测性、可恢复会话，以及子 Agent 委派。
 
@@ -82,13 +82,13 @@ Mini Harness 把这些关注点实现为明确的运行时组件，而不是隐�
 | 追踪 | 追加式 JSONL trace，默认脱敏，覆盖权限/工具/provider/成本，支持剪枝与无副作用回放 |
 | 会话 | 持久化对话，支持中断检测与 resume |
 | MCP | stdio 与 Streamable HTTP、schema 校验、保守注解信任、OAuth |
-| Sandbox | 可选 Docker-only shell：无 host 兜底、无网络、只读根文件系统、丢弃能力、资源限制 |
+| Sandbox | Bubblewrap 宿主 shell：真实宿主环境、只读文件系统、可写 workspace、全新 `/tmp` |
 
 ## 环境要求
 
 - Python 3.10+
 - 真实模型运行需要 OpenAI 兼容 API key
-- 仅在启用 `sandbox_shell` 时需要 Docker
+- 启用 `sandbox_shell` 时 Linux 需要 `bwrap`（bubblewrap）
 
 ## 安装
 
@@ -257,7 +257,7 @@ agents.register(
 | --- | --- |
 | `agent` | 子 Agent 委派 |
 | `load_skill` | 配置了 skill catalog 时 |
-| `sandbox_shell` | 显式启用 Docker sandbox 时 |
+| `sandbox_shell` | 启用 bwrap 沙箱 shell 时 |
 | `mcp__...` | 从配置的 MCP server 发现 |
 
 每个工具声明一个 `ToolDescriptor`，供权限评估、资源调度、追踪和归因复用：
@@ -380,20 +380,15 @@ skills/
 mini-oh --skills-dir ./skills --workspace . "Use the available project skills."
 ```
 
-## Docker Sandbox Shell
+## 沙箱 Shell（bubblewrap）
 
-Shell 执行默认关闭，需显式启用：
+`sandbox_shell` 在 bubblewrap 沙箱中直接运行宿主 bash。宿主环境（python、pytest、git、node、`.venv`、PATH）开箱可用；只有 workspace 可写，其余文件系统只读，`/tmp` 是全新的临时目录。工作目录跨命令保持。
 
 ```bash
-docker pull python:3.12-slim
-mini-oh \
-  --sandbox-shell \
-  --sandbox-image python:3.12-slim \
-  --workspace . \
-  "Run the project checks."
+mini-oh --workspace . "Run the project checks."
 ```
 
-没有 host Shell 兜底：Docker 或镜像不可用时直接启动失败，而不是在宿主上执行。每次调用使用一次性容器：`--network none`、只读根文件系统、可写 workspace 挂载、丢弃全部 capability、`no-new-privileges`、CPU/内存/PID/tmpfs 限制、host UID/GID 映射，并屏蔽运行时凭据位置。
+没有无沙箱兜底：如果未安装 `bwrap`，shell 工具直接不可用，而不会在无沙箱状态下运行于宿主。
 
 这是本地开发的安全边界，不是面向恶意多租户的沙箱。
 
@@ -434,7 +429,7 @@ mini-harness/
 │   ├── skills.py              # 渐进式 skill 加载
 │   ├── mcp.py                 # MCP 集成
 │   ├── mcp_auth.py            # HTTP MCP OAuth 支持
-│   ├── sandbox.py             # Docker-only shell 执行
+│   ├── sandbox.py             # bwrap 沙箱宿主 shell
 │   ├── models.py              # 消息与工具调用数据结构
 │   └── cli.py                 # `mini-oh` 命令行入口
 ├── tests/                     # 运行时与协议测试
@@ -462,13 +457,13 @@ ruff check .
 - 模型收到可恢复的失败：工具错误尽可能作为 observation 返回
 - 工具协议状态保持有效：调用与结果在执行、压缩、中断、恢复过程中始终配对
 - 可观测性不得重放副作用
-- 安全声明与实现一致：Docker 隔离、权限策略、OAuth 边界均注明局限
+- 安全声明与实现一致：bwrap 隔离、权限策略、OAuth 边界均注明局限
 - 复杂度要配得上价值：偏好小而可检查的机制，而非隐藏的框架行为
 
 ## 局限
 
 - 资源锁是进程内的
-- Docker 属于可信计算基
+- 宿主文件系统只读绑定属于可信计算基
 - 本地 OAuth token 文件有权限保护，但未做 OS 钥匙串加密
 - Hooks 是可信扩展，不是沙箱插件
 - 默认子 Agent 是轻量委派循环，不是自主分布式 worker

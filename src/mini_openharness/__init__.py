@@ -14,7 +14,7 @@ from mini_openharness.provider import (
     OpenAICompatibleProvider,
     OpenAIResponsesProvider,
 )
-from mini_openharness.sandbox import DockerSandbox, SandboxedShellTool
+from mini_openharness.sandbox import BwrapShell, SandboxedShellTool
 from mini_openharness.skills import SkillCatalog
 from mini_openharness.tools import (
     EditFileTool,
@@ -47,7 +47,7 @@ __all__ = [
     "ModelProvider",
     "OpenAICompatibleProvider",
     "OpenAIResponsesProvider",
-    "DockerSandbox",
+    "BwrapShell",
     "SandboxedShellTool",
     "SkillCatalog",
     "EditFileTool",

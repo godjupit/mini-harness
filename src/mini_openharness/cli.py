@@ -35,8 +35,7 @@ from mini_openharness.provider import (
     OpenAIResponsesProvider,
 )
 from mini_openharness.sandbox import (
-    DockerSandbox,
-    DockerSandboxConfig,
+    BwrapShell,
     SandboxUnavailableError,
     SandboxedShellTool,
 )
@@ -117,34 +116,7 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
         "--sandbox-shell",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable Docker-only sandbox_shell (default); use --no-sandbox-shell to disable",
-    )
-    parser.add_argument("--sandbox-image", default="python:3.12-slim")
-    parser.add_argument("--sandbox-memory", default="512m")
-    parser.add_argument("--sandbox-cpus", type=float, default=1.0)
-    parser.add_argument("--sandbox-pids", type=int, default=128)
-    parser.add_argument(
-        "--sandbox-network",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Allow network access inside the sandbox (default); use --no-sandbox-network to disable",
-    )
-    parser.add_argument(
-        "--sandbox-writable",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Writable container rootfs so apk/pip can install (default); use --no-sandbox-writable for read-only",
-    )
-    parser.add_argument(
-        "--sandbox-root",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Run the sandbox as root so package managers can install (default); use --no-sandbox-root for host uid",
-    )
-    parser.add_argument(
-        "--sandbox-persistent",
-        action="store_true",
-        help="Session-scoped persistent container: install once, exec per command (default: disposable)",
+        help="Enable bwrap-sandboxed host shell (default); use --no-sandbox-shell to disable",
     )
     parser.add_argument("--context-threshold", type=int, default=800_000)
     parser.add_argument("--keep-recent", type=int, default=6)
@@ -245,9 +217,8 @@ async def _interactive(args: argparse.Namespace) -> int:
     tracer = None
     mcp_manager = None
     provider = None
-    sandbox = None
     try:
-        loop, tracer, mcp_manager, provider, sandbox = await _build_runtime(
+        loop, tracer, mcp_manager, provider = await _build_runtime(
             args,
             session_log=session_log,
             trace_prompt="(interactive session)",
@@ -290,7 +261,7 @@ async def _interactive(args: argparse.Namespace) -> int:
                 loop.cancel()
                 print("cancelled", file=sys.stderr)
     finally:
-        await _close_runtime(mcp_manager, provider, sandbox)
+        await _close_runtime(mcp_manager, provider)
         _ACTIVE_SESSION = None
     if tracer:
         print(f"trace: {tracer.path}")
@@ -416,10 +387,9 @@ async def _drive_session(
     tracer = None
     mcp_manager = None
     provider = None
-    sandbox = None
     exit_code = 1
     try:
-        loop, tracer, mcp_manager, provider, sandbox = await _build_runtime(
+        loop, tracer, mcp_manager, provider = await _build_runtime(
             args,
             session_log=session_log,
             messages=messages,
@@ -445,7 +415,7 @@ async def _drive_session(
         _print_resume_hint()
         raise
     finally:
-        await _close_runtime(mcp_manager, provider, sandbox)
+        await _close_runtime(mcp_manager, provider)
         _ACTIVE_SESSION = None
     if tracer:
         print(f"trace: {tracer.path}")
@@ -523,23 +493,11 @@ async def _build_runtime(
             },
         )
 
-    sandbox = None
     tools = default_tools()
     if args.sandbox_shell:
-        sandbox = DockerSandbox(
-            DockerSandboxConfig(
-                image=args.sandbox_image,
-                memory=args.sandbox_memory,
-                cpus=args.sandbox_cpus,
-                pids_limit=args.sandbox_pids,
-                network=args.sandbox_network,
-                writable=args.sandbox_writable,
-                root=args.sandbox_root,
-                persistent=args.sandbox_persistent,
-            )
-        )
+        sandbox = BwrapShell(workspace)
         try:
-            await sandbox.ensure_available()
+            sandbox.ensure_available()
         except SandboxUnavailableError as exc:
             print(f"warning: sandbox_shell disabled: {exc}", file=sys.stderr)
         else:
@@ -587,21 +545,18 @@ async def _build_runtime(
         messages=messages,
         session=session_log,
     )
-    return loop, tracer, mcp_manager, provider, sandbox
+    return loop, tracer, mcp_manager, provider
 
 
 async def _close_runtime(
     mcp_manager: McpManager | None,
     provider: Any,
-    sandbox: DockerSandbox | None = None,
 ) -> None:
     if mcp_manager:
         await mcp_manager.close()
     close = getattr(provider, "close", None)
     if close is not None:
         await close()
-    if sandbox is not None:
-        await sandbox.close()
 
 
 def _sessions_command(args: argparse.Namespace) -> int:

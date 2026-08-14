@@ -1,171 +1,125 @@
 from __future__ import annotations
 
 import asyncio
-import shlex
+import os
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
-from mini_openharness.permissions import HumanApprovalHandler
 from mini_openharness.sandbox import (
-    DockerSandbox,
-    DockerSandboxConfig,
-    SandboxedShellTool,
+    BwrapShell,
     SandboxUnavailableError,
+    SandboxedShellTool,
 )
-from mini_openharness.tools import ToolContext, ToolRegistry
 
 
-async def approve_all(request, decision):
-    del request, decision
-    return True
+def make_shell(workspace: Path) -> BwrapShell:
+    venv_bin = Path(sys.executable).parent
+    env = {
+        **os.environ,
+        "PATH": f"{venv_bin}:{os.environ.get('PATH', '')}",
+    }
+    return BwrapShell(workspace, env=env)
 
 
-def test_docker_sandbox_argv_enforces_core_isolation(tmp_path):
-    sandbox = DockerSandbox(DockerSandboxConfig(image="alpine:3.20"))
-    sandbox.docker = "/usr/bin/docker"
-
-    argv = sandbox.build_argv(workspace=tmp_path, command="echo ok", name="test-box")
-
-    assert argv[argv.index("--network") + 1] == "none"
-    assert "--read-only" in argv
-    assert argv[argv.index("--cap-drop") + 1] == "ALL"
-    assert argv[argv.index("--security-opt") + 1] == "no-new-privileges"
-    assert argv[argv.index("--pids-limit") + 1] == "128"
-    mount = argv[argv.index("--mount") + 1]
-    assert mount == f"type=bind,src={tmp_path.resolve()},dst=/workspace"
-    assert argv[-3:] == ["/bin/sh", "-lc", "echo ok"]
+async def run(shell: BwrapShell, command: str) -> tuple[str, bool]:
+    result = await shell.run(command=command, timeout=60)
+    return result.output, result.is_error
 
 
-def test_docker_sandbox_argv_allows_network_and_writable_rootfs(tmp_path):
-    sandbox = DockerSandbox(DockerSandboxConfig(network=True, writable=True))
-    sandbox.docker = "/usr/bin/docker"
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
+def test_host_python_is_available(tmp_path):
+    shell = make_shell(tmp_path)
 
-    argv = sandbox.build_argv(workspace=tmp_path, command="echo ok", name="test-box")
+    output, is_error = asyncio.run(run(shell, "python --version"))
 
-    assert "--network" not in argv
-    assert "--read-only" not in argv
-    assert argv[argv.index("--cap-drop") + 1] == "ALL"
+    assert not is_error
+    assert output.startswith("Python")
 
 
-def test_docker_sandbox_argv_root_drops_host_uid_mapping(tmp_path):
-    sandbox = DockerSandbox(DockerSandboxConfig(root=True))
-    sandbox.docker = "/usr/bin/docker"
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
+def test_host_pytest_is_available(tmp_path):
+    shell = make_shell(tmp_path)
 
-    argv = sandbox.build_argv(workspace=tmp_path, command="echo ok", name="test-box")
+    output, is_error = asyncio.run(run(shell, "pytest --version"))
 
-    assert "--user" not in argv
-    sandbox2 = DockerSandbox(DockerSandboxConfig())
-    sandbox2.docker = "/usr/bin/docker"
-    default_argv = sandbox2.build_argv(
-        workspace=tmp_path, command="echo ok", name="test-box"
+    assert not is_error
+    assert "pytest" in output
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
+def test_workspace_venv_python_runs(tmp_path):
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(tmp_path / ".venv")],
+        check=True,
     )
-    assert "--user" in default_argv
+    shell = make_shell(tmp_path)
+
+    output, is_error = asyncio.run(run(shell, ".venv/bin/python --version"))
+
+    assert not is_error
+    assert output.startswith("Python")
 
 
-def test_sandbox_tool_explains_container_to_workspace_path_mapping():
-    assert "/workspace/example.txt" in SandboxedShellTool.description
-    assert "workspace-relative path example.txt" in SandboxedShellTool.description
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
+def test_git_status_runs(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    shell = make_shell(tmp_path)
+
+    output, is_error = asyncio.run(run(shell, "git status"))
+
+    assert not is_error
+    assert "On branch" in output or "nothing to commit" in output
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
+def test_cwd_persists_across_commands(tmp_path):
+    shell = make_shell(tmp_path)
+
+    first, first_error = asyncio.run(run(shell, "mkdir -p subdir && cd subdir"))
+    assert not first_error
+    output, is_error = asyncio.run(run(shell, "pwd"))
+
+    assert not is_error
+    assert output.strip() == str((tmp_path / "subdir").resolve())
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
+def test_workspace_is_writable(tmp_path):
+    shell = make_shell(tmp_path)
+
+    output, is_error = asyncio.run(run(shell, "echo hi > f.txt"))
+
+    assert not is_error
+    assert (tmp_path / "f.txt").read_text(encoding="utf-8").strip() == "hi"
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
+def test_root_filesystem_is_read_only(tmp_path):
+    shell = make_shell(tmp_path)
+
+    output, is_error = asyncio.run(run(shell, "touch /etc/mini-oh-perm-test"))
+
+    assert is_error
+    assert "Read-only file system" in output or "Permission denied" in output
+
+
+def test_bwrap_missing_raises_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "mini_openharness.sandbox.shutil.which",
+        lambda _name: None,
+    )
+    shell = BwrapShell(tmp_path)
+
+    with pytest.raises(SandboxUnavailableError, match="bwrap"):
+        asyncio.run(run(shell, "ls"))
+
+
+def test_sandbox_tool_metadata():
     assert SandboxedShellTool.descriptor.source == "sandbox"
     assert SandboxedShellTool.descriptor.effect == "write"
     assert SandboxedShellTool.descriptor.destructive is True
-
-
-@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker CLI unavailable")
-def test_real_docker_shell_writes_only_workspace_and_has_no_network(tmp_path):
-    outside = tmp_path.parent / "mini-oh-host-secret"
-    outside.write_text("secret", encoding="utf-8")
-    (tmp_path / ".env").write_text("OPENAI_API_KEY=container-secret", encoding="utf-8")
-    oauth = tmp_path / ".mini-oh" / "oauth"
-    oauth.mkdir(parents=True)
-    (oauth / "remote.json").write_text("oauth-secret", encoding="utf-8")
-    sandbox = DockerSandbox(DockerSandboxConfig(image="alpine:3.20"))
-    tools = ToolRegistry()
-    tools.register(SandboxedShellTool(sandbox))
-    before = _mini_container_names()
-    command = (
-        "printf workspace-ok > created.txt; "
-        'test "$(ls /sys/class/net)" = "lo"; '
-        "test ! -s .env; "
-        "test ! -r .mini-oh/oauth/remote.json; "
-        f"test ! -e {shlex.quote(str(outside))}; "
-        "if touch /etc/blocked 2>/dev/null; then exit 7; fi; "
-        "printf isolated"
-    )
-
-    async def exercise():
-        try:
-            await sandbox.ensure_available()
-        except SandboxUnavailableError as exc:
-            pytest.skip(str(exc))
-        return await tools.execute(
-            "sandbox_shell",
-            {"command": command, "timeout_seconds": 15},
-            ToolContext(
-                tmp_path,
-                tool_timeout_seconds=20,
-                approval_handler=HumanApprovalHandler(approve_all),
-            ),
-        )
-
-    result = asyncio.run(exercise())
-
-    assert not result.is_error, result.output
-    assert result.output == "isolated"
-    assert result.metadata["sandbox"] == "docker"
-    assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "workspace-ok"
-    assert outside.read_text(encoding="utf-8") == "secret"
-    assert _mini_container_names() == before
-
-
-@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker CLI unavailable")
-def test_persistent_sandbox_keeps_state_across_commands(tmp_path):
-    sandbox = DockerSandbox(DockerSandboxConfig(persistent=True))
-    try:
-        first = asyncio.run(
-            sandbox.run(
-                workspace=tmp_path,
-                command="echo install > state.txt",
-                timeout=30,
-            )
-        )
-        assert not first.is_error, first.output
-
-        second = asyncio.run(
-            sandbox.run(workspace=tmp_path, command="cat state.txt", timeout=30)
-        )
-        assert not second.is_error, second.output
-        assert second.output.strip() == "install"
-        assert second.metadata["sandbox"] == "docker-persistent"
-    finally:
-        asyncio.run(sandbox.close())
-
-
-@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker CLI unavailable")
-def test_docker_shell_timeout_removes_container(tmp_path):
-    sandbox = DockerSandbox(DockerSandboxConfig(image="alpine:3.20"))
-    before = _mini_container_names()
-
-    async def exercise():
-        try:
-            await sandbox.ensure_available()
-        except SandboxUnavailableError as exc:
-            pytest.skip(str(exc))
-        return await sandbox.run(workspace=tmp_path, command="sleep 5", timeout=0.2)
-
-    result = asyncio.run(exercise())
-
-    assert result.is_error
-    assert result.metadata["timed_out"] is True
-    assert _mini_container_names() == before
-
-
-def _mini_container_names() -> set[str]:
-    running = subprocess.run(
-        ["docker", "ps", "-a", "--filter", "name=mini-oh-", "--format", "{{.Names}}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return {line for line in running.stdout.splitlines() if line}
+    assert SandboxedShellTool.parameters["required"] == ["command"]

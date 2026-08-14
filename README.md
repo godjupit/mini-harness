@@ -4,7 +4,7 @@
 
 > A compact, safety-aware runtime for building and studying coding agents.
 
-Agent loop · permission engine · auto-review · subagents · hooks · MCP · skills · context compaction · trace/replay · Docker sandbox
+Agent loop · permission engine · auto-review · subagents · hooks · MCP · skills · context compaction · trace/replay · bwrap sandbox
 
 Mini Harness is a small but complete coding-agent runtime. It focuses on the control plane that is usually hidden behind a product UI: model/tool orchestration, permission decisions, safe execution boundaries, lifecycle hooks, context management, observability, resumable sessions, and delegated subagents.
 
@@ -82,13 +82,13 @@ The built-in `agent` tool can delegate read-only investigation or planning to sp
 | Tracing | Append-only JSONL traces with secret redaction, timing, permission/tool/provider events, cost, pruning, side-effect-free replay |
 | Sessions | Persistent conversations with interruption detection and resume |
 | MCP | stdio and Streamable HTTP transports, schema validation, conservative annotation trust, OAuth |
-| Sandbox | Optional Docker-only shell: no host fallback, no network, read-only rootfs, dropped capabilities, resource limits |
+| Sandbox | Bubblewrap host shell: real host environment, read-only filesystem, writable workspace, fresh `/tmp` |
 
 ## Requirements
 
 - Python 3.10+
 - An OpenAI-compatible API key for real model runs
-- Docker only if `sandbox_shell` is enabled
+- `bwrap` (bubblewrap) on Linux if `sandbox_shell` is enabled
 
 ## Installation
 
@@ -257,7 +257,7 @@ Runtime-registered tools:
 | --- | --- |
 | `agent` | Subagent delegation |
 | `load_skill` | When a skill catalog is configured |
-| `sandbox_shell` | When Docker sandboxing is explicitly enabled |
+| `sandbox_shell` | When the bwrap sandbox shell is enabled |
 | `mcp__...` | Tools discovered from configured MCP servers |
 
 Each tool declares a `ToolDescriptor` used by permission evaluation, resource scheduling, tracing, and attribution:
@@ -380,20 +380,19 @@ Only lightweight metadata is exposed initially; the model loads the full skill b
 mini-oh --skills-dir ./skills --workspace . "Use the available project skills."
 ```
 
-## Docker sandbox shell
+## Sandbox shell (bubblewrap)
 
-Shell execution is disabled by default. Enable it explicitly:
+`sandbox_shell` runs host bash inside a bubblewrap sandbox. The host environment
+(python, pytest, git, node, `.venv`, PATH) is available directly; only the
+workspace is writable, the rest of the filesystem is read-only, and `/tmp` is a
+fresh temporary directory. The working directory persists across calls.
 
 ```bash
-docker pull python:3.12-slim
-mini-oh \
-  --sandbox-shell \
-  --sandbox-image python:3.12-slim \
-  --workspace . \
-  "Run the project checks."
+mini-oh --workspace . "Run the project checks."
 ```
 
-There is no host-shell fallback: if Docker or the image is unavailable, startup fails instead of running on the host. Each invocation uses a disposable container with `--network none`, a read-only rootfs, a writable workspace bind mount, all capabilities dropped, `no-new-privileges`, CPU/memory/PID/tmpfs limits, host UID/GID mapping, and masking of runtime credential locations.
+There is no unrestricted fallback: if `bwrap` is not installed, the shell tool
+is unavailable instead of running on the host without a sandbox.
 
 This is a local development safety boundary, not a malicious multi-tenant sandbox.
 
@@ -434,7 +433,7 @@ mini-harness/
 │   ├── skills.py              # progressive skill loading
 │   ├── mcp.py                 # MCP integration
 │   ├── mcp_auth.py            # HTTP MCP OAuth support
-│   ├── sandbox.py             # Docker-only shell execution
+│   ├── sandbox.py             # bwrap-sandboxed host shell
 │   ├── models.py              # messages and tool-call data structures
 │   └── cli.py                 # `mini-oh` command-line interface
 ├── tests/                     # runtime and protocol tests
@@ -462,13 +461,13 @@ Tests cover the agent loop, tools, permissions, auto-review, hooks, providers, c
 - The model receives recoverable failures: tool errors are observations whenever possible
 - Tool protocol state stays valid: calls and results remain paired through execution, compaction, interruption, and resume
 - Observability must not replay side effects
-- Security claims match the implementation: Docker isolation, permission policy, and OAuth boundaries are documented with their limits
+- Security claims match the implementation: bwrap isolation, permission policy, and OAuth boundaries are documented with their limits
 - Complexity earns its place: small, inspectable mechanisms over hidden framework behavior
 
 ## Limitations
 
 - Resource locking is process-local
-- Docker remains part of the trusted computing base
+- The host filesystem read-only bind remains part of the trusted computing base
 - Local OAuth token files are permission-protected but not OS-keychain encrypted
 - Hooks are trusted extensions, not sandboxed plugins
 - Default subagents are lightweight delegated loops, not autonomous distributed workers

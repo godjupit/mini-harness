@@ -47,6 +47,14 @@ class PermissionEngine:
     def _check_safety(self, request: PermissionRequest) -> PermissionDecision | None:
         result = check_safety(request, self.context)
         if result.safe:
+            if (
+                result.behavior == PermissionBehavior.ALLOW
+                and find_matching_rule(request, self.context.rules.deny) is None
+            ):
+                return PermissionDecision(
+                    PermissionBehavior.ALLOW,
+                    result.reason or "routine command is safe",
+                )
             return None
         return PermissionDecision(result.behavior, result.reason)
 

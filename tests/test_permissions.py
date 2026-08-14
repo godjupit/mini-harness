@@ -197,6 +197,55 @@ def test_complex_shell_is_ask(tmp_path):
     assert decision.behavior == PermissionBehavior.ASK
 
 
+def test_shell_routine_commands_are_allowed(tmp_path):
+    engine = make_engine(tmp_path)
+    allowed = [
+        "ls",
+        "pwd",
+        "cd src && ls",
+        "cd src && git status",
+        "cd tests && pytest",
+        "python -m pytest tests/test_x.py",
+        "git diff",
+        "grep abc main.py",
+    ]
+    for command in allowed:
+        decision = engine.authorize(
+            request("sandbox_shell", command=command, effect="write")
+        )
+        assert decision.behavior == PermissionBehavior.ALLOW, command
+
+
+def test_shell_unsafe_or_uncertain_commands_ask(tmp_path):
+    engine = make_engine(tmp_path)
+    cases = [
+        "cd src && rm -rf *",
+        "git reset --hard",
+        "git push",
+        "pip install requests",
+        "rm file.txt",
+        "cd .. && ls",
+        "echo hello > file.txt",
+        "cat file | grep hello",
+        "cmd1 || cmd2",
+    ]
+    for command in cases:
+        decision = engine.authorize(
+            request("sandbox_shell", command=command, effect="write")
+        )
+        assert decision.behavior == PermissionBehavior.ASK, command
+
+
+def test_shell_multiline_command_is_denied(tmp_path):
+    engine = make_engine(tmp_path)
+
+    decision = engine.authorize(
+        request("sandbox_shell", command="ls\nrm -rf /", effect="write")
+    )
+
+    assert decision.behavior == PermissionBehavior.DENY
+
+
 def test_human_approval_handler():
     req = request("write_file", effect="write")
 

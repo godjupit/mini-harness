@@ -360,7 +360,14 @@ async def _build_runtime(
         tools.register(SandboxedShellTool(sandbox))
     if skills.list():
         tools.register(LoadSkillTool(skills))
-    tools.register(build_agent_tool(provider=provider, tools=tools, workspace=workspace))
+    tools.register(
+        build_agent_tool(
+            provider=provider,
+            tools=tools,
+            workspace=workspace,
+            parent_session=session_log,
+        )
+    )
     mcp_manager = McpManager.from_file(args.mcp_config) if args.mcp_config else None
     permission_engine = PermissionEngine(_permission_context(args))
     hooks = load_hook_registry(args.hooks_config) if args.hooks_config else None

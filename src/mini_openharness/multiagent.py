@@ -4,9 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from mini_openharness.engine import AgentLoop
 from mini_openharness.provider import ModelProvider
+from mini_openharness.session import SessionLog
 from mini_openharness.tools import (
     ToolContext,
     ToolDescriptor,
@@ -27,10 +29,17 @@ class AgentDefinition:
 
 
 class AgentManager:
-    def __init__(self, provider, tools, workspace):
+    def __init__(
+        self,
+        provider,
+        tools,
+        workspace,
+        parent_session: SessionLog | None = None,
+    ):
         self.provider = provider
         self.tools = tools
         self.workspace = workspace
+        self.parent_session = parent_session
         
     async def run_agent(
         self,
@@ -38,22 +47,65 @@ class AgentManager:
         task_prompt: str
     ) -> str:
         agent_tools = self.tools.subset(definition.tools)
+
+        subagent_session = None
+        agent_id = f"agent-{uuid4().hex}"
+        if self.parent_session is not None:
+            root = (
+                self.parent_session.root
+                / self.parent_session.session_id
+                / "subagents"
+            )
+            subagent_session = SessionLog(
+                root,
+                session_id=agent_id,
+                metadata={
+                    "kind": "subagent",
+                    "agent_id": agent_id,
+                    "agent_type": definition.type,
+                    "parent_session_id": self.parent_session.session_id,
+                    "task": task_prompt,
+                },
+            )
+            self.parent_session.append_event(
+                "subagent_start",
+                {
+                    "agent_id": agent_id,
+                    "agent_type": definition.type,
+                    "task": task_prompt,
+                },
+            )
         
         loop = AgentLoop(
             provider=self.provider,
             workspace=self.workspace,
             tools=agent_tools,
             system_prompt=definition.system_prompt,
-            max_steps=definition.max_turns
+            max_steps=definition.max_turns,
+            session=subagent_session,
         )
         
         final_response = ""
-        
-        async for event in loop.run(task_prompt):
-            if event.kind == "assistant":
-                final_response = event.message
-            elif event.kind == "error":
-                raise RuntimeError(event.message)
+        status = "completed"
+        try:
+            async for event in loop.run(task_prompt):
+                if event.kind == "assistant":
+                    final_response = event.message
+                elif event.kind == "error":
+                    raise RuntimeError(event.message)
+        except Exception:
+            status = "failed"
+            raise
+        finally:
+            if self.parent_session is not None:
+                self.parent_session.append_event(
+                    "subagent_end",
+                    {
+                        "agent_id": agent_id,
+                        "agent_type": definition.type,
+                        "status": status,
+                    },
+                )
         
         return final_response
     
@@ -147,6 +199,7 @@ def build_agent_tool(
     tools: ToolRegistry,
     workspace: str | Path,
     definitions: AgentRegistry | dict[str, AgentDefinition] | None = None,
+    parent_session: SessionLog | None = None,
 ) -> AgentTool:
     """Compose an AgentTool wired to the runtime provider/registry/workspace.
 
@@ -154,7 +207,12 @@ def build_agent_tool(
     plan_agent) is used. The tool keeps a reference to the given registry, so
     later ``registry.register(...)`` calls are visible without rebuilding.
     """
-    manager = AgentManager(provider=provider, tools=tools, workspace=workspace)
+    manager = AgentManager(
+        provider=provider,
+        tools=tools,
+        workspace=workspace,
+        parent_session=parent_session,
+    )
     if definitions is None:
         definitions = default_agents()
     return AgentTool(manager=manager, definitions=definitions)

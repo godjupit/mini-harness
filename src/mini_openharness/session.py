@@ -128,6 +128,15 @@ class SessionLog:
             ).encode("utf-8")
         )
 
+    def append_event(self, event_type: str, data: dict[str, Any]) -> None:
+        """Append a non-message audit event (e.g. subagent_start / subagent_end)."""
+        self._append_line(
+            json.dumps(
+                {"type": event_type, **data},
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+
     def _append_line(self, line: bytes) -> None:
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(self.path, flags, 0o600)

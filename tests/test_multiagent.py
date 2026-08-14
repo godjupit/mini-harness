@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -27,6 +28,7 @@ from mini_openharness.permissions import (
     PermissionRules,
 )
 from mini_openharness.provider import DemoProvider, ProviderError
+from mini_openharness.session import SessionLog, SessionStore
 from mini_openharness.tools import ToolContext, ToolRegistry, default_tools
 
 
@@ -349,6 +351,76 @@ def test_registry_defaults_and_unknown_lookup():
     assert registry.get("explore_agent") is explore_agent
     assert registry.get("plan_agent") is plan_agent
     assert registry.get("nope") is None
+
+
+def test_subagent_sidechain_session_is_written(tmp_path):
+    (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
+    parent = SessionLog(tmp_path, metadata={"first_prompt": "main turn"})
+    provider = ScriptedProvider(
+        [
+            ModelReply(tool_calls=(ToolCall("1", "read_file", {"path": "a.txt"}),)),
+            ModelReply(content="explored"),
+        ]
+    )
+    manager = AgentManager(
+        provider=provider,
+        tools=default_tools(),
+        workspace=tmp_path,
+        parent_session=parent,
+    )
+
+    final = run_agent(manager, explore_agent, "explore")
+
+    assert final == "explored"
+    side_dir = tmp_path / parent.session_id / "subagents"
+    side_files = list(side_dir.glob("agent-*.jsonl"))
+    assert len(side_files) == 1
+
+    record = SessionStore(side_dir).read(side_files[0].stem)
+    assert record.meta["kind"] == "subagent"
+    assert record.meta["parent_session_id"] == parent.session_id
+    assert record.meta["agent_type"] == "explore_agent"
+    assert [message.role for message in record.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+
+    parent_lines = [
+        json.loads(line)
+        for line in parent.path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    event_types = [line["type"] for line in parent_lines]
+    assert "subagent_start" in event_types
+    assert "subagent_end" in event_types
+
+
+def test_subagent_failure_writes_failed_end_event(tmp_path):
+    class FailingProvider:
+        async def complete(self, messages, tools):
+            del messages, tools
+            raise ProviderError("provider exploded")
+
+    parent = SessionLog(tmp_path)
+    manager = AgentManager(
+        provider=FailingProvider(),
+        tools=default_tools(),
+        workspace=tmp_path,
+        parent_session=parent,
+    )
+
+    with pytest.raises(RuntimeError, match="provider exploded"):
+        run_agent(manager, explore_agent, "go")
+
+    parent_lines = [
+        json.loads(line)
+        for line in parent.path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    end_events = [line for line in parent_lines if line["type"] == "subagent_end"]
+    assert end_events and end_events[-1]["status"] == "failed"
 
 
 def test_agent_tool_parameters_expose_registered_agent_types(tmp_path):

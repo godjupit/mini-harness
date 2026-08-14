@@ -1,5 +1,7 @@
 # Mini Harness
 
+**English** | [简体中文](README_ZH.md)
+
 > A compact, safety-aware runtime for building and studying coding agents.
 
 Agent loop · permission engine · auto-review · subagents · hooks · MCP · skills · context compaction · trace/replay · Docker sandbox

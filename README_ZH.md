@@ -1,5 +1,7 @@
 # Mini Harness
 
+[English](README.md) | **简体中文**
+
 > 一个紧凑、安全感知的 Coding Agent 运行时，用于构建和学习 Agent。
 
 Agent Loop · 权限引擎 · 自动审批 · 子 Agent · Hooks · MCP · Skills · 上下文压缩 · Trace/Replay · Docker Sandbox

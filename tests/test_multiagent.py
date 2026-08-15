@@ -78,7 +78,7 @@ def test_run_agent_drives_full_tool_loop_and_returns_final_message(tmp_path):
     # The loop asked the model twice: once to pick a tool, once to answer.
     assert len(provider.requests) == 2
     # The second request's last message is the tool result the model observed.
-    assert provider.requests[1][0][-1].content == "hello world"
+    assert "hello world" in provider.requests[1][0][-1].content
 
 
 def test_run_agent_only_exposes_the_subset_of_tools(tmp_path):

@@ -187,7 +187,7 @@ def test_model_tool_model_loop(tmp_path):
         "assistant",
         "done",
     ]
-    assert provider.requests[1][0][-1].content == "hello"
+    assert "hello" in provider.requests[1][0][-1].content
 
 
 def test_agent_loop_read_then_edit_uses_per_run_snapshot(tmp_path):
@@ -274,10 +274,9 @@ def test_parallel_tool_calls_preserve_result_order(tmp_path):
     collect(loop, "read both")
 
     tool_messages = [message for message in loop.messages if message.role == "tool"]
-    assert [(message.tool_call_id, message.content) for message in tool_messages] == [
-        ("a", "A"),
-        ("b", "B"),
-    ]
+    assert [message.tool_call_id for message in tool_messages] == ["a", "b"]
+    assert tool_messages[0].content.endswith("A")
+    assert tool_messages[1].content.endswith("B")
 
 
 def test_mutating_tool_batch_is_serialized(tmp_path):
@@ -648,16 +647,28 @@ def test_tool_failure_is_exposed_on_agent_and_trace_events(tmp_path):
 
 def test_agent_loop_offloads_large_tool_output_before_next_model_call(tmp_path):
     payload = "x" * 2_000
-    (tmp_path / "large.txt").write_text(payload, encoding="utf-8")
+
+    class LoudTool:
+        name = "loud_tool"
+        description = "emit large output"
+        parameters = {"type": "object", "additionalProperties": False}
+        read_only = True
+
+        async def run(self, arguments, context):
+            del arguments, context
+            return ToolResult(payload)
+
+    tools = ToolRegistry()
+    tools.register(LoudTool())
     provider = ScriptedProvider(
         [
-            ModelReply(tool_calls=(ToolCall("large", "read_file", {"path": "large.txt"}),)),
+            ModelReply(tool_calls=(ToolCall("large", "loud_tool", {}),)),
             ModelReply(content="done"),
         ]
     )
     loop = AgentLoop(
         provider=provider,
-        tools=default_tools(),
+        tools=tools,
         workspace=tmp_path,
         artifact_store=ArtifactStore(tmp_path / "artifacts", max_inline_chars=100),
     )
@@ -668,6 +679,32 @@ def test_agent_loop_offloads_large_tool_output_before_next_model_call(tmp_path):
     artifact = next((tmp_path / "artifacts" / "untraced").glob("*.txt"))
     assert "offloaded" in observation
     assert artifact.read_text(encoding="utf-8") == payload
+
+
+def test_read_file_large_output_is_never_offloaded_to_artifact(tmp_path):
+    (tmp_path / "engine.py").write_text(
+        "".join(f"line {index}\n" for index in range(1, 2001)),
+        encoding="utf-8",
+    )
+    provider = ScriptedProvider(
+        [
+            ModelReply(tool_calls=(ToolCall("read", "read_file", {"path": "engine.py"}),)),
+            ModelReply(content="done"),
+        ]
+    )
+    loop = AgentLoop(
+        provider=provider,
+        tools=default_tools(),
+        workspace=tmp_path,
+        artifact_store=ArtifactStore(tmp_path / "artifacts", max_inline_chars=100),
+    )
+
+    events = collect(loop, "read large source")
+
+    tool_end = next(event for event in events if event.kind == "tool_end")
+    assert "artifact_path" not in tool_end.data
+    assert "Lines: 1-300 of 2000" in tool_end.data["output"]
+    assert list((tmp_path / "artifacts").rglob("*.txt")) == []
 
 
 def test_cancel_stops_in_flight_tool_task(tmp_path):

@@ -857,6 +857,9 @@ class AgentLoop:
             limit = self.artifact_store.max_inline_chars
             inline = output[:limit] + "\n...[artifact file; content stays in the original artifact]"
             return inline, None
+        if call.name == "read_file":
+            # read_file paginates its own output; source reads are never offloaded.
+            return output, None
         run_id = self.tracer.run_id if self.tracer else "untraced"
         return self.artifact_store.offload(run_id=run_id, tool_call_id=call.id, output=output)
 

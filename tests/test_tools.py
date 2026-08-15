@@ -17,6 +17,8 @@ from mini_openharness.permissions import (
     PermissionRules,
 )
 from mini_openharness.tools import (
+    DEFAULT_READ_LINES,
+    FULL_READ_MAX_LINES,
     ResourceAccess,
     ResourceLockManager,
     FileSnapshotStore,
@@ -365,6 +367,350 @@ def test_read_cannot_escape_workspace(tmp_path):
     assert "escapes workspace" in result.output
 
 
+def _write_lines(path, total):
+    path.write_text(
+        "".join(f"line {index}\n" for index in range(1, total + 1)),
+        encoding="utf-8",
+    )
+
+
+def test_read_file_small_file_full_read(tmp_path):
+    path = tmp_path / "small.txt"
+    _write_lines(path, 5)
+
+    result = execute(default_tools(), "read_file", {"path": "small.txt"}, ToolContext(tmp_path))
+
+    assert not result.is_error
+    assert "Lines: 1-5 of 5" in result.output
+    assert "More: false" in result.output
+    assert "line 1\n" in result.output
+    assert "line 5\n" in result.output
+
+
+def test_read_file_large_file_default_first_page(tmp_path):
+    path = tmp_path / "big.txt"
+    _write_lines(path, 1000)
+
+    result = execute(default_tools(), "read_file", {"path": "big.txt"}, ToolContext(tmp_path))
+
+    assert not result.is_error
+    assert f"Lines: 1-{DEFAULT_READ_LINES} of 1000" in result.output
+    assert "More: true" in result.output
+    assert f"Next offset: {DEFAULT_READ_LINES}" in result.output
+    assert "line 1\n" in result.output
+    assert f"line {DEFAULT_READ_LINES + 1}\n" not in result.output
+
+
+def test_read_file_full_read_boundary(tmp_path):
+    path = tmp_path / "boundary.txt"
+    _write_lines(path, FULL_READ_MAX_LINES)
+
+    full = execute(
+        default_tools(),
+        "read_file",
+        {"path": "boundary.txt"},
+        ToolContext(tmp_path),
+    )
+    _write_lines(path, FULL_READ_MAX_LINES + 1)
+    page = execute(
+        default_tools(),
+        "read_file",
+        {"path": "boundary.txt"},
+        ToolContext(tmp_path),
+    )
+
+    assert f"Lines: 1-{FULL_READ_MAX_LINES} of {FULL_READ_MAX_LINES}" in full.output
+    assert "More: false" in full.output
+    assert f"Lines: 1-{DEFAULT_READ_LINES} of {FULL_READ_MAX_LINES + 1}" in page.output
+    assert "More: true" in page.output
+
+
+def test_read_file_offset_limit_range(tmp_path):
+    path = tmp_path / "big.txt"
+    _write_lines(path, 1000)
+
+    result = execute(
+        default_tools(),
+        "read_file",
+        {"path": "big.txt", "offset": 300, "limit": 200},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.is_error
+    assert "Lines: 301-500 of 1000" in result.output
+    assert "More: true" in result.output
+    assert "Next offset: 500" in result.output
+    assert "line 301\n" in result.output
+    assert "line 500\n" in result.output
+    assert "line 501\n" not in result.output
+
+
+def test_read_file_offset_only_uses_default_limit(tmp_path):
+    path = tmp_path / "big.txt"
+    _write_lines(path, 1000)
+
+    result = execute(
+        default_tools(),
+        "read_file",
+        {"path": "big.txt", "offset": 100},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.is_error
+    assert f"Lines: 101-{100 + DEFAULT_READ_LINES} of 1000" in result.output
+    assert f"Next offset: {100 + DEFAULT_READ_LINES}" in result.output
+
+
+def test_read_file_limit_only_starts_at_zero(tmp_path):
+    path = tmp_path / "big.txt"
+    _write_lines(path, 1000)
+
+    result = execute(
+        default_tools(),
+        "read_file",
+        {"path": "big.txt", "limit": 25},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.is_error
+    assert "Lines: 1-25 of 1000" in result.output
+    assert "Next offset: 25" in result.output
+
+
+def test_read_file_limit_one(tmp_path):
+    path = tmp_path / "big.txt"
+    _write_lines(path, 1000)
+
+    result = execute(
+        default_tools(),
+        "read_file",
+        {"path": "big.txt", "offset": 5, "limit": 1},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.is_error
+    assert "Lines: 6-6 of 1000" in result.output
+    assert "line 6\n" in result.output
+    assert "line 7\n" not in result.output
+
+
+def test_read_file_last_page_more_false(tmp_path):
+    path = tmp_path / "big.txt"
+    _write_lines(path, 1000)
+
+    result = execute(
+        default_tools(),
+        "read_file",
+        {"path": "big.txt", "offset": 900, "limit": 200},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.is_error
+    assert "Lines: 901-1000 of 1000" in result.output
+    assert "More: false" in result.output
+    assert "Next offset: 1000" in result.output
+    assert "line 1000\n" in result.output
+
+
+def test_read_file_offset_beyond_eof(tmp_path):
+    path = tmp_path / "big.txt"
+    _write_lines(path, 1000)
+
+    result = execute(
+        default_tools(),
+        "read_file",
+        {"path": "big.txt", "offset": 1500},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.is_error
+    assert "Lines: (none) of 1000" in result.output
+    assert "More: false" in result.output
+    assert "beyond the end of the file" in result.output
+
+
+def test_read_file_empty_file(tmp_path):
+    path = tmp_path / "empty.txt"
+    path.write_text("", encoding="utf-8")
+
+    result = execute(default_tools(), "read_file", {"path": "empty.txt"}, ToolContext(tmp_path))
+
+    assert not result.is_error
+    assert "Lines: (none) of 0" in result.output
+    assert "file is empty" in result.output
+
+
+def test_read_file_invalid_offset_and_limit(tmp_path):
+    path = tmp_path / "app.py"
+    path.write_text("x\n", encoding="utf-8")
+
+    for bad in (
+        {"path": "app.py", "offset": -1},
+        {"path": "app.py", "limit": 0},
+        {"path": "app.py", "limit": -3},
+    ):
+        result = execute(default_tools(), "read_file", bad, ToolContext(tmp_path))
+        assert result.is_error
+        assert result.failure.code == "invalid_input"
+
+
+def test_read_file_same_range_not_repeated(tmp_path):
+    path = tmp_path / "app.py"
+    _write_lines(path, 100)
+    context = ToolContext(tmp_path)
+    tools = default_tools()
+
+    first = execute(
+        tools,
+        "read_file",
+        {"path": "app.py", "offset": 10, "limit": 20},
+        context,
+    )
+    second = execute(
+        tools,
+        "read_file",
+        {"path": "app.py", "offset": 10, "limit": 20},
+        context,
+    )
+
+    assert "Lines: 11-30 of 100" in first.output
+    assert second.output.startswith(
+        "File unchanged. Lines 11-30 were already returned earlier."
+    )
+    assert "line 11" not in second.output
+
+
+def test_read_file_different_range_is_normal_page(tmp_path):
+    path = tmp_path / "app.py"
+    _write_lines(path, 100)
+    context = ToolContext(tmp_path)
+    tools = default_tools()
+
+    first = execute(
+        tools,
+        "read_file",
+        {"path": "app.py", "offset": 0, "limit": 10},
+        context,
+    )
+    second = execute(
+        tools,
+        "read_file",
+        {"path": "app.py", "offset": 20, "limit": 10},
+        context,
+    )
+
+    assert "Lines: 1-10 of 100" in first.output
+    assert "already returned" not in second.output
+    assert "Lines: 21-30 of 100" in second.output
+    assert "line 21\n" in second.output
+
+
+def test_read_file_cache_invalidates_after_file_change(tmp_path):
+    path = tmp_path / "app.py"
+    _write_lines(path, 10)
+    context = ToolContext(tmp_path)
+    tools = default_tools()
+
+    first = execute(
+        tools,
+        "read_file",
+        {"path": "app.py", "offset": 0, "limit": 10},
+        context,
+    )
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("line 1", "CHANGED 1"),
+        encoding="utf-8",
+    )
+    second = execute(
+        tools,
+        "read_file",
+        {"path": "app.py", "offset": 0, "limit": 10},
+        context,
+    )
+
+    assert "already returned" not in first.output
+    assert "already returned" not in second.output
+    assert "Lines: 1-10 of 10" in second.output
+    assert "CHANGED 1" in second.output
+
+
+def test_grep_returns_file_line_matches(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.py").write_text(
+        "def helper():\n    pass\n\nclass PermissionEngine:\n    pass\n",
+        encoding="utf-8",
+    )
+    (src / "b.py").write_text(
+        "from a import PermissionEngine\n\nengine = PermissionEngine()\n",
+        encoding="utf-8",
+    )
+
+    result = execute(
+        default_tools(),
+        "grep",
+        {"pattern": "PermissionEngine", "path": "src"},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.is_error
+    assert "src/a.py:4: class PermissionEngine:" in result.output
+    assert "src/b.py:1: from a import PermissionEngine" in result.output
+    assert "src/b.py:3: engine = PermissionEngine()" in result.output
+
+
+def test_grep_single_file_and_include_filter(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.py").write_text("TODO: fix me\n", encoding="utf-8")
+    (src / "notes.md").write_text("TODO: docs\n", encoding="utf-8")
+
+    single = execute(
+        default_tools(),
+        "grep",
+        {"pattern": "TODO", "path": "src/a.py"},
+        ToolContext(tmp_path),
+    )
+    filtered = execute(
+        default_tools(),
+        "grep",
+        {"pattern": "TODO", "path": "src", "include": "*.md"},
+        ToolContext(tmp_path),
+    )
+
+    assert single.output == "src/a.py:1: TODO: fix me"
+    assert filtered.output == "src/notes.md:1: TODO: docs"
+
+
+def test_grep_skips_hidden_and_binary_files(tmp_path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("PermissionEngine=hidden\n", encoding="utf-8")
+    (tmp_path / "blob.bin").write_bytes(b"\x00\x01PermissionEngine\x00")
+
+    result = execute(
+        default_tools(),
+        "grep",
+        {"pattern": "PermissionEngine", "path": "."},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.is_error
+    assert ".git" not in result.output
+    assert "blob.bin" not in result.output
+
+
+def test_grep_invalid_regex_is_an_error(tmp_path):
+    result = execute(
+        default_tools(),
+        "grep",
+        {"pattern": "([unclosed", "path": "."},
+        ToolContext(tmp_path),
+    )
+
+    assert result.is_error
+    assert "Invalid regex" in result.output
+
+
 def test_runtime_secrets_are_hidden_from_file_tools(tmp_path):
     (tmp_path / ".env").write_text("OPENAI_API_KEY=secret", encoding="utf-8")
     oauth = tmp_path / ".mini-oh" / "oauth"
@@ -386,7 +732,8 @@ def test_runtime_secrets_are_hidden_from_file_tools(tmp_path):
     listing = execute(tools, "list_dir", {}, ToolContext(tmp_path))
 
     assert env_result.is_error and token_result.is_error
-    assert example_result.output == "OPENAI_API_KEY="
+    assert "Lines: 1-1 of 1" in example_result.output
+    assert "OPENAI_API_KEY=" in example_result.output
     assert ".env\n" not in listing.output + "\n"
     assert "remote.json" not in listing.output
 
@@ -492,10 +839,12 @@ def test_edit_rejects_missing_or_ambiguous_match_without_writing(tmp_path):
 
     assert missing.failure.code == "match_not_found"
     assert ambiguous.failure.code == "ambiguous_match"
+    assert "Re-read the relevant section" in missing.output
+    assert "matches exactly once" in ambiguous.output
     assert path.read_text(encoding="utf-8") == "same same"
 
 
-def test_edit_replace_all_preserves_unicode_and_line_endings(tmp_path):
+def test_edit_unique_match_preserves_unicode_and_line_endings(tmp_path):
     path = tmp_path / "values.txt"
     path.write_bytes("值=旧\r\n值=旧\r\n".encode())
     snapshots = FileSnapshotStore()
@@ -508,16 +857,70 @@ def test_edit_replace_all_preserves_unicode_and_line_endings(tmp_path):
         "edit_file",
         {
             "path": "values.txt",
-            "old_text": "旧",
-            "new_text": "新",
-            "replace_all": True,
+            "old_text": "旧\r\n值=旧",
+            "new_text": "新\r\n值=新",
         },
         context,
     )
 
     assert not result.is_error
-    assert result.metadata["replacements"] == 2
+    assert result.metadata["replacements"] == 1
     assert path.read_bytes() == "值=新\r\n值=新\r\n".encode()
+
+
+def test_edit_local_change_keeps_unrelated_content_intact(tmp_path):
+    path = tmp_path / "app.py"
+    path.write_text("a = 1\nkeep me\nb = 2\n", encoding="utf-8")
+    snapshots = FileSnapshotStore()
+    context = ToolContext(
+        tmp_path,
+        approval_handler=approve_all_handler(),
+        file_snapshots=snapshots,
+    )
+    tools = default_tools()
+    execute(tools, "read_file", {"path": "app.py"}, context)
+
+    result = execute(
+        tools,
+        "edit_file",
+        {"path": "app.py", "old_text": "a = 1", "new_text": "a = 10"},
+        context,
+    )
+
+    assert not result.is_error
+    assert path.read_text(encoding="utf-8") == "a = 10\nkeep me\nb = 2\n"
+
+
+def test_edit_large_file_only_changes_local_region(tmp_path):
+    lines = [f"line {index:04d} - marker={index % 7}" for index in range(1, 2001)]
+    path = tmp_path / "big.py"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    snapshots = FileSnapshotStore()
+    context = ToolContext(
+        tmp_path,
+        approval_handler=approve_all_handler(),
+        file_snapshots=snapshots,
+    )
+    tools = default_tools()
+    execute(tools, "read_file", {"path": "big.py"}, context)
+
+    result = execute(
+        tools,
+        "edit_file",
+        {
+            "path": "big.py",
+            "old_text": "line 1000 - marker=6",
+            "new_text": "line 1000 - marker=CHANGED",
+        },
+        context,
+    )
+
+    assert not result.is_error
+    updated_lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(updated_lines) == len(lines)
+    assert updated_lines[999] == "line 1000 - marker=CHANGED"
+    assert updated_lines[0] == lines[0]
+    assert updated_lines[1999] == lines[1999]
 
 
 def test_edit_atomic_replace_failure_keeps_original_and_cleans_temp(

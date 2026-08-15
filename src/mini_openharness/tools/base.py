@@ -1,13 +1,9 @@
-"""Typed tool registry with workspace and mutation boundaries."""
+"""Core tool infrastructure: registry, permissions, resources, results, paths."""
 
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import hashlib
-import os
-import stat
-import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,6 +117,36 @@ class FileSnapshotStore:
         return self._snapshots.get(path.resolve())
 
 
+class ReadRangeCache:
+    """Per-run record of returned read_file ranges to avoid duplicate pages.
+
+    Keys are ``(resolved path, start offset, line count)``; the stored file
+    version is ``(mtime_ns, size)``. A version mismatch invalidates the entry
+    so a modified file is always re-read.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, int, int], tuple[int, int]] = {}
+
+    def already_returned(
+        self,
+        path: str,
+        start: int,
+        count: int,
+        version: tuple[int, int],
+    ) -> bool:
+        stored = self._entries.get((path, start, count))
+        if stored is None:
+            return False
+        if stored != version:
+            del self._entries[(path, start, count)]
+            return False
+        return True
+
+    def record(self, path: str, start: int, count: int, version: tuple[int, int]) -> None:
+        self._entries[(path, start, count)] = version
+
+
 @dataclass(frozen=True)
 class ToolContext:
     workspace: Path
@@ -129,6 +155,7 @@ class ToolContext:
     tracer: TraceSink | None = None
     tool_timeout_seconds: float = 30.0
     file_snapshots: FileSnapshotStore | None = None
+    read_ranges: ReadRangeCache = field(default_factory=ReadRangeCache)
 
 
 @dataclass(frozen=True)
@@ -255,16 +282,14 @@ class ToolRegistry:
             }
             for tool in self._tools.values()
         ]
-    
+
     def subset(self, names: tuple[str, ...]) -> ToolRegistry:
         registry = ToolRegistry()
         for name in names:
             if name not in self._tools:
                 raise KeyError(f"unknown tool: {name}")
             registry.register(self._tools[name])
-        
         return registry
-        
 
     def source(self, name: str) -> str:
         return self.descriptor(name).source
@@ -505,112 +530,6 @@ def _safe_path(workspace: Path, raw_path: str) -> Path:
     return candidate
 
 
-class ReadFileTool:
-    name = "read_file"
-    description = "Read a UTF-8 text file inside the workspace."
-    read_only = True
-    descriptor = ToolDescriptor(effect="read", path_argument="path")
-    parameters = {
-        "type": "object",
-        "properties": {"path": {"type": "string"}},
-        "required": ["path"],
-        "additionalProperties": False,
-    }
-
-    async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        path = _safe_path(context.workspace, str(arguments["path"]))
-        if _is_runtime_secret(context.workspace, path):
-            return ToolResult(
-                f"Reading protected runtime secret is not allowed: {arguments['path']}",
-                is_error=True,
-            )
-        if not path.is_file():
-            return ToolResult(f"File not found: {arguments['path']}", is_error=True)
-        data = await asyncio.to_thread(path.read_bytes)
-        content = data.decode("utf-8")
-        if context.file_snapshots is not None:
-            context.file_snapshots.record(path, data)
-        return ToolResult(content)
-
-    def resources(self, arguments: dict[str, Any], context: ToolContext):
-        path = _safe_path(context.workspace, str(arguments["path"]))
-        return (ResourceAccess(f"fs:{path}", "read"),)
-
-
-class ListDirTool:
-    name = "list_dir"
-    description = (
-        "List the files and directories directly inside a directory in the "
-        "workspace. Directories are suffixed with '/'. Use find_files to search "
-        "recursively for files by name."
-    )
-    read_only = True
-    descriptor = ToolDescriptor(effect="read", path_argument="path")
-    parameters = {
-        "type": "object",
-        "properties": {"path": {"type": "string", "default": "."}},
-        "additionalProperties": False,
-    }
-
-    async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        path = _safe_path(context.workspace, str(arguments.get("path", ".")))
-        if not path.is_dir():
-            return ToolResult(f"Directory not found: {arguments.get('path', '.')}", is_error=True)
-        entries = []
-        for item in sorted(path.iterdir(), key=lambda candidate: candidate.name):
-            if not _is_listable(context.workspace, item):
-                continue
-            relative = str(item.relative_to(context.workspace.resolve()))
-            entries.append(relative + ("/" if item.is_dir() else ""))
-        return ToolResult("\n".join(entries[:500]) or "(empty directory)")
-
-    def resources(self, arguments: dict[str, Any], context: ToolContext):
-        path = _safe_path(context.workspace, str(arguments.get("path", ".")))
-        return (ResourceAccess(f"fs:{path}", "read", tree=True),)
-
-
-class FindFilesTool:
-    name = "find_files"
-    description = (
-        "Recursively search for files inside the workspace whose name matches a "
-        "glob pattern (e.g. 'cli.py' or '*.py')."
-    )
-    read_only = True
-    descriptor = ToolDescriptor(effect="read", path_argument="path")
-    parameters = {
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "default": "."},
-            "pattern": {"type": "string", "minLength": 1},
-        },
-        "required": ["pattern"],
-        "additionalProperties": False,
-    }
-
-    async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        root = _safe_path(context.workspace, str(arguments.get("path", ".")))
-        if not root.is_dir():
-            return ToolResult(
-                f"Directory not found: {arguments.get('path', '.')}",
-                is_error=True,
-            )
-        pattern = str(arguments["pattern"])
-        matches = sorted(
-            str(item.relative_to(context.workspace.resolve()))
-            for item in root.rglob("*")
-            if item.is_file()
-            and fnmatch.fnmatch(item.name, pattern)
-            and _is_listable(context.workspace, item)
-        )
-        return ToolResult(
-            "\n".join(matches[:500]) or f"(no files match {pattern!r})"
-        )
-
-    def resources(self, arguments: dict[str, Any], context: ToolContext):
-        root = _safe_path(context.workspace, str(arguments.get("path", ".")))
-        return (ResourceAccess(f"fs:{root}", "read", tree=True),)
-
-
 def _is_listable(workspace: Path, path: Path) -> bool:
     """Files/dirs the model may list: no runtime secrets or internal state."""
     if _is_runtime_secret(workspace, path):
@@ -623,219 +542,6 @@ def _is_listable(workspace: Path, path: Path) -> bool:
         part in {".git", ".mini-oh", ".pytest_cache", ".ruff_cache", "__pycache__", ".venv"}
         for part in relative.parts
     )
-
-
-class WriteFileTool:
-    name = "write_file"
-    description = "Write a UTF-8 text file inside the workspace."
-    read_only = False
-    descriptor = ToolDescriptor(effect="write", destructive=True, path_argument="path")
-    parameters = {
-        "type": "object",
-        "properties": {
-            "path": {"type": "string"},
-            "content": {"type": "string"},
-        },
-        "required": ["path", "content"],
-        "additionalProperties": False,
-    }
-
-    async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        path = _safe_path(context.workspace, str(arguments["path"]))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        content = str(arguments["content"])
-        await asyncio.to_thread(path.write_text, content, encoding="utf-8")
-        if context.file_snapshots is not None:
-            context.file_snapshots.record(path, content.encode("utf-8"))
-        return ToolResult(f"Wrote {len(content.encode('utf-8'))} bytes to {arguments['path']}")
-
-    def resources(self, arguments: dict[str, Any], context: ToolContext):
-        path = _safe_path(context.workspace, str(arguments["path"]))
-        return (ResourceAccess(f"fs:{path}", "write"),)
-
-
-class EditFileTool:
-    name = "edit_file"
-    description = (
-        "Replace an exact text fragment in a UTF-8 workspace file. Read the file first so "
-        "the runtime can reject edits based on stale content."
-    )
-    read_only = False
-    descriptor = ToolDescriptor(effect="write", destructive=True, path_argument="path")
-    parameters = {
-        "type": "object",
-        "properties": {
-            "path": {"type": "string"},
-            "old_text": {"type": "string", "minLength": 1},
-            "new_text": {"type": "string"},
-            "replace_all": {"type": "boolean", "default": False},
-            "expected_sha256": {
-                "type": "string",
-                "pattern": "^[0-9a-fA-F]{64}$",
-            },
-        },
-        "required": ["path", "old_text", "new_text"],
-        "additionalProperties": False,
-    }
-
-    async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        raw_path = str(arguments["path"])
-        try:
-            path = _safe_path(context.workspace, raw_path)
-        except ValueError as exc:
-            return ToolResult.fail(
-                str(exc),
-                code="invalid_path",
-                stage="validate",
-            )
-        if _is_runtime_secret(context.workspace, path):
-            return ToolResult.fail(
-                f"Editing protected runtime secret is not allowed: {raw_path}",
-                code="protected_file",
-                stage="execute",
-            )
-        if not path.is_file():
-            return ToolResult.fail(
-                f"File not found: {raw_path}",
-                code="file_not_found",
-                stage="execute",
-            )
-
-        expected_hash = arguments.get("expected_sha256")
-        if expected_hash is None and context.file_snapshots is not None:
-            snapshot = context.file_snapshots.get(path)
-            expected_hash = snapshot.sha256 if snapshot is not None else None
-        if expected_hash is None:
-            return ToolResult.fail(
-                f"Read {raw_path} before editing it, or provide expected_sha256",
-                code="file_not_read",
-                stage="validate",
-            )
-
-        data = await asyncio.to_thread(path.read_bytes)
-        current_hash = hashlib.sha256(data).hexdigest()
-        if current_hash != str(expected_hash).lower():
-            return ToolResult.fail(
-                f"File changed since it was read: {raw_path}",
-                code="file_changed",
-                stage="execute",
-                detail={"expected_sha256": expected_hash, "actual_sha256": current_hash},
-            )
-
-        content = data.decode("utf-8")
-        old_text = str(arguments["old_text"])
-        new_text = str(arguments["new_text"])
-        occurrences = content.count(old_text)
-        if occurrences == 0:
-            return ToolResult.fail(
-                f"Text to replace was not found in {raw_path}",
-                code="match_not_found",
-                stage="execute",
-            )
-        replace_all = bool(arguments.get("replace_all", False))
-        if occurrences > 1 and not replace_all:
-            return ToolResult.fail(
-                f"Text to replace appears {occurrences} times in {raw_path}; use replace_all",
-                code="ambiguous_match",
-                stage="execute",
-                detail={"occurrences": occurrences},
-            )
-
-        replacements = occurrences if replace_all else 1
-        updated = content.replace(old_text, new_text, -1 if replace_all else 1)
-        updated_data = updated.encode("utf-8")
-        mode = stat.S_IMODE(path.stat().st_mode)
-        try:
-            await asyncio.to_thread(
-                _atomic_replace_bytes,
-                path,
-                updated_data,
-                mode,
-                current_hash,
-            )
-        except _FileChangedDuringEdit:
-            return ToolResult.fail(
-                f"File changed while the edit was being prepared: {raw_path}",
-                code="file_changed",
-                stage="execute",
-            )
-        except OSError as exc:
-            return ToolResult.fail(
-                f"Atomic replace failed for {raw_path}: {exc}",
-                code="atomic_replace_failed",
-                stage="execute",
-                detail={"exception_type": type(exc).__name__},
-            )
-
-        if context.file_snapshots is not None:
-            snapshot = context.file_snapshots.record(path, updated_data)
-            updated_hash = snapshot.sha256
-        else:
-            updated_hash = hashlib.sha256(updated_data).hexdigest()
-        return ToolResult(
-            f"Replaced {replacements} occurrence(s) in {raw_path}",
-            metadata={"replacements": replacements, "sha256": updated_hash},
-        )
-
-    def resources(self, arguments: dict[str, Any], context: ToolContext):
-        path = _safe_path(context.workspace, str(arguments["path"]))
-        return (ResourceAccess(f"fs:{path}", "write"),)
-
-
-def default_tools() -> ToolRegistry:
-    registry = ToolRegistry()
-    registry.register(ReadFileTool())
-    registry.register(ListDirTool())
-    registry.register(FindFilesTool())
-    registry.register(WriteFileTool())
-    registry.register(EditFileTool())
-    return registry
-
-
-class _FileChangedDuringEdit(RuntimeError):
-    pass
-
-
-def _atomic_replace_bytes(
-    path: Path,
-    data: bytes,
-    mode: int,
-    expected_sha256: str,
-) -> None:
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.chmod(mode)
-        latest_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-        if latest_hash != expected_sha256:
-            raise _FileChangedDuringEdit
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        return
-    try:
-        try:
-            os.fsync(descriptor)
-        except OSError:
-            pass
-    finally:
-        os.close(descriptor)
 
 
 def _is_runtime_secret(workspace: Path, path: Path) -> bool:

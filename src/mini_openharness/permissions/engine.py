@@ -59,6 +59,13 @@ class PermissionEngine:
         if result.behavior == PermissionBehavior.ASK:
             if find_matching_rule(request, self.context.rules.deny) is not None:
                 return None  # 显式 deny 规则优先于 safety 的 ASK
+            if find_matching_rule(request, self.context.rules.allow) is not None:
+                # 显式 allow 规则代表用户意图，覆盖 safety 的 ASK（例如
+                # benchmark 配置允许全部 shell）；破坏性命令仍被 safety DENY。
+                return PermissionDecision(
+                    PermissionBehavior.ALLOW,
+                    "explicit allow rule overrides safety review",
+                )
             return PermissionDecision(result.behavior, result.reason)
         return PermissionDecision(result.behavior, result.reason)
 

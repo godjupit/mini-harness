@@ -91,6 +91,36 @@ def test_tool_timeout_becomes_recoverable_observation(tmp_path):
     assert "timed out" in result.output
 
 
+def test_tool_timeout_zero_means_unlimited(tmp_path):
+    class SlowTool:
+        name = "slow_unlimited"
+        description = "slow"
+        parameters = {"type": "object", "additionalProperties": False}
+        read_only = True
+
+        async def run(self, arguments, context):
+            del arguments, context
+            await asyncio.sleep(0.05)
+            return ToolResult("late but done")
+
+    registry = ToolRegistry()
+    registry.register(SlowTool())
+    result = asyncio.run(
+        registry.execute(
+            "slow_unlimited",
+            {},
+            ToolContext(
+                tmp_path,
+                tool_timeout_seconds=0,
+                permission_engine=allow_all_engine(tmp_path),
+            ),
+        )
+    )
+
+    assert not result.is_error
+    assert result.output == "late but done"
+
+
 def test_descriptor_timeout_overrides_context_timeout(tmp_path):
     class SlowTool:
         name = "slow_desc"
@@ -118,9 +148,37 @@ def test_descriptor_timeout_overrides_context_timeout(tmp_path):
     assert result.output == "done"
 
 
-def test_descriptor_timeout_rejects_non_positive():
+def test_descriptor_timeout_allows_zero_for_no_timeout():
+    descriptor = ToolDescriptor(effect="read", timeout_seconds=0)
+    assert descriptor.timeout_seconds == 0
     with pytest.raises(ValueError, match="timeout_seconds"):
-        ToolDescriptor(effect="read", timeout_seconds=0)
+        ToolDescriptor(effect="read", timeout_seconds=-1)
+
+
+def test_descriptor_timeout_zero_disables_registry_timeout(tmp_path):
+    class SlowTool:
+        name = "slow_no_timeout"
+        description = "slow"
+        parameters = {"type": "object", "additionalProperties": False}
+        descriptor = ToolDescriptor(effect="read", timeout_seconds=0)
+
+        async def run(self, arguments, context):
+            del arguments, context
+            await asyncio.sleep(0.05)
+            return ToolResult("done")
+
+    registry = ToolRegistry()
+    registry.register(SlowTool())
+    result = asyncio.run(
+        registry.execute(
+            "slow_no_timeout",
+            {},
+            ToolContext(tmp_path, tool_timeout_seconds=0.01),
+        )
+    )
+
+    assert not result.is_error
+    assert result.output == "done"
 
 
 def test_tool_failure_factory_enforces_error_invariant():

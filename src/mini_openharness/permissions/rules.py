@@ -75,6 +75,13 @@ def build_default_allow_rules() -> list[PermissionRule]:
             pattern="*",
             source="builtin",
         ),
+        # 默认放行全部 shell（破坏性命令仍被 safety 层 DENY，显式 allow 无法覆盖）。
+        PermissionRule(
+            PermissionBehavior.ALLOW,
+            tool="sandbox_shell",
+            pattern="*",
+            source="builtin",
+        ),
     ]
 
 

@@ -57,6 +57,42 @@ def test_host_pytest_is_available(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
+def test_shell_timeout_returns_partial_output(tmp_path):
+    shell = make_shell(tmp_path)
+
+    result = asyncio.run(
+        shell.run(
+            command=(
+                "python -u -c \"print('early-progress'); "
+                "import time; time.sleep(30)\""
+            ),
+            timeout=2,
+            cwd=tmp_path,
+        )
+    )
+
+    assert result.is_error
+    assert result.metadata.get("timed_out") is True
+    assert "early-progress" in result.output
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
+def test_shell_defaults_to_no_timeout(tmp_path):
+    shell = make_shell(tmp_path)
+    tool = SandboxedShellTool(shell)
+
+    result = asyncio.run(
+        tool.run(
+            {"command": "echo shell-ok"},
+            ToolContext(tmp_path, tool_timeout_seconds=0.01),
+        )
+    )
+
+    assert not result.is_error
+    assert "shell-ok" in result.output
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
 def test_workspace_venv_python_runs(tmp_path):
     subprocess.run(
         [sys.executable, "-m", "venv", str(tmp_path / ".venv")],

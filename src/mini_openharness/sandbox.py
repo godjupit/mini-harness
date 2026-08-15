@@ -100,19 +100,47 @@ class BwrapShell:
             stderr=asyncio.subprocess.STDOUT,
             env=self.context.env,
         )
+        chunks: list[bytes] = []
+
+        async def drain() -> None:
+            assert process.stdout is not None
+            while True:
+                chunk = await process.stdout.read(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+
+        reader = asyncio.create_task(drain())
+        timed_out = False
         try:
-            output, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            if timeout is not None and timeout > 0:
+                await asyncio.wait_for(process.wait(), timeout=timeout)
+            else:
+                await process.wait()
         except asyncio.TimeoutError:
+            timed_out = True
             await _stop_process(process)
-            return ToolResult(
-                f"Sandbox command timed out after {timeout:g} seconds",
-                is_error=True,
-                metadata={"timed_out": True, "sandbox": "bwrap"},
-            )
         except asyncio.CancelledError:
             await _stop_process(process)
             raise
-        text = output.decode("utf-8", errors="replace").replace("\r\n", "\n")
+        finally:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(reader, return_exceptions=True),
+                    timeout=2,
+                )
+            except asyncio.TimeoutError:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+        text = b"".join(chunks).decode("utf-8", errors="replace").replace("\r\n", "\n")
+        if timed_out:
+            return ToolResult(
+                f"Sandbox command timed out after {timeout:g} seconds.\n"
+                "Output so far (the command may still be progressing):\n"
+                f"{text or '(no output yet)'}",
+                is_error=True,
+                metadata={"timed_out": True, "sandbox": "bwrap"},
+            )
         if len(text) > 12_000:
             text = text[:12_000] + "\n...[truncated]..."
         return ToolResult(
@@ -141,6 +169,8 @@ class SandboxedShellTool:
         effect="compute",
         destructive=False,
         command_argument="command",
+        # registry 层不对 shell 做超时控制；超时由命令级 timeout_seconds 决定。
+        timeout_seconds=0,
     )
     parameters = {
         "type": "object",
@@ -149,9 +179,10 @@ class SandboxedShellTool:
             "cwd": {"type": "string", "default": "."},
             "timeout_seconds": {
                 "type": "number",
-                "minimum": 1,
-                "maximum": 600,
-                "default": 30,
+                "minimum": 0,
+                "maximum": 3600,
+                "default": 0,
+                "description": "bound this command in seconds; 0 or omitted = no timeout",
             },
         },
         "required": ["command"],
@@ -174,10 +205,13 @@ class SandboxedShellTool:
         )
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        timeout = min(
-            float(arguments.get("timeout_seconds", 30)),
-            context.tool_timeout_seconds,
-        )
+        requested = float(arguments.get("timeout_seconds", 0) or 0)
+        if requested <= 0:
+            timeout = 0.0  # 默认不限时
+        elif context.tool_timeout_seconds and context.tool_timeout_seconds > 0:
+            timeout = min(requested, context.tool_timeout_seconds)
+        else:
+            timeout = requested
         return await self.shell.run(
             command=str(arguments["command"]),
             timeout=timeout,

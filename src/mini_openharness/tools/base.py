@@ -168,13 +168,14 @@ class ToolDescriptor:
     destructive: bool = False
     path_argument: str | None = None
     command_argument: str | None = None
+    # 0 表示该工具在 registry 层不做超时控制（例如 sandbox_shell 默认不限时）。
     timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if self.effect not in {"read", "write", "remote", "compute", "unknown"}:
             raise ValueError(f"Unsupported tool effect: {self.effect}")
-        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
-            raise ValueError("tool descriptor timeout_seconds must be positive")
+        if self.timeout_seconds is not None and self.timeout_seconds < 0:
+            raise ValueError("tool descriptor timeout_seconds must be >= 0")
         if not self.source:
             raise ValueError("tool descriptor source must not be empty")
         if self.path_argument == "":
@@ -453,10 +454,13 @@ class ToolRegistry:
                 if descriptor.timeout_seconds is None
                 else descriptor.timeout_seconds
             )
-            result = await asyncio.wait_for(
-                tool.run(arguments, context),
-                timeout=timeout,
-            )
+            if timeout is not None and timeout > 0:
+                result = await asyncio.wait_for(
+                    tool.run(arguments, context),
+                    timeout=timeout,
+                )
+            else:
+                result = await tool.run(arguments, context)
         except asyncio.TimeoutError:
             return ToolResult.fail(
                 f"{name} timed out after {timeout:g} seconds",

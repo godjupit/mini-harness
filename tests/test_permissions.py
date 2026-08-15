@@ -93,13 +93,13 @@ def test_engine_rules_safety_and_defaults(tmp_path):
         engine.authorize(
             request("sandbox_shell", command="npm publish", effect="write")
         ).behavior
-        == PermissionBehavior.ASK
+        == PermissionBehavior.ALLOW
     )
     assert (
         engine.authorize(
             request("sandbox_shell", command="$(rm -rf /)", effect="write")
         ).behavior
-        == PermissionBehavior.ASK
+        == PermissionBehavior.ALLOW
     )
 
 
@@ -226,6 +226,26 @@ def test_complex_shell_is_ask(tmp_path):
     assert decision.behavior == PermissionBehavior.ASK
 
 
+def test_explicit_allow_rule_overrides_safety_ask(tmp_path):
+    engine = make_engine(
+        tmp_path,
+        rules=PermissionRules(
+            allow=[PermissionRule(PermissionBehavior.ALLOW, tool="sandbox_shell", pattern="*")]
+        ),
+    )
+
+    allowed = engine.authorize(
+        request("sandbox_shell", command="pip install requests", effect="write")
+    )
+    destructive = engine.authorize(
+        request("sandbox_shell", command="rm -rf /", effect="write")
+    )
+
+    assert allowed.behavior == PermissionBehavior.ALLOW
+    # 安全层的破坏性硬拦截仍然生效，显式 allow 不能覆盖
+    assert destructive.behavior == PermissionBehavior.DENY
+
+
 def test_shell_routine_commands_are_allowed(tmp_path):
     engine = make_engine(tmp_path)
     allowed = [
@@ -255,15 +275,13 @@ def test_shell_routine_commands_are_allowed(tmp_path):
 
 
 def test_shell_unsafe_or_uncertain_commands_ask(tmp_path):
-    engine = make_engine(tmp_path)
+    # 空规则：验证 safety 层对不确定命令的 ASK 行为（不依赖默认 allow 规则）
+    engine = make_engine(tmp_path, rules=PermissionRules())
     cases = [
-        "cd src && rm -rf *",
         "git reset --hard",
         "git push",
         "pip install requests",
-        "rm file.txt",
         "cd .. && ls",
-        "pytest && rm file",
         "echo hello > file.txt",
         "cmd1 || cmd2",
     ]
@@ -272,6 +290,29 @@ def test_shell_unsafe_or_uncertain_commands_ask(tmp_path):
             request("sandbox_shell", command=command, effect="write")
         )
         assert decision.behavior == PermissionBehavior.ASK, command
+
+
+def test_default_rules_allow_all_shell_except_destructive(tmp_path):
+    engine = make_engine(tmp_path)
+    allowed = [
+        "pip install requests",
+        "git reset --hard",
+        "git push",
+        "rm file.txt",
+        "cmd1 || cmd2",
+        "echo hello > file.txt",
+        "python -m pytest tests",
+    ]
+    for command in allowed:
+        decision = engine.authorize(
+            request("sandbox_shell", command=command, effect="write")
+        )
+        assert decision.behavior == PermissionBehavior.ALLOW, command
+
+    destructive = engine.authorize(
+        request("sandbox_shell", command="rm -rf /", effect="write")
+    )
+    assert destructive.behavior == PermissionBehavior.DENY
 
 
 def test_shell_destructive_commands_deny(tmp_path):

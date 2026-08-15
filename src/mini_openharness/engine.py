@@ -22,8 +22,11 @@ from mini_openharness.provider import (
     ProviderComplete,
     ProviderContextWindowError,
     ProviderError,
+    ProviderReasoningDelta,
     ProviderRetry,
     ProviderTextDelta,
+    ProviderToolCallDelta,
+    ProviderToolCallStart,
 )
 from mini_openharness.tools import (
     FileSnapshotStore,
@@ -41,6 +44,9 @@ EventKind = Literal[
     "first_token",
     "model_response_end",
     "assistant_delta",
+    "reasoning_delta",
+    "tool_call_start",
+    "tool_call_delta",
     "assistant",
     "provider_retry",
     "tool_start",
@@ -293,7 +299,10 @@ class AgentLoop:
             while True:
                 model_attempt += 1
                 step_started = time.monotonic()
-                first_token_ms: float | None = None
+                first_activity_ms: float | None = None
+                first_reasoning_ms: float | None = None
+                first_text_ms: float | None = None
+                first_tool_call_ms: float | None = None
                 yield AgentEvent("model_start", data={"step": step, "attempt": model_attempt})
                 if self.tracer:
                     self.tracer.emit(
@@ -316,15 +325,38 @@ class AgentLoop:
                             self.tools.schemas(),
                             cancel_event=state.cancel_event,
                         ):
-                            if isinstance(provider_event, ProviderTextDelta):
-                                if first_token_ms is None:
-                                    first_token_ms = (
-                                        time.monotonic() - step_started
-                                    ) * 1000
+                            if isinstance(provider_event, ProviderReasoningDelta):
+                                elapsed_ms = (time.monotonic() - step_started) * 1000
+                                if first_activity_ms is None:
+                                    first_activity_ms = elapsed_ms
+                                if first_reasoning_ms is None:
+                                    first_reasoning_ms = elapsed_ms
+                                yield AgentEvent(
+                                    "reasoning_delta",
+                                    provider_event.delta,
+                                    {"step": step},
+                                )
+                            elif isinstance(provider_event, ProviderTextDelta):
+                                elapsed_ms = (time.monotonic() - step_started) * 1000
+                                if first_activity_ms is None:
+                                    first_activity_ms = elapsed_ms
+                                if first_text_ms is None:
+                                    first_text_ms = elapsed_ms
                                     ttft_data = {
                                         "step": step,
                                         "attempt": model_attempt,
-                                        "ttft_ms": round(first_token_ms, 1),
+                                        "ttft_ms": round(
+                                            first_activity_ms
+                                            if first_activity_ms is not None
+                                            else first_text_ms,
+                                            1,
+                                        ),
+                                        "first_activity_ms": (
+                                            round(first_activity_ms, 1)
+                                            if first_activity_ms is not None
+                                            else None
+                                        ),
+                                        "first_text_ms": round(first_text_ms, 1),
                                     }
                                     if self.tracer:
                                         self.tracer.emit("first_token", ttft_data)
@@ -336,6 +368,33 @@ class AgentLoop:
                                     )
                                 yield AgentEvent(
                                     "assistant_delta", provider_event.text, {"step": step}
+                                )
+                            elif isinstance(provider_event, ProviderToolCallStart):
+                                elapsed_ms = (time.monotonic() - step_started) * 1000
+                                if first_activity_ms is None:
+                                    first_activity_ms = elapsed_ms
+                                if first_tool_call_ms is None:
+                                    first_tool_call_ms = elapsed_ms
+                                yield AgentEvent(
+                                    "tool_call_start",
+                                    data={
+                                        "step": step,
+                                        "index": provider_event.index,
+                                        "name": provider_event.name,
+                                        "call_id": provider_event.call_id,
+                                    },
+                                )
+                            elif isinstance(provider_event, ProviderToolCallDelta):
+                                elapsed_ms = (time.monotonic() - step_started) * 1000
+                                if first_activity_ms is None:
+                                    first_activity_ms = elapsed_ms
+                                yield AgentEvent(
+                                    "tool_call_delta",
+                                    data={
+                                        "step": step,
+                                        "index": provider_event.index,
+                                        "arguments_delta": provider_event.arguments_delta,
+                                    },
                                 )
                             elif isinstance(provider_event, ProviderRetry):
                                 data = {
@@ -395,17 +454,32 @@ class AgentLoop:
                 return
 
             total_ms = (time.monotonic() - step_started) * 1000
-            if first_token_ms is None:
-                first_token_ms = total_ms  # 非流式：首 token 即响应完成
-            generation_ms = max(0.0, total_ms - first_token_ms)
+            ttft_ms = first_activity_ms if first_activity_ms is not None else total_ms
+            generation_ms = max(0.0, total_ms - ttft_ms)
             response_data = {
                 "step": step,
                 "attempt": model_attempt,
                 "model": getattr(self.provider, "model", None),
-                "ttft_ms": round(first_token_ms, 1),
+                "ttft_ms": round(ttft_ms, 1),
                 "generation_ms": round(generation_ms, 1),
+                "first_activity_ms": (
+                    round(first_activity_ms, 1) if first_activity_ms is not None else None
+                ),
+                "first_reasoning_ms": (
+                    round(first_reasoning_ms, 1)
+                    if first_reasoning_ms is not None
+                    else None
+                ),
+                "first_text_ms": (
+                    round(first_text_ms, 1) if first_text_ms is not None else None
+                ),
+                "first_tool_call_ms": (
+                    round(first_tool_call_ms, 1)
+                    if first_tool_call_ms is not None
+                    else None
+                ),
                 "total_ms": round(total_ms, 1),
-                "request_to_first_token_ms": round(first_token_ms, 1),
+                "request_to_first_token_ms": round(ttft_ms, 1),
                 "first_to_last_token_ms": round(generation_ms, 1),
                 "request_total_ms": round(total_ms, 1),
                 "visible_output_chars": len(reply.content),

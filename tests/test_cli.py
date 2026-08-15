@@ -373,6 +373,49 @@ def test_tool_start_does_not_print_write_content(capsys):
     assert "write_file notes/ok.txt (14 chars)" in out
 
 
+def test_print_event_reasoning_flips_status_and_tool_call_start_is_immediate(capsys):
+    cli._THINKING_LINE_OPEN = False
+    cli._REASONING_LINE_SHOWN = False
+    cli._print_event(AgentEvent("model_start", data={"step": 1, "attempt": 1}))
+    cli._print_event(AgentEvent("reasoning_delta", "hidden reasoning", {"step": 1}))
+    cli._print_event(
+        AgentEvent(
+            "tool_call_start",
+            data={"step": 1, "index": 0, "name": "read_file", "call_id": "call-1"},
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert "model reasoning" in out
+    assert "→ read_file" in out
+    assert "hidden reasoning" not in out
+
+
+def test_print_event_first_token_after_reasoning_keeps_reasoning_label(capsys):
+    cli._THINKING_LINE_OPEN = False
+    cli._REASONING_LINE_SHOWN = False
+    cli._print_event(AgentEvent("model_start", data={"step": 1, "attempt": 1}))
+    cli._print_event(AgentEvent("reasoning_delta", "r", {"step": 1}))
+    cli._print_event(AgentEvent("first_token", data={"ttft_ms": 1234.0}))
+
+    out = capsys.readouterr().out
+    assert "model reasoning... 1.2s" in out
+
+
+def test_print_event_tool_call_start_without_name_shows_index(capsys):
+    cli._THINKING_LINE_OPEN = False
+    cli._REASONING_LINE_SHOWN = False
+    cli._print_event(
+        AgentEvent(
+            "tool_call_start",
+            data={"step": 1, "index": 2, "name": None, "call_id": None},
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert "→ tool_call[2]" in out
+
+
 def test_sandbox_shell_output_is_hidden(capsys):
     cli._print_event(
         AgentEvent(

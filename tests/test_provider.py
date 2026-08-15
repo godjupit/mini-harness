@@ -14,8 +14,11 @@ from mini_openharness.provider import (
     ProviderComplete,
     ProviderContextWindowError,
     ProviderOutputTruncatedError,
+    ProviderReasoningDelta,
     ProviderRetry,
     ProviderTextDelta,
+    ProviderToolCallDelta,
+    ProviderToolCallStart,
 )
 
 
@@ -58,6 +61,173 @@ def test_streaming_text_fragmented_tool_call_and_usage():
     assert reply.tool_calls[0].name == "read_file"
     assert reply.tool_calls[0].arguments == {"path": "a"}
     assert (reply.input_tokens, reply.output_tokens) == (7, 3)
+
+
+def test_chat_stream_text_only():
+    body = (
+        'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"lo there"}}]}\n\n'
+        'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="test",
+        model="test",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+    )
+    try:
+        events = collect(provider)
+    finally:
+        asyncio.run(provider.close())
+
+    assert (
+        "".join(event.text for event in events if isinstance(event, ProviderTextDelta))
+        == "hello there"
+    )
+    assert not any(isinstance(event, ProviderReasoningDelta) for event in events)
+    assert not any(
+        isinstance(event, (ProviderToolCallStart, ProviderToolCallDelta))
+        for event in events
+    )
+    reply = next(event.reply for event in events if isinstance(event, ProviderComplete))
+    assert reply.content == "hello there"
+    assert reply.tool_calls == ()
+
+
+def test_chat_stream_without_reasoning_content_still_works():
+    body = (
+        'data: {"choices":[{"delta":{"content":"plain","reasoning_content":null}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":" answer"}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="test",
+        model="test",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+    )
+    try:
+        events = collect(provider)
+    finally:
+        asyncio.run(provider.close())
+
+    assert not any(isinstance(event, ProviderReasoningDelta) for event in events)
+    reply = next(event.reply for event in events if isinstance(event, ProviderComplete))
+    assert reply.content == "plain answer"
+    assert reply.tool_calls == ()
+
+
+def test_chat_reasoning_then_text_keeps_reasoning_out_of_content():
+    body = (
+        'data: {"choices":[{"delta":{"reasoning_content":"Let me think"}}]}\n\n'
+        'data: {"choices":[{"delta":{"reasoning_content":" step by step"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"Answer:"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":" 42"}}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="test",
+        model="test",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+    )
+    try:
+        events = collect(provider)
+    finally:
+        asyncio.run(provider.close())
+
+    reasoning = "".join(
+        event.delta for event in events if isinstance(event, ProviderReasoningDelta)
+    )
+    assert reasoning == "Let me think step by step"
+    text = "".join(
+        event.text for event in events if isinstance(event, ProviderTextDelta)
+    )
+    assert text == "Answer: 42"
+    reply = next(event.reply for event in events if isinstance(event, ProviderComplete))
+    assert reply.content == "Answer: 42"
+    assert "Let me think" not in reply.content
+
+
+def test_chat_reasoning_then_tool_call_emits_start_and_preserves_arguments():
+    body = (
+        'data: {"choices":[{"delta":{"reasoning_content":"need to read"}}]}\n\n'
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1",'
+        '"type":"function","function":{"name":"read_file","arguments":""}}]}}]}\n\n'
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        '"function":{"arguments":"{\\"path\\":\\"a"}}]}}]}\n\n'
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        '"function":{"arguments":"\\"}"}}]}}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="test",
+        model="test",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+    )
+    try:
+        events = collect(provider)
+    finally:
+        asyncio.run(provider.close())
+
+    starts = [
+        event for event in events if isinstance(event, ProviderToolCallStart)
+    ]
+    assert len(starts) == 1
+    assert starts[0].index == 0
+    assert starts[0].name == "read_file"
+    assert starts[0].call_id == "call-1"
+    deltas = [
+        event for event in events if isinstance(event, ProviderToolCallDelta)
+    ]
+    assert "".join(event.arguments_delta for event in deltas) == '{"path":"a"}'
+    first_delta_pos = next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, ProviderToolCallDelta)
+    )
+    complete_pos = next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, ProviderComplete)
+    )
+    assert first_delta_pos < complete_pos
+    reply = next(event.reply for event in events if isinstance(event, ProviderComplete))
+    assert reply.content == ""
+    assert "need to read" not in reply.content
+    assert reply.tool_calls == (ToolCall("call-1", "read_file", {"path": "a"}),)
+
+
+def test_chat_tool_call_only_emits_start_without_text_or_reasoning():
+    body = (
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-7",'
+        '"type":"function","function":{"name":"list_dir","arguments":""}}]}}]}\n\n'
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        '"function":{"arguments":"{\\"path\\":\\".\\"}"}}]}}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="test",
+        model="test",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+    )
+    try:
+        events = collect(provider)
+    finally:
+        asyncio.run(provider.close())
+
+    assert not any(
+        isinstance(event, (ProviderTextDelta, ProviderReasoningDelta))
+        for event in events
+    )
+    starts = [
+        event for event in events if isinstance(event, ProviderToolCallStart)
+    ]
+    assert len(starts) == 1
+    assert starts[0].name == "list_dir"
+    assert starts[0].call_id == "call-7"
+    reply = next(event.reply for event in events if isinstance(event, ProviderComplete))
+    assert reply.content == ""
+    assert reply.tool_calls == (ToolCall("call-7", "list_dir", {"path": "."}),)
 
 
 def test_responses_stream_uses_typed_items_call_id_and_usage():
@@ -124,6 +294,14 @@ def test_responses_stream_uses_typed_items_call_id_and_usage():
         "output": "README.md",
     }
     assert captured["payload"]["tools"][0]["type"] == "function"
+    starts = [
+        event for event in events if isinstance(event, ProviderToolCallStart)
+    ]
+    assert len(starts) == 1
+    assert starts[0].index == 1
+    assert starts[0].name == "read_file"
+    assert starts[0].call_id == "call-1"
+    assert any(isinstance(event, ProviderToolCallDelta) for event in events)
     reply = next(event.reply for event in events if isinstance(event, ProviderComplete))
     assert reply.content == "hello"
     assert reply.tool_calls == (ToolCall("call-1", "read_file", {"path": "README.md"}),)

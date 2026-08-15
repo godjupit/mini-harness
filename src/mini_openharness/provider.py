@@ -58,6 +58,24 @@ class ProviderTextDelta:
 
 
 @dataclass(frozen=True)
+class ProviderReasoningDelta:
+    delta: str
+
+
+@dataclass(frozen=True)
+class ProviderToolCallStart:
+    index: int
+    name: str | None = None
+    call_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderToolCallDelta:
+    index: int
+    arguments_delta: str
+
+
+@dataclass(frozen=True)
 class ProviderRetry:
     attempt: int
     delay_seconds: float
@@ -69,7 +87,14 @@ class ProviderComplete:
     reply: ModelReply
 
 
-ProviderEvent = ProviderTextDelta | ProviderRetry | ProviderComplete
+ProviderEvent = (
+    ProviderTextDelta
+    | ProviderReasoningDelta
+    | ProviderToolCallStart
+    | ProviderToolCallDelta
+    | ProviderRetry
+    | ProviderComplete
+)
 
 
 class StreamingModelProvider(Protocol):
@@ -169,6 +194,7 @@ class OpenAICompatibleProvider:
     ) -> AsyncIterator[ProviderEvent]:
         content_parts: list[str] = []
         tool_parts: dict[int, dict[str, str]] = {}
+        tool_call_started: set[int] = set()
         input_tokens = 0
         output_tokens = 0
         finish_reasons: set[str] = set()
@@ -201,6 +227,9 @@ class OpenAICompatibleProvider:
                         if finish_reason:
                             finish_reasons.add(str(finish_reason))
                         delta = choice.get("delta") or {}
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning:
+                            yield ProviderReasoningDelta(str(reasoning))
                         text = delta.get("content")
                         if text:
                             content_parts.append(str(text))
@@ -210,10 +239,24 @@ class OpenAICompatibleProvider:
                             part = tool_parts.setdefault(
                                 index, {"id": "", "name": "", "arguments": ""}
                             )
-                            part["id"] += str(raw_call.get("id") or "")
                             function = raw_call.get("function") or {}
-                            part["name"] += str(function.get("name") or "")
-                            part["arguments"] += str(function.get("arguments") or "")
+                            call_id = str(raw_call.get("id") or "")
+                            function_name = str(function.get("name") or "")
+                            arguments_delta = str(function.get("arguments") or "")
+                            if index not in tool_call_started:
+                                tool_call_started.add(index)
+                                yield ProviderToolCallStart(
+                                    index=index,
+                                    name=function_name or None,
+                                    call_id=call_id or None,
+                                )
+                            part["id"] += call_id
+                            part["name"] += function_name
+                            part["arguments"] += arguments_delta
+                            if arguments_delta:
+                                yield ProviderToolCallDelta(
+                                    index=index, arguments_delta=arguments_delta
+                                )
         except ProviderError:
             raise
         except httpx.TimeoutException as exc:
@@ -270,6 +313,7 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
     ) -> AsyncIterator[ProviderEvent]:
         content_parts: list[str] = []
         tool_parts: dict[int, dict[str, str]] = {}
+        tool_call_started: set[int] = set()
         input_tokens = 0
         output_tokens = 0
         completed = False
@@ -307,10 +351,24 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
                                 "name": str(item.get("name") or ""),
                                 "arguments": str(item.get("arguments") or ""),
                             }
+                            if index not in tool_call_started:
+                                tool_call_started.add(index)
+                                yield ProviderToolCallStart(
+                                    index=index,
+                                    name=str(item.get("name") or None),
+                                    call_id=str(
+                                        item.get("call_id") or item.get("id") or None
+                                    ),
+                                )
                     elif event_type == "response.function_call_arguments.delta":
                         index = int(event.get("output_index", 0))
                         part = tool_parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
-                        part["arguments"] += str(event.get("delta") or "")
+                        arguments_delta = str(event.get("delta") or "")
+                        part["arguments"] += arguments_delta
+                        if arguments_delta:
+                            yield ProviderToolCallDelta(
+                                index=index, arguments_delta=arguments_delta
+                            )
                     elif event_type == "response.function_call_arguments.done":
                         index = int(event.get("output_index", 0))
                         part = tool_parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
@@ -327,6 +385,15 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
                                 "name": str(item.get("name") or ""),
                                 "arguments": str(item.get("arguments") or "{}"),
                             }
+                            if index not in tool_call_started:
+                                tool_call_started.add(index)
+                                yield ProviderToolCallStart(
+                                    index=index,
+                                    name=str(item.get("name") or None),
+                                    call_id=str(
+                                        item.get("call_id") or item.get("id") or None
+                                    ),
+                                )
                     elif event_type == "response.completed":
                         completed = True
                         usage = (event.get("response") or {}).get("usage") or {}

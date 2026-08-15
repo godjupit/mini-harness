@@ -69,6 +69,7 @@ def _positive_float(value: str) -> float:
 
 _ACTIVE_SESSION: SessionLog | None = None
 _THINKING_LINE_OPEN = False
+_REASONING_LINE_SHOWN = False
 
 
 def _print_resume_hint() -> None:
@@ -835,14 +836,29 @@ def _trace_command(args: argparse.Namespace) -> int:
 
 
 def _print_event(event: AgentEvent) -> None:
-    global _THINKING_LINE_OPEN
+    global _THINKING_LINE_OPEN, _REASONING_LINE_SHOWN
     if event.kind == "model_start":
         _THINKING_LINE_OPEN = True
+        _REASONING_LINE_SHOWN = False
         print("⏳ model thinking...", end="", flush=True)
+    elif event.kind == "reasoning_delta":
+        if not _REASONING_LINE_SHOWN:
+            _REASONING_LINE_SHOWN = True
+            print("\r⏳ model reasoning...", end="", flush=True)
     elif event.kind == "first_token":
         _THINKING_LINE_OPEN = False
         ttft = event.data.get("ttft_ms", 0)
-        print(f"\r⏳ model thinking... {ttft / 1000:.1f}s")
+        status = "model reasoning" if _REASONING_LINE_SHOWN else "model thinking"
+        print(f"\r⏳ {status}... {ttft / 1000:.1f}s")
+    elif event.kind == "tool_call_start":
+        if _THINKING_LINE_OPEN:
+            _THINKING_LINE_OPEN = False
+            print()
+        name = event.data.get("name")
+        if name:
+            print(f"→ {name}")
+        else:
+            print(f"→ tool_call[{event.data.get('index', '?')}]")
     elif event.kind == "model_response_end":
         if _THINKING_LINE_OPEN:
             _THINKING_LINE_OPEN = False

@@ -20,8 +20,11 @@ from mini_openharness.provider import (
     ProviderAuthenticationError,
     ProviderComplete,
     ProviderContextWindowError,
+    ProviderReasoningDelta,
     ProviderRetry,
     ProviderTextDelta,
+    ProviderToolCallDelta,
+    ProviderToolCallStart,
 )
 from mini_openharness.compaction import ArtifactStore, ContextCompactor
 from mini_openharness.tools import (
@@ -802,6 +805,84 @@ def test_model_ttft_and_response_events_are_tracked(tmp_path):
     assert end.data["reported_output_tokens"] == 5
     assert end.data["input_tokens"] == 10
     assert end.data["output_tokens"] == 5
+
+
+def test_reasoning_then_text_tracks_first_activity_and_reasoning(tmp_path):
+    class StreamingProvider:
+        async def stream(self, messages, tools, *, cancel_event=None):
+            del messages, tools, cancel_event
+            yield ProviderReasoningDelta("think")
+            yield ProviderTextDelta("hello")
+            yield ProviderComplete(ModelReply(content="hello"))
+
+    loop = AgentLoop(provider=StreamingProvider(), tools=default_tools(), workspace=tmp_path)
+
+    events = collect(loop, "hi")
+
+    kinds = [event.kind for event in events]
+    assert "reasoning_delta" in kinds
+    assert "first_token" in kinds
+    reasoning = next(event for event in events if event.kind == "reasoning_delta")
+    assert reasoning.message == "think"
+    end = next(event for event in events if event.kind == "model_response_end")
+    assert end.data["first_reasoning_ms"] is not None
+    assert end.data["first_text_ms"] is not None
+    assert end.data["first_activity_ms"] == end.data["first_reasoning_ms"]
+    assert end.data["ttft_ms"] == end.data["first_activity_ms"]
+    assert end.data["first_tool_call_ms"] is None
+
+
+def test_pure_tool_call_turn_uses_first_activity_not_total_time(tmp_path):
+    class StreamingProvider:
+        def __init__(self):
+            self.requests = 0
+
+        async def stream(self, messages, tools, *, cancel_event=None):
+            del messages, tools, cancel_event
+            self.requests += 1
+            if self.requests == 1:
+                yield ProviderToolCallStart(
+                    index=0, name="list_dir", call_id="call-1"
+                )
+                yield ProviderToolCallDelta(index=0, arguments_delta='{"path": "."}')
+                await asyncio.sleep(0.01)
+                yield ProviderComplete(
+                    ModelReply(
+                        content="",
+                        tool_calls=(ToolCall("call-1", "list_dir", {"path": "."}),),
+                    )
+                )
+            else:
+                yield ProviderTextDelta("done")
+                yield ProviderComplete(ModelReply(content="done"))
+
+    loop = AgentLoop(provider=StreamingProvider(), tools=default_tools(), workspace=tmp_path)
+
+    events = collect(loop, "list")
+
+    first_end_pos = next(
+        index
+        for index, event in enumerate(events)
+        if event.kind == "model_response_end"
+    )
+    first_end = events[first_end_pos]
+    assert first_end.data["first_activity_ms"] is not None
+    assert first_end.data["first_tool_call_ms"] is not None
+    assert first_end.data["first_text_ms"] is None
+    assert first_end.data["first_reasoning_ms"] is None
+    assert first_end.data["ttft_ms"] == first_end.data["first_activity_ms"]
+    assert first_end.data["ttft_ms"] < first_end.data["total_ms"]
+    assert (
+        first_end.data["total_ms"] - first_end.data["first_activity_ms"] >= 8.0
+    )
+    assert "first_token" not in [
+        event.kind for event in events[:first_end_pos]
+    ]
+    stream_start = next(event for event in events if event.kind == "tool_call_start")
+    assert stream_start.data["name"] == "list_dir"
+    assert stream_start.data["call_id"] == "call-1"
+    assert any(event.kind == "tool_call_delta" for event in events)
+    assert events[-1].kind == "done"
 
 
 def test_context_error_forces_one_compaction_and_retries_same_model_step(tmp_path):

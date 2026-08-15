@@ -448,7 +448,7 @@ def test_cli_interrupt_prints_resume_hint_and_returns_130(tmp_path, monkeypatch,
 
     assert code == 130
     output = capsys.readouterr()
-    assert "Resume this session with: mini-oh resume" in output.out + output.err
+    assert "Resume this session with: wqb resume" in output.out + output.err
 
 
 def test_handle_sigterm_prints_hint_and_exits_143(tmp_path, monkeypatch, capsys):

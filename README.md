@@ -127,19 +127,19 @@ The CLI loads `.env` from the current directory without overriding variables alr
 Offline demo (no API key, exercises the real runtime path):
 
 ```bash
-mini-oh --demo --workspace . "Inspect this project and summarize its architecture."
+wqb --demo --workspace . "Inspect this project and summarize its architecture."
 ```
 
 Real model run:
 
 ```bash
-mini-oh --workspace . "Inspect the repository and explain the agent runtime."
+wqb --workspace . "Inspect the repository and explain the agent runtime."
 ```
 
 The default provider path uses the Responses API. For a Chat Completions-compatible endpoint:
 
 ```bash
-mini-oh \
+wqb \
   --api-mode chat \
   --base-url https://compatible.example/v1 \
   --workspace . \
@@ -174,7 +174,7 @@ Safety checks run before configurable rules:
 ASK decisions ask for approval in an interactive terminal. Without an approval callback, ASK fails closed.
 
 ```bash
-mini-oh --workspace . "Create docs/design.md"
+wqb --workspace . "Create docs/design.md"
 ```
 
 ### Auto-review (AUTO_REVIEW mode)
@@ -182,7 +182,7 @@ mini-oh --workspace . "Create docs/design.md"
 `--auto-review` sends ASK decisions to an independent reviewer model call instead of a human:
 
 ```bash
-mini-oh --auto-review --workspace . "Refactor the parser and update the tests."
+wqb --auto-review --workspace . "Refactor the parser and update the tests."
 ```
 
 The reviewer receives the tool, effect, path/command, workspace, arguments, and the permission reason, and can only return approve/reject for that specific ASK. Invariants:
@@ -205,7 +205,7 @@ The reviewer receives the tool, effect, path/command, workspace, arguments, and 
 ```
 
 ```bash
-mini-oh --permission-config examples/permissions.json --workspace . "Update the docs."
+wqb --permission-config examples/permissions.json --workspace . "Update the docs."
 ```
 
 Rule patterns use `fnmatch`-style matching. Unmatched requests still fall through to the runtime default and non-bypassable safety checks.
@@ -287,7 +287,7 @@ A model may return several tool calls in one response. Each call resolves to log
 Tool observations return in original call order even when execution finishes out of order:
 
 ```bash
-mini-oh --max-concurrent-tools 4 --workspace . "Inspect several files."
+wqb --max-concurrent-tools 4 --workspace . "Inspect several files."
 ```
 
 ### Safe editing
@@ -308,7 +308,7 @@ Hooks are trusted runtime extensions the model cannot opt out of.
 A stop hook can act as a verification gate: if it blocks completion, its output returns to the model as feedback so the agent can fix the problem and try again.
 
 ```bash
-mini-oh \
+wqb \
   --hooks-config examples/hooks-verification.json \
   --workspace . \
   "Implement the change and make the tests pass."
@@ -324,7 +324,7 @@ Command hooks execute with `argv` directly (no shell), use the workspace as the 
 - Large tool outputs are offloaded to `.mini-oh/artifacts/<run-id>/`, keeping only a head/tail preview inline
 
 ```bash
-mini-oh \
+wqb \
   --context-threshold 12000 \
   --keep-recent 6 \
   --max-inline-output 8000 \
@@ -338,11 +338,11 @@ If the provider reports a context-window error, the runtime can force one compac
 Each run writes an append-only JSONL trace under `.mini-oh/traces/<run-id>.jsonl`, covering model requests/responses, streaming deltas, tool lifecycle, permission decisions, resource waits, hooks, compaction, MCP attribution, usage, cost, and final run state. Sensitive fields are redacted by default.
 
 ```bash
-mini-oh trace list
-mini-oh trace show <run-id>
-mini-oh trace replay <run-id>
-mini-oh trace prune --older-than 30          # dry-run
-mini-oh trace prune --max-runs 100 --apply
+wqb trace list
+wqb trace show <run-id>
+wqb trace replay <run-id>
+wqb trace prune --older-than 30          # dry-run
+wqb trace prune --max-runs 100 --apply
 ```
 
 `trace replay` only renders the recorded timeline — it does not call the model or execute tools again.
@@ -350,9 +350,9 @@ mini-oh trace prune --max-runs 100 --apply
 ## Sessions and resume
 
 ```bash
-mini-oh sessions
-mini-oh resume <session-id>
-mini-oh resume --latest
+wqb sessions
+wqb resume <session-id>
+wqb resume --latest
 ```
 
 `continue` is accepted as an alias for `resume`.
@@ -362,7 +362,7 @@ mini-oh resume --latest
 ### MCP
 
 ```bash
-mini-oh --mcp-config examples/mcp.json --workspace . "Inspect available MCP tools."
+wqb --mcp-config examples/mcp.json --workspace . "Inspect available MCP tools."
 ```
 
 Supports stdio and Streamable HTTP transports, input/output schema validation, structured content preservation, conservative `readOnlyHint` handling, and OAuth flows with local token persistence. Remote tools are not implicitly trusted merely because they are reachable.
@@ -378,7 +378,7 @@ skills/
 Only lightweight metadata is exposed initially; the model loads the full skill body through `load_skill` when needed.
 
 ```bash
-mini-oh --skills-dir ./skills --workspace . "Use the available project skills."
+wqb --skills-dir ./skills --workspace . "Use the available project skills."
 ```
 
 ## Sandbox shell (bubblewrap)
@@ -389,7 +389,7 @@ workspace is writable, the rest of the filesystem is read-only, and `/tmp` is a
 fresh temporary directory. The working directory persists across calls.
 
 ```bash
-mini-oh --workspace . "Run the project checks."
+wqb --workspace . "Run the project checks."
 ```
 
 There is no unrestricted fallback: if `bwrap` is not installed, the shell tool
@@ -409,7 +409,7 @@ This is a local development safety boundary, not a malicious multi-tenant sandbo
 - Structured `ToolFailure(code, stage, retryable)` metadata
 
 ```bash
-mini-oh \
+wqb \
   --tool-timeout 20 \
   --max-repeated-tool-batches 2 \
   --max-concurrent-tools 4 \
@@ -436,7 +436,7 @@ mini-harness/
 │   ├── mcp_auth.py            # HTTP MCP OAuth support
 │   ├── sandbox.py             # bwrap-sandboxed host shell
 │   ├── models.py              # messages and tool-call data structures
-│   └── cli.py                 # `mini-oh` command-line interface
+│   └── cli.py                 # `wqb` command-line interface
 ├── tests/                     # runtime and protocol tests
 ├── examples/                  # permissions, hooks, MCP, reviewer demos
 ├── docs/                      # guided code-reading notes

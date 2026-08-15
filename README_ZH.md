@@ -127,19 +127,19 @@ CLI 会从当前目录加载 `.env`，且不覆盖 Shell 里已有的环境变�
 离线演示（无需 API key，走真实运行时路径）：
 
 ```bash
-mini-oh --demo --workspace . "Inspect this project and summarize its architecture."
+wqb --demo --workspace . "Inspect this project and summarize its architecture."
 ```
 
 真实模型运行：
 
 ```bash
-mini-oh --workspace . "Inspect the repository and explain the agent runtime."
+wqb --workspace . "Inspect the repository and explain the agent runtime."
 ```
 
 默认使用 Responses API；Chat Completions 兼容端点：
 
 ```bash
-mini-oh \
+wqb \
   --api-mode chat \
   --base-url https://compatible.example/v1 \
   --workspace . \
@@ -174,7 +174,7 @@ mini-oh \
 ASK 决策会在交互终端向用户确认；没有审批回调时 ASK 一律拒绝（fail closed）。
 
 ```bash
-mini-oh --workspace . "Create docs/design.md"
+wqb --workspace . "Create docs/design.md"
 ```
 
 ### 自动审批（AUTO_REVIEW 模式）
@@ -182,7 +182,7 @@ mini-oh --workspace . "Create docs/design.md"
 `--auto-review` 把 ASK 决策交给一个独立的 reviewer 模型调用，而不是人工：
 
 ```bash
-mini-oh --auto-review --workspace . "Refactor the parser and update the tests."
+wqb --auto-review --workspace . "Refactor the parser and update the tests."
 ```
 
 Reviewer 只会收到工具、效应、path/command、workspace、参数和权限原因，只能对该 ASK 返回 approve/reject。不变量：
@@ -205,7 +205,7 @@ Reviewer 只会收到工具、效应、path/command、workspace、参数和权�
 ```
 
 ```bash
-mini-oh --permission-config examples/permissions.json --workspace . "Update the docs."
+wqb --permission-config examples/permissions.json --workspace . "Update the docs."
 ```
 
 规则模式使用 `fnmatch` 风格匹配；未命中的请求仍会落入运行时默认策略和不可绕过的安全检查。
@@ -287,7 +287,7 @@ ToolDescriptor(
 即使执行乱序完成，工具观察仍按原始调用顺序返回给模型。
 
 ```bash
-mini-oh --max-concurrent-tools 4 --workspace . "Inspect several files."
+wqb --max-concurrent-tools 4 --workspace . "Inspect several files."
 ```
 
 ### 安全编辑
@@ -308,7 +308,7 @@ Hooks 是模型无法关闭的可信运行时扩展。
 stop hook 可以作为验证闸门：如果它阻止完成，输出会作为反馈返回给模型，让模型修复后再次尝试。
 
 ```bash
-mini-oh \
+wqb \
   --hooks-config examples/hooks-verification.json \
   --workspace . \
   "Implement the change and make the tests pass."
@@ -324,7 +324,7 @@ mini-oh \
 - 大型工具输出归档到 `.mini-oh/artifacts/<run-id>/`，对话里只保留头尾预览
 
 ```bash
-mini-oh \
+wqb \
   --context-threshold 12000 \
   --keep-recent 6 \
   --max-inline-output 8000 \
@@ -338,11 +338,11 @@ mini-oh \
 每次运行会在 `.mini-oh/traces/<run-id>.jsonl` 写追加式 JSONL trace，覆盖模型请求/响应、流式增量、工具生命周期、权限决策、资源等待、hooks、压缩、MCP 归因、用量、成本与最终状态。敏感字段默认脱敏。
 
 ```bash
-mini-oh trace list
-mini-oh trace show <run-id>
-mini-oh trace replay <run-id>
-mini-oh trace prune --older-than 30          # 默认 dry-run
-mini-oh trace prune --max-runs 100 --apply
+wqb trace list
+wqb trace show <run-id>
+wqb trace replay <run-id>
+wqb trace prune --older-than 30          # 默认 dry-run
+wqb trace prune --max-runs 100 --apply
 ```
 
 `trace replay` 只渲染记录的时间线——不会再次调用模型或执行工具。
@@ -350,9 +350,9 @@ mini-oh trace prune --max-runs 100 --apply
 ## 会话与恢复
 
 ```bash
-mini-oh sessions
-mini-oh resume <session-id>
-mini-oh resume --latest
+wqb sessions
+wqb resume <session-id>
+wqb resume --latest
 ```
 
 `continue` 是 `resume` 的别名。
@@ -362,7 +362,7 @@ mini-oh resume --latest
 ### MCP
 
 ```bash
-mini-oh --mcp-config examples/mcp.json --workspace . "Inspect available MCP tools."
+wqb --mcp-config examples/mcp.json --workspace . "Inspect available MCP tools."
 ```
 
 支持 stdio 与 Streamable HTTP 传输、输入/输出 schema 校验、结构化内容保留、保守的 `readOnlyHint` 处理，以及带本地 token 持久化的 OAuth 流程。远程工具不会因为“可达”就被隐式信任。
@@ -378,7 +378,7 @@ skills/
 初始只暴露轻量元数据；模型在真正需要时通过 `load_skill` 加载完整内容。
 
 ```bash
-mini-oh --skills-dir ./skills --workspace . "Use the available project skills."
+wqb --skills-dir ./skills --workspace . "Use the available project skills."
 ```
 
 ## 沙箱 Shell（bubblewrap）
@@ -386,7 +386,7 @@ mini-oh --skills-dir ./skills --workspace . "Use the available project skills."
 `sandbox_shell` 在 bubblewrap 沙箱中直接运行宿主 bash。宿主环境（python、pytest、git、node、`.venv`、PATH）开箱可用；只有 workspace 可写，其余文件系统只读，`/tmp` 是全新的临时目录。工作目录跨命令保持。
 
 ```bash
-mini-oh --workspace . "Run the project checks."
+wqb --workspace . "Run the project checks."
 ```
 
 没有无沙箱兜底：如果未安装 `bwrap`，shell 工具直接不可用，而不会在无沙箱状态下运行于宿主。
@@ -405,7 +405,7 @@ mini-oh --workspace . "Run the project checks."
 - 结构化 `ToolFailure(code, stage, retryable)` 元数据
 
 ```bash
-mini-oh \
+wqb \
   --tool-timeout 20 \
   --max-repeated-tool-batches 2 \
   --max-concurrent-tools 4 \
@@ -432,7 +432,7 @@ mini-harness/
 │   ├── mcp_auth.py            # HTTP MCP OAuth 支持
 │   ├── sandbox.py             # bwrap 沙箱宿主 shell
 │   ├── models.py              # 消息与工具调用数据结构
-│   └── cli.py                 # `mini-oh` 命令行入口
+│   └── cli.py                 # `wqb` 命令行入口
 ├── tests/                     # 运行时与协议测试
 ├── examples/                  # permissions、hooks、MCP、reviewer 演示
 ├── docs/                      # 引导式代码阅读笔记

@@ -21,7 +21,7 @@ dependencies = [
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
-mini-oh = "mini_openharness.cli:main"
+wqb = "mini_openharness.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mini_openharness"]

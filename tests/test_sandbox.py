@@ -14,6 +14,7 @@ from mini_openharness.sandbox import (
     SandboxUnavailableError,
     SandboxedShellTool,
 )
+from mini_openharness.tools import ToolContext
 
 
 def make_shell(workspace: Path) -> BwrapShell:
@@ -25,8 +26,13 @@ def make_shell(workspace: Path) -> BwrapShell:
     return BwrapShell(workspace, env=env)
 
 
-async def run(shell: BwrapShell, command: str) -> tuple[str, bool]:
-    result = await shell.run(command=command, timeout=60)
+async def run(
+    shell: BwrapShell,
+    command: str,
+    *,
+    cwd: str | None = None,
+) -> tuple[str, bool]:
+    result = await shell.run(command=command, timeout=60, cwd=cwd)
     return result.output, result.is_error
 
 
@@ -76,15 +82,26 @@ def test_git_status_runs(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
-def test_cwd_persists_across_commands(tmp_path):
+def test_cwd_parameter_sets_working_directory(tmp_path):
     shell = make_shell(tmp_path)
 
-    first, first_error = asyncio.run(run(shell, "mkdir -p subdir && cd subdir"))
+    first, first_error = asyncio.run(run(shell, "mkdir -p subdir", cwd="."))
+    assert not first_error
+    output, is_error = asyncio.run(run(shell, "pwd", cwd="subdir"))
+
+    assert not is_error
+    assert output.strip() == str((tmp_path / "subdir").resolve())
+
+
+def test_cwd_not_persisted_across_commands(tmp_path):
+    shell = make_shell(tmp_path)
+
+    first, first_error = asyncio.run(run(shell, "mkdir -p subdir", cwd="."))
     assert not first_error
     output, is_error = asyncio.run(run(shell, "pwd"))
 
     assert not is_error
-    assert output.strip() == str((tmp_path / "subdir").resolve())
+    assert output.strip() == str(tmp_path.resolve())
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap unavailable")
@@ -120,6 +137,16 @@ def test_bwrap_missing_raises_unavailable(tmp_path, monkeypatch):
 
 def test_sandbox_tool_metadata():
     assert SandboxedShellTool.descriptor.source == "sandbox"
-    assert SandboxedShellTool.descriptor.effect == "write"
-    assert SandboxedShellTool.descriptor.destructive is True
+    assert SandboxedShellTool.descriptor.effect == "compute"
+    assert SandboxedShellTool.descriptor.destructive is False
     assert SandboxedShellTool.parameters["required"] == ["command"]
+
+
+def test_shell_resource_lock_follows_classifier(tmp_path):
+    tool = SandboxedShellTool(BwrapShell(tmp_path))
+    context = ToolContext(tmp_path)
+
+    assert tool.resources({"command": "ls"}, context)[0].mode == "read"
+    assert tool.resources({"command": "cd src && pytest"}, context)[0].mode == "read"
+    assert tool.resources({"command": "pip install requests"}, context)[0].mode == "write"
+    assert tool.resources({"command": "rm -rf /"}, context)[0].mode == "write"

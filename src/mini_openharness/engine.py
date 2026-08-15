@@ -401,9 +401,15 @@ class AgentLoop:
             response_data = {
                 "step": step,
                 "attempt": model_attempt,
+                "model": getattr(self.provider, "model", None),
                 "ttft_ms": round(first_token_ms, 1),
                 "generation_ms": round(generation_ms, 1),
                 "total_ms": round(total_ms, 1),
+                "request_to_first_token_ms": round(first_token_ms, 1),
+                "first_to_last_token_ms": round(generation_ms, 1),
+                "request_total_ms": round(total_ms, 1),
+                "visible_output_chars": len(reply.content),
+                "reported_output_tokens": reply.output_tokens,
                 "input_tokens": reply.input_tokens,
                 "output_tokens": reply.output_tokens,
             }

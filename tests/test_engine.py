@@ -796,6 +796,10 @@ def test_model_ttft_and_response_events_are_tracked(tmp_path):
     end = next(event for event in events if event.kind == "model_response_end")
     assert end.data["ttft_ms"] >= 0
     assert end.data["generation_ms"] >= 0
+    assert end.data["request_to_first_token_ms"] == end.data["ttft_ms"]
+    assert end.data["request_total_ms"] == end.data["total_ms"]
+    assert end.data["visible_output_chars"] == 5
+    assert end.data["reported_output_tokens"] == 5
     assert end.data["input_tokens"] == 10
     assert end.data["output_tokens"] == 5
 

@@ -9,6 +9,7 @@ import os
 import signal
 import shutil
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -73,13 +74,13 @@ _THINKING_LINE_OPEN = False
 def _print_resume_hint() -> None:
     if _ACTIVE_SESSION is not None:
         print(
-            f"Resume this session with: mini-oh resume {_ACTIVE_SESSION.session_id}",
+            f"Resume this session with: wqb resume {_ACTIVE_SESSION.session_id}",
             file=sys.stderr,
         )
 
 
 def build_run_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mini-oh", description="A tiny coding-agent harness")
+    parser = argparse.ArgumentParser(prog="wqb", description="A tiny coding-agent harness")
     parser.add_argument("prompt", nargs="?", help="Task for the coding agent")
     _add_agent_arguments(parser)
     return parser
@@ -144,7 +145,7 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_trace_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mini-oh trace", description="Inspect run traces")
+    parser = argparse.ArgumentParser(prog="wqb trace", description="Inspect run traces")
     parser.add_argument("action", choices=("list", "show", "replay", "prune"))
     parser.add_argument("run_id", nargs="?")
     parser.add_argument("--trace-dir", default=".mini-oh/traces")
@@ -162,7 +163,7 @@ def build_trace_parser() -> argparse.ArgumentParser:
 
 
 def build_sessions_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mini-oh sessions", description="List conversation sessions")
+    parser = argparse.ArgumentParser(prog="wqb sessions", description="List conversation sessions")
     parser.add_argument("--session-dir", help="JSONL conversation session directory")
     parser.add_argument("--json", action="store_true")
     return parser
@@ -170,7 +171,7 @@ def build_sessions_parser() -> argparse.ArgumentParser:
 
 def build_resume_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="mini-oh resume", description="Resume an interrupted conversation session"
+        prog="wqb resume", description="Resume an interrupted conversation session"
     )
     parser.add_argument("session_id", nargs="?", help="Session id; defaults to the most recent")
     parser.add_argument("--latest", action="store_true", help="Resume the most recent session")
@@ -187,11 +188,14 @@ async def _run(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     prompt = args.prompt
     session_log = None
+    session_init_ms = 0.0
     if not args.no_session:
+        session_started = time.perf_counter()
         session_log = SessionLog(
             _session_dir(args),
             metadata={"first_prompt": prompt, "workspace": str(workspace)},
         )
+        session_init_ms = (time.perf_counter() - session_started) * 1000
         global _ACTIVE_SESSION
         _ACTIVE_SESSION = session_log
     return await _drive_session(
@@ -200,6 +204,7 @@ async def _run(args: argparse.Namespace) -> int:
         messages=None,
         trace_prompt=prompt,
         run_events=lambda loop: loop.run(prompt),
+        session_init_ms=session_init_ms,
     )
 
 
@@ -207,11 +212,14 @@ async def _interactive(args: argparse.Namespace) -> int:
     """Continuous REPL: one runtime / AgentLoop / Session for many prompts."""
     workspace = Path(args.workspace).resolve()
     session_log = None
+    session_init_ms = 0.0
     if not args.no_session:
+        session_started = time.perf_counter()
         session_log = SessionLog(
             _session_dir(args),
             metadata={"first_prompt": "(interactive)", "interactive": True},
         )
+        session_init_ms = (time.perf_counter() - session_started) * 1000
         global _ACTIVE_SESSION
         _ACTIVE_SESSION = session_log
 
@@ -225,8 +233,22 @@ async def _interactive(args: argparse.Namespace) -> int:
             session_log=session_log,
             trace_prompt="(interactive session)",
         )
+        if tracer is not None:
+            tracer.emit(
+                "runtime_init",
+                {"phase": "session_init", "elapsed_ms": round(session_init_ms, 1)},
+            )
         if mcp_manager:
+            mcp_started = time.perf_counter()
             registered = await mcp_manager.connect_and_register(loop.tools)
+            if tracer is not None:
+                tracer.emit(
+                    "runtime_init",
+                    {
+                        "phase": "mcp_connect",
+                        "elapsed_ms": round((time.perf_counter() - mcp_started) * 1000, 1),
+                    },
+                )
             print(f"connected MCP tools: {', '.join(registered) or '(none)'}")
 
         print("mini-openharness")
@@ -380,8 +402,9 @@ async def _resume_command(args: argparse.Namespace) -> int:
     latest = store.latest()
     session_id = args.session_id or (latest.session_id if latest else None)
     if not session_id:
-        print("no sessions found; run `mini-oh` with a prompt first", file=sys.stderr)
+        print("no sessions found; run `wqb` with a prompt first", file=sys.stderr)
         return 1
+    session_started = time.perf_counter()
     try:
         record = store.read(session_id)
     except (FileNotFoundError, ValueError) as exc:
@@ -395,6 +418,7 @@ async def _resume_command(args: argparse.Namespace) -> int:
     if interruption == Interruption.DANGLING_TOOL_CALLS:
         messages = strip_dangling_tool_calls(messages)
     session_log = SessionLog.open_existing(_session_dir(args), session_id)
+    session_init_ms = (time.perf_counter() - session_started) * 1000
     global _ACTIVE_SESSION
     _ACTIVE_SESSION = session_log
     first_prompt = str(record.meta.get("first_prompt", ""))
@@ -405,6 +429,7 @@ async def _resume_command(args: argparse.Namespace) -> int:
         messages=messages,
         trace_prompt=first_prompt or "(resumed session)",
         run_events=lambda loop: loop.resume(),
+        session_init_ms=session_init_ms,
     )
 
 
@@ -415,6 +440,7 @@ async def _drive_session(
     messages: list[Message] | None,
     trace_prompt: str,
     run_events: Any,
+    session_init_ms: float | None = None,
 ) -> int:
     global _ACTIVE_SESSION
     loop = None
@@ -429,8 +455,22 @@ async def _drive_session(
             messages=messages,
             trace_prompt=trace_prompt,
         )
+        if tracer is not None and session_init_ms is not None:
+            tracer.emit(
+                "runtime_init",
+                {"phase": "session_init", "elapsed_ms": round(session_init_ms, 1)},
+            )
         if mcp_manager:
+            mcp_started = time.perf_counter()
             registered = await mcp_manager.connect_and_register(loop.tools)
+            if tracer is not None:
+                tracer.emit(
+                    "runtime_init",
+                    {
+                        "phase": "mcp_connect",
+                        "elapsed_ms": round((time.perf_counter() - mcp_started) * 1000, 1),
+                    },
+                )
             print(f"connected MCP tools: {', '.join(registered) or '(none)'}")
         exit_code = await _consume_events(loop, run_events(loop), args)
     except MaxStepsExceeded as exc:
@@ -480,6 +520,34 @@ async def _build_runtime(
     trace_prompt: str,
 ) -> tuple[AgentLoop, TraceWriter | None, McpManager | None, Any]:
     workspace = Path(args.workspace).resolve()
+    trace_dir = Path(args.trace_dir or workspace / ".mini-oh" / "traces")
+    provider_name = "demo" if args.demo else f"openai-{args.api_mode}"
+    tracer = None
+    if not args.no_trace:
+        tracer = TraceWriter(
+            trace_dir,
+            redact_secrets=not args.unsafe_trace_secrets,
+            strict=args.strict_trace,
+            metadata={
+                "prompt": trace_prompt,
+                "workspace": str(workspace),
+                "provider": provider_name,
+                "model": args.model if not args.demo else "demo",
+            },
+        )
+
+    phase_started = time.perf_counter()
+
+    def phase(name: str) -> None:
+        nonlocal phase_started
+        elapsed_ms = (time.perf_counter() - phase_started) * 1000
+        if tracer is not None:
+            tracer.emit(
+                "runtime_init",
+                {"phase": name, "elapsed_ms": round(elapsed_ms, 1)},
+            )
+        phase_started = time.perf_counter()
+
     skills = SkillCatalog(args.skills_dir or workspace / "skills")
     system_parts = [
         (
@@ -497,6 +565,19 @@ async def _build_runtime(
             "- If verification is impossible in this environment, say so explicitly "
             "instead of claiming success.\n"
             "- Use workspace-relative paths (e.g. src/app.py), not absolute paths.\n"
+            "\n"
+            "EFFICIENCY\n"
+            "- Minimize tool calls and model turns. Do not inspect files or repository "
+            "history unless needed for the current task.\n"
+            "- When the target directory is known, start there. Do not inspect sibling "
+            "projects, archives, or root documentation without a concrete need.\n"
+            "- After a command fails, diagnose the exact error and make the smallest "
+            "corrective action. Do not issue multiple exploratory commands for a "
+            "straightforward failure.\n"
+            "\n"
+            "VERIFICATION\n"
+            "- Run the minimum verification necessary. Do not repeat equivalent tests "
+            "after they already pass.\n"
             "\n"
             "TOOLS\n"
             "- read_file / list_dir / find_files / write_file / edit_file: workspace "
@@ -527,10 +608,10 @@ async def _build_runtime(
     skill_prompt = skills.prompt()
     if skill_prompt:
         system_parts.append(skill_prompt)
+    phase("skills")
 
     if args.demo:
         provider = DemoProvider()
-        provider_name = "demo"
     else:
         if not args.api_key:
             raise SystemExit("OPENAI_API_KEY is required unless --demo is used")
@@ -544,22 +625,7 @@ async def _build_runtime(
             timeout=args.timeout,
             max_retries=args.max_retries,
         )
-        provider_name = f"openai-{args.api_mode}"
-
-    trace_dir = Path(args.trace_dir or workspace / ".mini-oh" / "traces")
-    tracer = None
-    if not args.no_trace:
-        tracer = TraceWriter(
-            trace_dir,
-            redact_secrets=not args.unsafe_trace_secrets,
-            strict=args.strict_trace,
-            metadata={
-                "prompt": trace_prompt,
-                "workspace": str(workspace),
-                "provider": provider_name,
-                "model": args.model if not args.demo else "demo",
-            },
-        )
+    phase("provider")
 
     tools = default_tools()
     if args.sandbox_shell:
@@ -580,7 +646,9 @@ async def _build_runtime(
             parent_session=session_log,
         )
     )
+    phase("tools")
     mcp_manager = McpManager.from_file(args.mcp_config) if args.mcp_config else None
+    phase("mcp_config")
     permission_engine = PermissionEngine(_permission_context(args))
     hooks = load_hook_registry(args.hooks_config) if args.hooks_config else None
     if args.auto_review:
@@ -613,6 +681,7 @@ async def _build_runtime(
         messages=messages,
         session=session_log,
     )
+    phase("loop")
     return loop, tracer, mcp_manager, provider
 
 
@@ -706,8 +775,16 @@ def _build_reviewer(args: argparse.Namespace, provider):
         text = (reply.content or "").strip().lower()
         parsed = "approve" if text.startswith("approve") else "reject"
         target = request.path or request.command or ""
-        detail = f" {target}" if target else ""
-        print(f"⚖ reviewer: {parsed} — {request.tool_name}{detail} ({decision.reason})")
+        if request.tool_name == "sandbox_shell":
+            suffix = f"shell {target}"
+        else:
+            suffix = f"{request.tool_name} {target}"
+        if parsed == "reject":
+            suffix = f"{suffix} ({decision.reason})"
+        suffix = suffix.replace("\n", " ")
+        if len(suffix) > 80:
+            suffix = suffix[:80] + "…"
+        print(f"⚖ reviewer: {parsed} — {suffix}")
         return parsed == "approve"
 
     return review
@@ -770,14 +847,6 @@ def _print_event(event: AgentEvent) -> None:
         if _THINKING_LINE_OPEN:
             _THINKING_LINE_OPEN = False
             print()
-        data = event.data
-        print(
-            "Model:\n"
-            f"  TTFT:           {data.get('ttft_ms', 0):>10.0f} ms\n"
-            f"  generation:     {data.get('generation_ms', 0):>10.0f} ms\n"
-            f"  input_tokens:   {data.get('input_tokens', 0):>10d}\n"
-            f"  output_tokens:  {data.get('output_tokens', 0):>10d}"
-        )
     elif event.kind == "assistant_delta":
         print(event.message, end="", flush=True)
     elif event.kind == "assistant":
@@ -794,8 +863,11 @@ def _print_event(event: AgentEvent) -> None:
         print(f"→ {_tool_start_summary(event)}")
     elif event.kind == "tool_end":
         marker = "✗" if event.data["is_error"] else "✓"
+        display_name = (
+            "shell" if event.data["name"] == "sandbox_shell" else event.data["name"]
+        )
         print(
-            f"{marker} {event.data['name']} ({event.data['elapsed_ms']}ms): "
+            f"{marker} {display_name} ({event.data['elapsed_ms']}ms): "
             f"{_tool_end_summary(event)}"
         )
     elif event.kind == "compact":
@@ -860,10 +932,12 @@ def _tool_start_summary(event: AgentEvent) -> str:
         return f"{name} {detail}"
     if name == "sandbox_shell":
         command = tool_input.get("command")
-        preview = command if isinstance(command, str) else str(command)
+        preview = (command if isinstance(command, str) else str(command)).replace(
+            "\n", " "
+        )
         if len(preview) > 80:
             preview = preview[:80] + "…"
-        return f"{name} {preview}"
+        return f"shell {preview}"
     return f"{name} {tool_input}"
 
 

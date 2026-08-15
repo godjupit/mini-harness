@@ -31,7 +31,7 @@ from mini_openharness.tools import default_tools
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_TASK = (
-    "我想给这个项目增加一个 'mini-oh doctor' 命令，用来检查运行环境是否就绪"
+    "我想给这个项目增加一个 'wqb doctor' 命令，用来检查运行环境是否就绪"
     "（API key、Docker、MCP 配置等）。"
     "请先调查清楚现有的 CLI 子命令结构和运行时是怎么构建的，"
     "然后给我一份具体到文件的实施方案。"

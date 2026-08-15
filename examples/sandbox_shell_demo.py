@@ -25,13 +25,18 @@ from mini_openharness.permissions import (
 from mini_openharness.sandbox import BwrapShell, SandboxUnavailableError
 
 
-async def run(shell: BwrapShell, command: str, label: str) -> None:
-    result = await shell.run(command=command, timeout=60)
+async def run(
+    shell: BwrapShell,
+    command: str,
+    label: str,
+    *,
+    cwd: str | None = None,
+) -> None:
+    result = await shell.run(command=command, timeout=60, cwd=cwd)
     marker = "✓" if not result.is_error else "✗"
     print(f"{marker} {label}")
     print(f"    command: {command!r}")
     print(f"    output:  {result.output[:200]!r}")
-    print(f"    cwd now: {shell.context.cwd}")
     print()
 
 
@@ -92,13 +97,14 @@ def main() -> int:
         await run(shell, ".venv/bin/python --version", "workspace .venv python")
         await run(shell, "git status", "host git")
 
-        print("=== cwd 跨命令保持 ===")
-        await run(shell, "mkdir -p subdir && cd subdir", "cd into subdir")
-        await run(shell, "pwd", "pwd after cd")
+        print("=== cwd 参数（不隐式持久化） ===")
+        await run(shell, "mkdir -p subdir", "create subdir")
+        await run(shell, "pwd", "pwd from root")
+        await run(shell, "pwd", "pwd with cwd=subdir", cwd="subdir")
 
         print("=== 文件系统边界 ===")
-        await run(shell, "echo hi > f.txt", "write inside workspace")
-        written = shell.context.cwd / "f.txt"
+        await run(shell, "echo hi > f.txt", "write inside workspace", cwd="subdir")
+        written = workspace / "subdir" / "f.txt"
         print(f"    {written} = {written.read_text(encoding='utf-8').strip()!r}")
         print()
         await run(shell, "touch /etc/mini-oh-demo", "write to /etc (should fail)")

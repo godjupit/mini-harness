@@ -198,7 +198,56 @@ def test_reviewer_prompt_includes_request_details(tmp_path, capsys):
     assert f"workspace: {tmp_path.resolve()}" in prompt
     assert "effect: write" in prompt
     assert "reason: needs review" in prompt
-    assert "⚖ reviewer: approve — sandbox_shell npm publish (needs review)" in capsys.readouterr().out
+    assert "⚖ reviewer: approve — shell npm publish" in capsys.readouterr().out
+
+
+def test_reviewer_verdict_line_truncates_long_commands(tmp_path, capsys):
+    args = build_run_parser().parse_args(["--workspace", str(tmp_path)])
+
+    class FakeProvider:
+        async def complete(self, messages, tools):
+            del messages, tools
+            return SimpleNamespace(content="approve")
+
+    reviewer = cli._build_reviewer(args, FakeProvider())
+    long_command = "python - <<'EOF'\n" + "x" * 500 + "\nEOF"
+    request = PermissionRequest(
+        tool_name="sandbox_shell",
+        input={"command": long_command},
+        command=long_command,
+        effect="write",
+    )
+    decision = PermissionDecision(PermissionBehavior.ASK, "needs review")
+
+    asyncio.run(reviewer(request, decision))
+
+    out = capsys.readouterr().out
+    assert "…" in out
+    assert out.count("\n") == 1  # 只有结尾换行，命令本身不换行
+    assert "x" * 500 not in out
+
+
+def test_reviewer_reject_line_includes_reason(tmp_path, capsys):
+    args = build_run_parser().parse_args(["--workspace", str(tmp_path)])
+
+    class FakeProvider:
+        async def complete(self, messages, tools):
+            del messages, tools
+            return SimpleNamespace(content="reject")
+
+    reviewer = cli._build_reviewer(args, FakeProvider())
+    request = PermissionRequest(
+        tool_name="sandbox_shell",
+        input={"command": "git push"},
+        command="git push",
+        effect="write",
+    )
+    decision = PermissionDecision(PermissionBehavior.ASK, "subcommand is not routine-safe")
+
+    asyncio.run(reviewer(request, decision))
+
+    out = capsys.readouterr().out
+    assert "⚖ reviewer: reject — shell git push (subcommand is not routine-safe)" in out
 
 
 def test_single_shot_with_prompt_does_not_enter_repl(tmp_path, capsys):

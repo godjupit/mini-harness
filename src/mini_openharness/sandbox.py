@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mini_openharness.permissions.safety import check_shell_safety
+from mini_openharness.permissions.types import PermissionBehavior
 from mini_openharness.tools import ResourceAccess, ToolContext, ToolDescriptor, ToolResult
 
 
@@ -18,21 +20,18 @@ class SandboxUnavailableError(RuntimeError):
 
 @dataclass
 class ShellContext:
-    """Session-scoped shell state shared across tool calls."""
+    """Session-scoped shell state: env is shared, cwd is not persisted."""
 
-    cwd: Path
     env: dict[str, str]
 
 
 class BwrapShell:
     """Run host bash inside bubblewrap; workspace writable, rest read-only.
 
-    Every command is a fresh bash process, but they share one ShellContext, so
-    ``cd`` persists and the host environment (python, .venv, git, PATH) is
-    reused directly.
+    Every command is a fresh bash process starting at the workspace root unless
+    an explicit ``cwd`` is given. The host environment (python, .venv, git,
+    PATH) is shared through ShellContext.
     """
-
-    _PWD_MARKER = "__MINI_OH_PWD__="
 
     def __init__(
         self,
@@ -40,10 +39,7 @@ class BwrapShell:
         env: dict[str, str] | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
-        self.context = ShellContext(
-            cwd=self.workspace,
-            env=dict(os.environ if env is None else env),
-        )
+        self.context = ShellContext(env=dict(os.environ if env is None else env))
         self.bwrap = shutil.which("bwrap")
 
     def ensure_available(self) -> None:
@@ -53,13 +49,17 @@ class BwrapShell:
                 "install it (e.g. apt install bubblewrap) and retry"
             )
 
-    def _argv(self, command: str) -> list[str]:
-        wrapped = (
-            f"{command}\n"
-            "__mini_oh_rc=$?\n"
-            "printf '\\n__MINI_OH_PWD__=%s\\n' \"$PWD\"\n"
-            "exit $__mini_oh_rc\n"
-        )
+    def _resolve_cwd(self, cwd: str | Path | None) -> Path:
+        if cwd is None:
+            return self.workspace
+        target = (self.workspace / cwd).resolve()
+        try:
+            target.relative_to(self.workspace)
+        except ValueError as exc:
+            raise ValueError(f"cwd escapes workspace: {cwd}") from exc
+        return target
+
+    def _argv(self, command: str, cwd: Path) -> list[str]:
         workspace = str(self.workspace)
         return [
             self.bwrap,
@@ -78,16 +78,23 @@ class BwrapShell:
             "/proc",
             "--die-with-parent",
             "--chdir",
-            str(self.context.cwd),
+            str(cwd),
             "/bin/bash",
             "-lc",
-            wrapped,
+            command,
         ]
 
-    async def run(self, *, command: str, timeout: float) -> ToolResult:
+    async def run(
+        self,
+        *,
+        command: str,
+        timeout: float,
+        cwd: str | Path | None = None,
+    ) -> ToolResult:
         self.ensure_available()
+        cwd_path = self._resolve_cwd(cwd)
         process = await asyncio.create_subprocess_exec(
-            *self._argv(command),
+            *self._argv(command, cwd_path),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -106,9 +113,6 @@ class BwrapShell:
             await _stop_process(process)
             raise
         text = output.decode("utf-8", errors="replace").replace("\r\n", "\n")
-        text, pwd = self._extract_pwd(text)
-        if pwd:
-            self.context.cwd = Path(pwd)
         if len(text) > 12_000:
             text = text[:12_000] + "\n...[truncated]..."
         return ToolResult(
@@ -116,16 +120,6 @@ class BwrapShell:
             is_error=process.returncode != 0,
             metadata={"returncode": process.returncode, "sandbox": "bwrap"},
         )
-
-    def _extract_pwd(self, text: str) -> tuple[str, str | None]:
-        marker = self._PWD_MARKER
-        lines = text.splitlines()
-        for index, line in enumerate(lines):
-            if line.startswith(marker):
-                pwd = line[len(marker) :].strip()
-                del lines[index]
-                return "\n".join(lines).strip(), pwd or None
-        return text, None
 
 
 class SandboxedShellTool:
@@ -135,20 +129,24 @@ class SandboxedShellTool:
         "The host environment (python, pytest, git, node, .venv, PATH) is "
         "available directly; only the workspace is writable, the rest of the "
         "filesystem is read-only, and /tmp is a fresh temporary directory. "
-        "Each command is a new bash process but the working directory persists "
-        "across calls. Use workspace-relative paths (e.g. 123/cli.py)."
+        "Each command starts at the workspace root; pass cwd to run elsewhere "
+        "(e.g. cwd='123'). The working directory is never persisted across "
+        "calls. Use workspace-relative paths (e.g. 123/cli.py)."
     )
     read_only = False
     descriptor = ToolDescriptor(
         source="sandbox",
-        effect="write",
-        destructive=True,
+        # shell 能读写任意东西，但具体安全由 per-command classifier 决定，
+        # 不再用静态 write+destructive 标记全部 shell 调用。
+        effect="compute",
+        destructive=False,
         command_argument="command",
     )
     parameters = {
         "type": "object",
         "properties": {
             "command": {"type": "string", "minLength": 1},
+            "cwd": {"type": "string", "default": "."},
             "timeout_seconds": {
                 "type": "number",
                 "minimum": 1,
@@ -164,9 +162,15 @@ class SandboxedShellTool:
         self.shell = shell
 
     def resources(self, arguments: dict[str, Any], context: ToolContext):
-        del arguments
+        command = str(arguments.get("command", ""))
+        result = check_shell_safety(command, context.workspace)
+        mode = (
+            "read"
+            if result.safe and result.behavior == PermissionBehavior.ALLOW
+            else "write"
+        )
         return (
-            ResourceAccess(f"fs:{context.workspace.resolve()}", "write", tree=True),
+            ResourceAccess(f"fs:{context.workspace.resolve()}", mode, tree=True),
         )
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -177,6 +181,7 @@ class SandboxedShellTool:
         return await self.shell.run(
             command=str(arguments["command"]),
             timeout=timeout,
+            cwd=arguments.get("cwd"),
         )
 
 

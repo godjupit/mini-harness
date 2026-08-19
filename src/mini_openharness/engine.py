@@ -897,6 +897,14 @@ class AgentLoop:
         self._conversation.messages = result.messages
         self._conversation.input_tokens += result.summary_input_tokens
         self._conversation.output_tokens += result.summary_output_tokens
+        if self.session is not None:
+            self.session.append_compaction(
+                summary=result.summary_text,
+                replaced_messages=result.summarized_messages,
+                before_tokens=result.before_tokens,
+                after_tokens=result.after_tokens,
+                summary_source=result.summary_source,
+            )
         data = {
             "before_tokens": result.before_tokens,
             "after_tokens": result.after_tokens,

@@ -249,8 +249,11 @@ agents.register(
 | `read_file` | 读取 workspace 内的 UTF-8 文本文件 |
 | `list_dir` | 列出目录内的条目（单层，目录以 `/` 结尾） |
 | `find_files` | 按文件名模式递归搜索（`cli.py`、`*.py`） |
+| `grep` | 用正则搜索文件内容，返回 `file:line: text` 匹配 |
 | `write_file` | 写入 UTF-8 文本文件 |
 | `edit_file` | 带快照校验的就地编辑 |
+| `memory_write` | 保存长期记忆到 `memdir/` 下的主题文件，并维护 `memdir/MEMORY.md` 索引 |
+| `memory_read` | 按需读取 `memdir/` 下的主题记忆文件（Just-in-Time Memory） |
 
 运行时注册的工具：
 
@@ -318,15 +321,19 @@ wqb \
 
 ## 上下文压缩与归档
 
-- 模型调用前估算上下文大小；超过阈值后，较旧的会话单元被交接摘要替换，近期单元保持原样
+- 模型调用前估算上下文大小；安装了 tiktoken（`pip install -e '.[tiktoken]'`）时使用真实 token 计数，否则退回字符估算；配置了 `--context-window` 时，达到窗口的 70% 即开始压缩，否则使用 `--context-threshold`
 - 工具回合按原子单元处理，压缩不会产生悬空的协议状态
+- 近期消息按 token 预算保留：从最新单元向前扫描，累计约 12000 tokens（`--keep-recent-tokens`），并至少保留一个完整工具回合
 - 正常路径用配置的模型做一次无工具摘要请求；失败时回退到确定性摘要
+- 压缩结果持久化到 session（`compaction` 记录），`resume` 直接恢复压缩后的上下文，不再重放全部历史
 - 大型工具输出归档到 `.mini-oh/artifacts/<run-id>/`，对话里只保留头尾预览
 
 ```bash
 wqb \
   --context-threshold 12000 \
-  --keep-recent 6 \
+  --context-window 200000 \
+  --keep-recent 1 \
+  --keep-recent-tokens 12000 \
   --max-inline-output 8000 \
   "Work through a long repository task."
 ```

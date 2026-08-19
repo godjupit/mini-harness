@@ -74,6 +74,77 @@ def test_session_log_round_trips_user_assistant_and_tool_messages(tmp_path):
     assert record.messages[2].name == "list_files"
 
 
+def test_compaction_record_rebuilds_compacted_context_on_read(tmp_path):
+    log = SessionLog(tmp_path, session_id="compact")
+    log.append_message(Message("system", "system"))
+    log.append_message(Message("user", "old request 1"))
+    log.append_message(Message("assistant", "old answer 1"))
+    log.append_message(Message("user", "recent request"))
+    log.append_compaction(
+        summary="[Compacted conversation summary]\nold work summarized",
+        replaced_messages=2,
+        before_tokens=100,
+        after_tokens=20,
+        summary_source="model",
+    )
+
+    record = SessionStore(tmp_path).read("compact")
+
+    assert [message.role for message in record.messages] == ["system", "system", "user"]
+    assert record.messages[1].content == "[Compacted conversation summary]\nold work summarized"
+    assert record.messages[-1].content == "recent request"
+
+
+def test_multiple_compactions_apply_in_sequence(tmp_path):
+    log = SessionLog(tmp_path, session_id="multi")
+    log.append_message(Message("system", "system"))
+    for index in range(4):
+        log.append_message(Message("user", f"request {index}"))
+        log.append_message(Message("assistant", f"answer {index}"))
+    log.append_compaction(
+        summary="summary one",
+        replaced_messages=6,
+        before_tokens=10,
+        after_tokens=1,
+        summary_source="model",
+    )
+    log.append_message(Message("user", "new request"))
+    log.append_message(Message("assistant", "new answer"))
+    log.append_compaction(
+        summary="summary two",
+        replaced_messages=3,
+        before_tokens=10,
+        after_tokens=1,
+        summary_source="model",
+    )
+
+    record = SessionStore(tmp_path).read("multi")
+
+    assert [message.content for message in record.messages] == [
+        "system",
+        "summary two",
+        "new request",
+        "new answer",
+    ]
+
+
+def test_compaction_record_with_bad_replaced_count_is_tolerated(tmp_path):
+    log = SessionLog(tmp_path, session_id="bad")
+    log.append_message(Message("system", "system"))
+    log.append_message(Message("user", "only"))
+    log.append_compaction(
+        summary="s",
+        replaced_messages=999,
+        before_tokens=1,
+        after_tokens=1,
+        summary_source="model",
+    )
+
+    record = SessionStore(tmp_path).read("bad")
+
+    assert [message.role for message in record.messages] == ["system", "system"]
+
+
 def test_session_store_tolerates_trailing_half_line(tmp_path):
     log = SessionLog(tmp_path, session_id="abc")
     log.append_message(Message("user", "hello"))

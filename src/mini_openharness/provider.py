@@ -10,6 +10,7 @@ from typing import Any, AsyncIterator, Protocol
 import httpx
 
 from mini_openharness.models import Message, ModelReply, ToolCall
+from mini_openharness.tokens import HeuristicCounter, TokenCounter
 
 
 class ProviderError(RuntimeError):
@@ -128,9 +129,13 @@ class OpenAICompatibleProvider:
         timeout: float = 120.0,
         max_retries: int = 3,
         retry_base_delay: float = 0.5,
+        context_window_tokens: int | None = None,
+        token_counter: TokenCounter | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.model = model
+        self.context_window_tokens = context_window_tokens
+        self.token_counter = token_counter or HeuristicCounter()
         self.max_retries = max(0, max_retries)
         self.retry_base_delay = max(0.0, retry_base_delay)
         self._client = httpx.AsyncClient(
@@ -139,6 +144,9 @@ class OpenAICompatibleProvider:
             timeout=timeout,
             transport=transport,
         )
+
+    def count_tokens(self, text: str) -> int:
+        return self.token_counter.count_tokens(text)
 
     async def stream(
         self,
@@ -595,6 +603,8 @@ def _to_responses_items(messages: list[Message]) -> list[dict[str, Any]]:
 
 class DemoProvider:
     """Deterministic provider that proves the full loop without an API key."""
+
+    context_window_tokens = None
 
     async def complete(self, messages: list[Message], tools: list[dict[str, Any]]) -> ModelReply:
         tool_names = {tool["name"] for tool in tools}

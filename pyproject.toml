@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5"]
+tiktoken = ["tiktoken>=0.7"]
 
 [project.scripts]
 wqb = "mini_openharness.cli:main"

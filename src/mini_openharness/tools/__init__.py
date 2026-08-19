@@ -16,6 +16,7 @@ from mini_openharness.tools.edit_file import EditFileTool
 from mini_openharness.tools.find_files import FindFilesTool
 from mini_openharness.tools.grep import GrepTool
 from mini_openharness.tools.list_dir import ListDirTool
+from mini_openharness.tools.memory import MEMORY_TYPES, MemoryReadTool, MemoryWriteTool
 from mini_openharness.tools.read_file import (
     DEFAULT_READ_LINES,
     FULL_READ_MAX_LINES,
@@ -32,6 +33,8 @@ def default_tools() -> ToolRegistry:
     registry.register(GrepTool())
     registry.register(WriteFileTool())
     registry.register(EditFileTool())
+    registry.register(MemoryWriteTool())
+    registry.register(MemoryReadTool())
     return registry
 
 
@@ -43,6 +46,9 @@ __all__ = [
     "FULL_READ_MAX_LINES",
     "GrepTool",
     "ListDirTool",
+    "MEMORY_TYPES",
+    "MemoryReadTool",
+    "MemoryWriteTool",
     "DEFAULT_READ_LINES",
     "ReadFileTool",
     "ResourceAccess",

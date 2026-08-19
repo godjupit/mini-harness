@@ -137,6 +137,30 @@ class SessionLog:
             ).encode("utf-8")
         )
 
+    def append_compaction(
+        self,
+        *,
+        summary: str,
+        replaced_messages: int,
+        before_tokens: int,
+        after_tokens: int,
+        summary_source: str,
+    ) -> None:
+        """Persist a context compaction so resume reconstructs the same state."""
+        self._append_line(
+            json.dumps(
+                {
+                    "type": "compaction",
+                    "summary": summary,
+                    "replaced": replaced_messages,
+                    "before_tokens": before_tokens,
+                    "after_tokens": after_tokens,
+                    "summary_source": summary_source,
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+
     def _append_line(self, line: bytes) -> None:
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(self.path, flags, 0o600)
@@ -221,6 +245,13 @@ class SessionStore:
                         messages.append(Message.from_dict(payload.get("message", {})))
                     except (KeyError, TypeError):
                         continue
+                elif payload.get("type") == "compaction":
+                    summary = str(payload.get("summary") or "")
+                    try:
+                        replaced = int(payload.get("replaced", 0))
+                    except (TypeError, ValueError):
+                        replaced = 0
+                    _apply_compaction(messages, summary, replaced)
         return meta, messages
 
 
@@ -240,3 +271,17 @@ def _session_path(root: Path, session_id: str) -> Path:
     if not session_id or not session_id.replace("-", "").replace("_", "").isalnum():
         raise ValueError("session id may contain only letters, digits, '-' and '_'")
     return root / f"{session_id}.jsonl"
+
+
+def _apply_compaction(messages: list[Message], summary: str, replaced: int) -> None:
+    """Replace the oldest ``replaced`` body messages with a summary system message."""
+    if replaced <= 0 or not summary:
+        return
+    if messages and messages[0].role == "system":
+        head, body = messages[:1], messages[1:]
+    else:
+        head, body = [], list(messages)
+    replaced = min(replaced, len(body))
+    if replaced <= 0:
+        return
+    messages[:] = head + [Message("system", summary)] + body[replaced:]

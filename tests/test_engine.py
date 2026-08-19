@@ -27,6 +27,7 @@ from mini_openharness.provider import (
     ProviderToolCallStart,
 )
 from mini_openharness.compaction import ArtifactStore, ContextCompactor
+from mini_openharness.session import SessionLog, SessionStore
 from mini_openharness.tools import (
     ResourceAccess,
     ToolDescriptor,
@@ -950,7 +951,11 @@ def test_context_error_forces_one_compaction_and_retries_same_model_step(tmp_pat
         tools=default_tools(),
         workspace=tmp_path,
         messages=history,
-        compactor=ContextCompactor(threshold_tokens=1_000_000, keep_recent_units=2),
+        compactor=ContextCompactor(
+            threshold_tokens=1_000_000,
+            keep_recent_units=2,
+            keep_recent_tokens=10,
+        ),
         tracer=tracer,
     )
 
@@ -964,6 +969,47 @@ def test_context_error_forces_one_compaction_and_retries_same_model_step(tmp_pat
     assert done.data["steps"] == 1
     trace = list(TraceStore(tmp_path / "traces").read("reactive-compact"))
     assert any(event.kind == "context_retry" for event in trace)
+
+
+def test_compaction_persists_to_session_and_resume_reconstructs(tmp_path):
+    class SummaryProvider:
+        async def complete(self, messages, tools):
+            if not tools:
+                return ModelReply(content="old context summarized: parser work")
+            return ModelReply(content="done")
+
+    history = [Message("system", "system")]
+    for index in range(8):
+        history.extend(
+            [
+                Message("user", f"old request {index} " + "x" * 400),
+                Message("assistant", "old answer"),
+            ]
+        )
+    provider = SummaryProvider()
+    loop = AgentLoop(
+        provider=provider,
+        tools=default_tools(),
+        workspace=tmp_path,
+        messages=history,
+        session=SessionLog(tmp_path / "sessions", session_id="sess"),
+        compactor=ContextCompactor(
+            threshold_tokens=1,
+            keep_recent_units=2,
+            keep_recent_tokens=10,
+        ),
+        max_steps=1,
+    )
+
+    events = collect(loop, "continue")
+
+    compact = next(event for event in events if event.kind == "compact")
+    assert compact.data["summary_source"] == "model"
+    record = SessionStore(tmp_path / "sessions").read("sess")
+    assert any(
+        message.role == "system" and "old context summarized" in message.content
+        for message in record.messages
+    )
 
 
 def test_context_error_without_compactable_history_fails_without_looping(tmp_path):

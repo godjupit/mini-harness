@@ -382,8 +382,157 @@ def test_all_builtin_tools_have_explicit_descriptors():
     assert registry.descriptor_inferred("list_dir") is False
     assert registry.descriptor_inferred("find_files") is False
     assert registry.descriptor_inferred("write_file") is False
+    assert registry.descriptor_inferred("memory_write") is False
+    assert registry.descriptor_inferred("memory_read") is False
     assert registry.descriptor("read_file").path_argument == "path"
     assert registry.descriptor("write_file").destructive is True
+    assert registry.descriptor("memory_write").effect == "write"
+    assert registry.descriptor("memory_write").destructive is False
+    assert registry.descriptor("memory_read").effect == "read"
+
+
+def test_memory_write_saves_topic_files_and_updates_index(tmp_path):
+    tools = default_tools()
+    cases = [
+        ("user", "role", "Backend intern candidate learning Go", "user_role.md"),
+        ("feedback", "testing", "Prefer official docs over tutorials", "feedback_testing.md"),
+        ("project", "release", "Release freeze begins Aug 24", "project_release.md"),
+    ]
+    for memory_type, topic, content, filename in cases:
+        result = execute(
+            tools,
+            "memory_write",
+            {"type": memory_type, "topic": topic, "content": content},
+            ToolContext(tmp_path, approval_handler=approve_all_handler()),
+        )
+        assert not result.is_error
+        assert result.metadata["file"] == filename
+        target = tmp_path / "memdir" / filename
+        assert target.is_file()
+        text = target.read_text(encoding="utf-8")
+        assert content in text
+        assert text.startswith(
+            f'---\nname: "{memory_type.title()} {topic.title()}"\n'
+            f'description: "{content}"\ntype: {memory_type}\n---\n'
+        )
+    index = (tmp_path / "memdir" / "MEMORY.md").read_text(encoding="utf-8")
+    assert "- [User Role](user_role.md) — Backend intern candidate learning Go" in index
+    assert "- [Feedback Testing](feedback_testing.md) — Prefer official docs over tutorials" in index
+    assert "- [Project Release](project_release.md) — Release freeze begins Aug 24" in index
+
+
+def test_memory_write_appends_content_and_upserts_index_without_duplicates(tmp_path):
+    tools = default_tools()
+    context = ToolContext(tmp_path, approval_handler=approve_all_handler())
+    for content in ("prefers concise replies", "prefers thorough explanations"):
+        result = execute(
+            tools,
+            "memory_write",
+            {"type": "user", "topic": "response_style", "content": content},
+            context,
+        )
+        assert not result.is_error
+
+    topic_text = (tmp_path / "memdir" / "user_response_style.md").read_text(encoding="utf-8")
+    assert topic_text.count("- 2026-08-19:") == 2
+    assert 'description: "prefers thorough explanations"' in topic_text
+    assert "type: user" in topic_text.split("---", 2)[1]
+    index = (tmp_path / "memdir" / "MEMORY.md").read_text(encoding="utf-8")
+    assert index.count("user_response_style.md") == 1
+    assert "prefers thorough explanations" in index
+
+
+def test_memory_write_is_allowed_by_default_rules_and_appends(tmp_path):
+    first = execute(
+        default_tools(),
+        "memory_write",
+        {"type": "user", "topic": "response_style", "content": "prefers concise replies"},
+        ToolContext(tmp_path),
+    )
+    second = execute(
+        default_tools(),
+        "memory_write",
+        {"type": "user", "topic": "response_style", "content": "prefers concise replies"},
+        ToolContext(tmp_path),
+    )
+
+    assert not first.is_error and not second.is_error
+    text = (tmp_path / "memdir" / "user_response_style.md").read_text(encoding="utf-8")
+    assert text.count("- 2026-08-19: prefers concise replies") == 2
+
+
+def test_memory_write_rejects_unknown_type_empty_content_and_unsafe_topic(tmp_path):
+    tools = default_tools()
+    bad_type = execute(
+        tools,
+        "memory_write",
+        {"type": "todo", "topic": "role", "content": "remember this"},
+        ToolContext(tmp_path),
+    )
+    empty = execute(
+        tools,
+        "memory_write",
+        {"type": "user", "topic": "role", "content": "   "},
+        ToolContext(tmp_path),
+    )
+    traversal = execute(
+        tools,
+        "memory_write",
+        {"type": "user", "topic": "../evil", "content": "remember this"},
+        ToolContext(tmp_path),
+    )
+
+    assert bad_type.failure.code == "invalid_input"
+    assert bad_type.failure.stage == "validate"
+    assert empty.is_error
+    assert traversal.is_error
+    assert not (tmp_path / "memdir").exists()
+
+
+def test_memory_read_loads_topic_file_on_demand(tmp_path):
+    (tmp_path / "memdir").mkdir()
+    (tmp_path / "memdir" / "permissions.md").write_text(
+        "ASK -> Auto Review\nhard DENY cannot be overridden\n",
+        encoding="utf-8",
+    )
+
+    result = execute(
+        default_tools(),
+        "memory_read",
+        {"file": "permissions.md"},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.is_error
+    assert "ASK -> Auto Review" in result.output
+    assert "hard DENY cannot be overridden" in result.output
+
+
+def test_memory_read_is_allowed_by_default_rules(tmp_path):
+    (tmp_path / "memdir").mkdir()
+    (tmp_path / "memdir" / "provider.md").write_text("streaming notes\n", encoding="utf-8")
+
+    result = execute(
+        default_tools(),
+        "memory_read",
+        {"file": "provider.md"},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.is_error
+    assert "streaming notes" in result.output
+
+
+def test_memory_read_rejects_missing_escapes_and_non_markdown(tmp_path):
+    (tmp_path / "memdir").mkdir()
+    tools = default_tools()
+    missing = execute(tools, "memory_read", {"file": "nope.md"}, ToolContext(tmp_path))
+    escape = execute(tools, "memory_read", {"file": "../engine.py"}, ToolContext(tmp_path))
+    plain = execute(tools, "memory_read", {"file": "notes.txt"}, ToolContext(tmp_path))
+
+    assert missing.is_error and "not found" in missing.output
+    assert escape.is_error
+    assert plain.is_error
 
 
 def test_tree_read_lock_blocks_child_write_until_release():

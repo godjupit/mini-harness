@@ -249,8 +249,11 @@ Built-in local tools:
 | `read_file` | Read a UTF-8 text file inside the workspace |
 | `list_dir` | List the entries inside a directory (one level, `/` marks directories) |
 | `find_files` | Recursively search for files by name pattern (`cli.py`, `*.py`) |
+| `grep` | Search file contents with a regex and return `file:line: text` matches |
 | `write_file` | Write a UTF-8 text file |
 | `edit_file` | Snapshot-checked in-place edit |
+| `memory_write` | Save long-term memory into topic files under `memdir/` and keep `memdir/MEMORY.md` as the index |
+| `memory_read` | Load one topic memory file from `memdir/` on demand (Just-in-Time Memory) |
 
 Runtime-registered tools:
 
@@ -318,15 +321,19 @@ Command hooks execute with `argv` directly (no shell), use the workspace as the 
 
 ## Context compaction and artifacts
 
-- Before model calls, the runtime estimates context size; once the threshold is exceeded, older conversation units are replaced by a handoff summary while recent units stay verbatim
+- Before model calls, the runtime estimates context size — real token counts when tiktoken is installed (`pip install -e '.[tiktoken]'`), otherwise a character-based heuristic; with `--context-window` set, compaction starts at 70% of the window, otherwise `--context-threshold` is used
 - Tool turns are treated atomically so compaction never creates dangling protocol state
+- Recent messages are retained by token budget: scanning backwards from the newest unit until roughly 12000 tokens (`--keep-recent-tokens`), with at least one complete tool turn kept
 - The normal path requests a no-tools summary from the configured model; on failure a deterministic summary is used
+- The compaction result is persisted to the session as a `compaction` record, so `resume` restores the compacted context instead of replaying all history
 - Large tool outputs are offloaded to `.mini-oh/artifacts/<run-id>/`, keeping only a head/tail preview inline
 
 ```bash
 wqb \
   --context-threshold 12000 \
-  --keep-recent 6 \
+  --context-window 200000 \
+  --keep-recent 1 \
+  --keep-recent-tokens 12000 \
   --max-inline-output 8000 \
   "Work through a long repository task."
 ```

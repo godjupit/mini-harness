@@ -82,6 +82,20 @@ def build_default_allow_rules() -> list[PermissionRule]:
             pattern="*",
             source="builtin",
         ),
+        # memory_write 只追加写入 workspace 内固定的 memdir/*.md 主题文件，放行以便即时保存。
+        PermissionRule(
+            PermissionBehavior.ALLOW,
+            tool="memory_write",
+            pattern="*",
+            source="builtin",
+        ),
+        # memory_read 只读 workspace 内 memdir/ 下的主题记忆文件，放行以便按需加载。
+        PermissionRule(
+            PermissionBehavior.ALLOW,
+            tool="memory_read",
+            pattern="*",
+            source="builtin",
+        ),
     ]
 
 

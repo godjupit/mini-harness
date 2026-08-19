@@ -16,7 +16,11 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from mini_openharness.compaction import ArtifactStore, ContextCompactor
+from mini_openharness.compaction import (
+    DEFAULT_KEEP_RECENT_TOKENS,
+    ArtifactStore,
+    ContextCompactor,
+)
 from mini_openharness.engine import AgentEvent, AgentLoop, MaxStepsExceeded
 from mini_openharness.hooks import load_hook_registry
 from mini_openharness.mcp import McpManager
@@ -51,6 +55,7 @@ from mini_openharness.session import (
 from mini_openharness.skills import LoadSkillTool, SkillCatalog
 from mini_openharness.tools import default_tools
 from mini_openharness.trace import TraceStore, TraceWriter
+from mini_openharness.tokens import build_token_counter
 
 
 def _positive_int(value: str) -> int:
@@ -123,7 +128,31 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
         help="Enable bwrap-sandboxed host shell (default); use --no-sandbox-shell to disable",
     )
     parser.add_argument("--context-threshold", type=int, default=800_000)
-    parser.add_argument("--keep-recent", type=int, default=6)
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=None,
+        help=(
+            "Model context window in tokens. Compaction starts when the "
+            "estimated context reaches 70%% of it; when omitted, "
+            "--context-threshold is used directly."
+        ),
+    )
+    parser.add_argument(
+        "--keep-recent",
+        type=int,
+        default=1,
+        help="Minimum complete tool turns kept verbatim after compaction (floor)",
+    )
+    parser.add_argument(
+        "--keep-recent-tokens",
+        type=int,
+        default=DEFAULT_KEEP_RECENT_TOKENS,
+        help=(
+            "Approximate token budget for the recent messages kept verbatim "
+            "after compaction (default 12000)"
+        ),
+    )
     parser.add_argument("--max-inline-output", type=int, default=8_000)
     parser.add_argument("--input-cost", type=float, default=0.0, help="USD per million tokens")
     parser.add_argument("--output-cost", type=float, default=0.0, help="USD per million tokens")
@@ -183,6 +212,22 @@ def build_resume_parser() -> argparse.ArgumentParser:
 def _session_dir(args: argparse.Namespace) -> Path:
     workspace = Path(args.workspace).resolve()
     return Path(args.session_dir or workspace / ".mini-oh" / "sessions").resolve()
+
+
+def _memory_prompt(workspace: str | Path) -> str:
+    """Return the memory index for the system prompt, or '' when absent."""
+    memory_file = Path(workspace) / "memdir" / "MEMORY.md"
+    try:
+        if not memory_file.is_file():
+            return ""
+        return (
+            "MEMORY INDEX\n\n"
+            + memory_file.read_text(encoding="utf-8").strip()
+            + "\n\nLoad a topic file with memory_read('<file>') only when the "
+            "current question actually needs it."
+        )
+    except OSError:
+        return ""
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -611,6 +656,8 @@ TOOL USE
 * `grep` searches file contents with a regular expression and returns `file:line: text` matches. Prefer it over reading whole files when locating a symbol, usage, or definition.
 * `read_file` reads a file in explicit line pages. Use `offset` (0-based start line) and `limit` (maximum lines) to read only the relevant range; the result reports the returned range, total lines, whether more content exists, and the next offset. Do not re-request the same unchanged range; use the reported next offset to continue paging.
 * `edit_file` applies a localized replacement to an existing file. Read the relevant section first, then provide old_text/new_text where old_text matches exactly once; the runtime rejects edits based on stale content or non-unique matches. Never rewrite a whole large file when edit_file suffices.
+* `memory_write` saves long-term memory into the workspace `memdir/` folder. Call it immediately when the user explicitly asks you to remember something, or states a durable fact about their role, goals, or preferences; feedback on your working style; project background not derivable from code; or where external information lives. `type` must be one of `user`, `feedback`, `project`, or `reference`; `topic` is a short slug such as `role`, `testing`, or `release`. The runtime writes the memory to `memdir/{type}_{topic}.md` and keeps `memdir/MEMORY.md` as the index (one line per topic file). Do not save ephemeral task details.
+* `memory_read` loads one topic memory file from `memdir/` (e.g. `permissions.md`, `provider.md`) on demand. Only the `memdir/MEMORY.md` index is injected at session start; when a question touches a topic listed there, call `memory_read` for that file before answering. Do not read every memory file up front.
 * `agent` delegates substantial, self-contained investigation to `explore_agent` or implementation planning to `plan_agent`. Do not delegate trivial searches that can be completed directly in one or two targeted tool calls.
 * After delegating an investigation, use the returned findings. Do not repeat the same searches in the main agent unless the result contains a specific unresolved gap.
 * `sandbox_shell` runs host shell commands in a bubblewrap sandbox. Host Python, pytest, git, and `.venv` are available; the workspace is writable, the rest of the filesystem is read-only, `/tmp` is fresh, and the working directory persists across calls.
@@ -667,7 +714,12 @@ RESPONSE DISCIPLINE
     if skill_prompt:
         system_parts.append(skill_prompt)
     phase("skills")
+    memory_prompt = _memory_prompt(workspace)
+    if memory_prompt:
+        system_parts.append(memory_prompt)
+    phase("memory")
 
+    token_counter = build_token_counter(args.model)
     if args.demo:
         provider = DemoProvider()
     else:
@@ -682,8 +734,13 @@ RESPONSE DISCIPLINE
             base_url=args.base_url,
             timeout=args.timeout,
             max_retries=args.max_retries,
+            context_window_tokens=args.context_window,
+            token_counter=token_counter,
         )
     phase("provider")
+    context_window = args.context_window
+    if context_window is None:
+        context_window = getattr(provider, "context_window_tokens", None)
 
     tools = default_tools()
     if args.sandbox_shell:
@@ -725,6 +782,9 @@ RESPONSE DISCIPLINE
         compactor=ContextCompactor(
             threshold_tokens=args.context_threshold,
             keep_recent_units=args.keep_recent,
+            keep_recent_tokens=args.keep_recent_tokens,
+            context_window_tokens=context_window,
+            token_counter=token_counter,
         ),
         artifact_store=ArtifactStore(
             workspace / ".mini-oh" / "artifacts",

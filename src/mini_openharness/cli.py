@@ -23,7 +23,7 @@ from mini_openharness.compaction import (
 )
 from mini_openharness.engine import AgentEvent, AgentLoop, MaxStepsExceeded
 from mini_openharness.hooks import load_hook_registry
-from mini_openharness.mcp import McpManager
+from mini_openharness.mcp.mcp import McpManager
 from mini_openharness.models import Message
 from mini_openharness.multiagent import build_agent_tool
 from mini_openharness.permissions import (

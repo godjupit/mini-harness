@@ -13,13 +13,14 @@ import pytest
 from mcp.client.auth import OAuthFlowError
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-from mini_openharness.mcp_auth import (
+
+from mini_openharness.mcp.mcp_auth import (
     FileOAuthStorage,
     LoopbackOAuthFlow,
     McpOAuthConfig,
     build_oauth_provider,
 )
-from mini_openharness.mcp import McpManager, McpTool
+from mini_openharness.mcp.mcp import McpManager, McpTool
 from mini_openharness.permissions import HumanApprovalHandler
 from mini_openharness.tools import ToolContext, ToolRegistry
 
@@ -33,22 +34,22 @@ def approve_all_handler() -> HumanApprovalHandler:
     return HumanApprovalHandler(approve_all)
 
 
-class FakeSession:
+class FakeClient:
     async def call_tool(self, name, arguments):
         return SimpleNamespace(
             content=[SimpleNamespace(type="text", text=f"{name}:{arguments['value']}")],
-            structuredContent=None,
-            isError=False,
+            structured_content=None,
+            is_error=False,
         )
 
 
-class StructuredSession:
+class StructuredClient:
     def __init__(self, value):
         self.value = value
 
     async def call_tool(self, name, arguments):
         del name, arguments
-        return SimpleNamespace(content=[], structuredContent=self.value, isError=False)
+        return SimpleNamespace(content=[], structured_content=self.value, is_error=False)
 
 
 def test_mcp_config_resolves_relative_cwd(tmp_path):
@@ -72,7 +73,7 @@ def test_mcp_adapter_uses_same_permission_and_registry_path(tmp_path):
             remote_name="echo",
             description="echo",
             parameters={"type": "object"},
-            session=FakeSession(),
+            client=FakeClient(),
         )
     )
 
@@ -98,7 +99,7 @@ def test_mcp_descriptor_preserves_source_without_name_prefix(tmp_path):
         remote_name="echo",
         description="echo",
         parameters={"type": "object"},
-        session=FakeSession(),
+        client=FakeClient(),
     )
     tool.name = "echo"
     registry = ToolRegistry()
@@ -123,7 +124,7 @@ def test_mcp_output_schema_is_validated_and_structured_content_is_preserved(tmp_
         description="count",
         parameters={"type": "object"},
         output_schema=schema,
-        session=StructuredSession({"count": 2}),
+        client=StructuredClient({"count": 2}),
     )
     invalid = McpTool(
         server_name="demo",
@@ -131,7 +132,7 @@ def test_mcp_output_schema_is_validated_and_structured_content_is_preserved(tmp_
         description="bad count",
         parameters={"type": "object"},
         output_schema=schema,
-        session=StructuredSession({"count": "two"}),
+        client=StructuredClient({"count": "two"}),
     )
 
     valid_result = asyncio.run(valid.run({}, ToolContext(tmp_path)))
@@ -235,7 +236,8 @@ def test_loopback_oauth_callback_captures_code_and_state():
         await flow.redirect_handler("https://auth.example/authorize")
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
-            b"GET /callback?code=abc&state=state-1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            b"GET /callback?code=abc&state=state-1&iss=https%3A%2F%2Fauth.example HTTP/1.1\r\n"
+            b"Host: localhost\r\n\r\n"
         )
         await writer.drain()
         response = await reader.read()
@@ -245,7 +247,9 @@ def test_loopback_oauth_callback_captures_code_and_state():
 
     result, response = asyncio.run(exercise())
 
-    assert result == ("abc", "state-1")
+    assert result.code == "abc"
+    assert result.state == "state-1"
+    assert result.iss == "https://auth.example"
     assert b"200 OK" in response
 
 
@@ -269,11 +273,13 @@ def test_real_streamable_http_mcp_transport(tmp_path):
     server = tmp_path / "http_server.py"
     server.write_text(
         "import os\n"
-        "from mcp.server.fastmcp import FastMCP\n"
-        "mcp = FastMCP('http-eval', host='127.0.0.1', port=int(os.environ['PORT']))\n"
+        "from mcp.server import MCPServer\n"
+        "mcp = MCPServer('http-eval')\n"
         "@mcp.tool()\n"
         "def echo(text: str) -> str:\n    return 'http:' + text\n"
-        "if __name__ == '__main__':\n    mcp.run(transport='streamable-http')\n",
+        "if __name__ == '__main__':\n"
+        "    mcp.run(transport='streamable-http', host='127.0.0.1', "
+        "port=int(os.environ['PORT']), stateless_http=True, json_response=True)\n",
         encoding="utf-8",
     )
     process = subprocess.Popen(

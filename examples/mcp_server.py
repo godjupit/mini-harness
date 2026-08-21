@@ -1,9 +1,9 @@
 """A real MCP stdio server used by the interview demo."""
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 
-mcp = FastMCP("mini-openharness-demo")
+mcp = MCPServer("mini-openharness-demo")
 
 
 @mcp.tool()

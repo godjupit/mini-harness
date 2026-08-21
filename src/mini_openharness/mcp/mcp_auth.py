@@ -13,7 +13,12 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from mcp.client.auth import OAuthClientProvider, OAuthFlowError
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from mcp.shared.auth import (
+    AuthorizationCodeResult,
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthToken,
+)
 
 
 @dataclass(frozen=True)
@@ -59,7 +64,7 @@ class FileOAuthStorage:
 
     async def _read(self) -> dict[str, Any]:
         async with self._lock:
-            return await asyncio.to_thread(self._read_sync)
+            return self._read_sync()
 
     def _read_sync(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -76,7 +81,7 @@ class FileOAuthStorage:
 
     async def _update(self, key: str, value: Any) -> None:
         async with self._lock:
-            await asyncio.to_thread(self._update_sync, key, value)
+            self._update_sync(key, value)
 
     def _update_sync(self, key: str, value: Any) -> None:
         payload = self._read_sync()
@@ -105,7 +110,13 @@ class FileOAuthStorage:
 class LoopbackOAuthFlow:
     """Receive one OAuth callback on an explicitly configured loopback URI."""
 
-    def __init__(self, redirect_uri: str, *, open_browser: bool = True) -> None:
+    def __init__(
+        self,
+        redirect_uri: str,
+        *,
+        open_browser: bool = True,
+        timeout_seconds: float = 300.0,
+    ) -> None:
         parsed = urlparse(redirect_uri)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("MCP OAuth redirect_uri must be an http loopback address")
@@ -116,8 +127,9 @@ class LoopbackOAuthFlow:
         self.port = parsed.port
         self.path = parsed.path or "/"
         self.open_browser = open_browser
+        self.timeout_seconds = timeout_seconds
         self._server: asyncio.AbstractServer | None = None
-        self._result: asyncio.Future[tuple[str, str | None]] | None = None
+        self._result: asyncio.Future[AuthorizationCodeResult] | None = None
 
     async def redirect_handler(self, authorization_url: str) -> None:
         loop = asyncio.get_running_loop()
@@ -127,11 +139,11 @@ class LoopbackOAuthFlow:
         if self.open_browser:
             await asyncio.to_thread(webbrowser.open, authorization_url)
 
-    async def callback_handler(self) -> tuple[str, str | None]:
+    async def callback_handler(self) -> AuthorizationCodeResult:
         if self._result is None:
             raise RuntimeError("OAuth callback server was not started")
         try:
-            return await self._result
+            return await asyncio.wait_for(self._result, timeout=self.timeout_seconds)
         finally:
             if self._server is not None:
                 self._server.close()
@@ -154,6 +166,7 @@ class LoopbackOAuthFlow:
             query = parse_qs(parsed.query)
             code = query.get("code", [""])[0]
             state = query.get("state", [None])[0]
+            iss = query.get("iss", [None])[0]
             error = query.get("error", [None])[0]
             valid_path = parsed.path == self.path
             ok = method == "GET" and valid_path and bool(code) and not error
@@ -172,7 +185,9 @@ class LoopbackOAuthFlow:
             await writer.drain()
             if self._result is not None and not self._result.done():
                 if ok:
-                    self._result.set_result((code, state))
+                    self._result.set_result(
+                        AuthorizationCodeResult(code=code, state=state, iss=iss)
+                    )
                 else:
                     self._result.set_exception(
                         RuntimeError(error or "Invalid OAuth callback")
@@ -196,20 +211,26 @@ class StrictOAuthClientProvider(OAuthClientProvider):
 
 
 def build_oauth_provider(server_url: str, config: McpOAuthConfig) -> OAuthClientProvider:
-    flow = LoopbackOAuthFlow(config.redirect_uri, open_browser=config.open_browser)
+    flow = LoopbackOAuthFlow(
+        config.redirect_uri,
+        open_browser=config.open_browser,
+        timeout_seconds=config.timeout_seconds,
+    )
     metadata = OAuthClientMetadata(
         redirect_uris=[config.redirect_uri],
         scope=config.scopes,
         client_name=config.client_name,
     )
-    # The SDK owns discovery, PKCE S256, state validation, RFC 8707 resource
-    # indicators, token refresh, dynamic registration and scope step-up.
+    # The SDK owns discovery, PKCE S256 generation, state + RFC 9207 issuer
+    # validation, RFC 8707 resource indicators, token refresh, dynamic
+    # registration, and scope step-up. We retain the explicit metadata check
+    # because the MCP authorization specification requires clients to verify
+    # advertised PKCE support before proceeding.
     return StrictOAuthClientProvider(
         server_url,
         metadata,
         FileOAuthStorage(config.token_file),
         redirect_handler=flow.redirect_handler,
         callback_handler=flow.callback_handler,
-        timeout=config.timeout_seconds,
         client_metadata_url=config.client_metadata_url,
     )

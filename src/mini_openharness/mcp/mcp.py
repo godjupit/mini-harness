@@ -1,4 +1,4 @@
-"""Bridge MCP stdio servers into the same local ToolRegistry."""
+"""Bridge MCP servers into the same local ToolRegistry."""
 
 from __future__ import annotations
 
@@ -12,13 +12,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import httpx
+import httpx2
 from jsonschema import ValidationError, validate
-from mcp import ClientSession, StdioServerParameters
+from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
-from mini_openharness.mcp_auth import McpOAuthConfig, build_oauth_provider
+from mini_openharness.mcp.mcp_auth import McpOAuthConfig, build_oauth_provider
 from mini_openharness.tools import ToolContext, ToolDescriptor, ToolRegistry, ToolResult
 
 
@@ -35,12 +35,12 @@ class McpServerConfig:
 
 
 class McpManager:
-    """Own MCP process/session lifecycles and register their tools."""
+    """Own MCP client/transport lifecycles and register their tools."""
 
     def __init__(self, configs: dict[str, McpServerConfig]) -> None:
         self.configs = configs
         self._stacks: list[AsyncExitStack] = []
-        self._sessions: dict[str, ClientSession] = {}
+        self._clients: dict[str, Client] = {}
 
     @classmethod
     def from_file(cls, path: str | Path) -> "McpManager":
@@ -91,6 +91,13 @@ class McpManager:
         return cls(configs)
 
     async def connect_and_register(self, registry: ToolRegistry) -> list[str]:
+        """Connect every configured MCP server and register its tools.
+
+        MCP SDK v2's high-level ``Client`` owns protocol negotiation. In the
+        default ``mode='auto'`` it probes the 2026-07-28 ``server/discover``
+        path and falls back to the legacy initialize handshake when needed.
+        """
+
         registered: list[str] = []
         for server_name, config in self.configs.items():
             stack = AsyncExitStack()
@@ -98,51 +105,51 @@ class McpManager:
                 if config.url:
                     auth = build_oauth_provider(config.url, config.oauth) if config.oauth else None
                     http_client = await stack.enter_async_context(
-                        httpx.AsyncClient(
+                        httpx2.AsyncClient(
                             headers=config.headers,
                             auth=auth,
-                            timeout=httpx.Timeout(30, read=300),
+                            follow_redirects=True,
+                            timeout=httpx2.Timeout(30, read=300),
                         )
                     )
-                    read_stream, write_stream, _ = await stack.enter_async_context(
-                        streamable_http_client(
-                            config.url,
-                            http_client=http_client,
-                        )
+                    transport = streamable_http_client(
+                        config.url,
+                        http_client=http_client,
                     )
                 else:
                     assert config.command is not None
-                    read_stream, write_stream = await stack.enter_async_context(
-                        stdio_client(
-                            StdioServerParameters(
-                                command=config.command,
-                                args=list(config.args),
-                                env={**os.environ, **config.env},
-                                cwd=config.cwd,
-                            )
+                    transport = stdio_client(
+                        StdioServerParameters(
+                            command=config.command,
+                            args=list(config.args),
+                            env=config.env or None,
+                            cwd=config.cwd,
                         )
                     )
-                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-                await session.initialize()
-                for tool in (await session.list_tools()).tools:
+
+                # Client v2 negotiates modern (2026-07-28) vs legacy MCP for us.
+                client = await stack.enter_async_context(Client(transport))
+
+                for tool in (await client.list_tools()).tools:
                     adapter = McpTool(
                         server_name=server_name,
                         remote_name=tool.name,
                         description=tool.description or f"MCP tool {tool.name}",
-                        parameters=dict(tool.inputSchema or {"type": "object"}),
+                        parameters=dict(tool.input_schema or {"type": "object"}),
                         output_schema=(
-                            dict(tool.outputSchema) if tool.outputSchema is not None else None
+                            dict(tool.output_schema) if tool.output_schema is not None else None
                         ),
                         read_only=bool(
                             config.trust_tool_annotations
                             and tool.annotations is not None
-                            and tool.annotations.readOnlyHint is True
+                            and tool.annotations.read_only_hint is True
                         ),
-                        session=session,
+                        client=client,
                     )
                     registry.register(adapter)
                     registered.append(adapter.name)
-                self._sessions[server_name] = session
+
+                self._clients[server_name] = client
                 self._stacks.append(stack)
             except BaseException:
                 await stack.aclose()
@@ -152,7 +159,7 @@ class McpManager:
     async def close(self) -> None:
         while self._stacks:
             await self._stacks.pop().aclose()
-        self._sessions.clear()
+        self._clients.clear()
 
 
 class McpTool:
@@ -167,7 +174,7 @@ class McpTool:
         parameters: dict[str, Any],
         output_schema: dict[str, Any] | None = None,
         read_only: bool = False,
-        session: ClientSession,
+        client: Client,
     ) -> None:
         self.server_name = server_name
         self.remote_name = remote_name
@@ -175,7 +182,7 @@ class McpTool:
         self.description = description
         self.parameters = parameters
         self.output_schema = output_schema
-        # MCP annotations are only hints. The manager honors readOnlyHint solely
+        # MCP annotations are only hints. The manager honors read_only_hint solely
         # when the server is explicitly configured as trusted.
         self.read_only = read_only
         self.descriptor = ToolDescriptor(
@@ -183,7 +190,7 @@ class McpTool:
             source_id=server_name,
             effect="read" if read_only else "remote",
         )
-        self.session = session
+        self.client = client
 
     def resources(self, arguments: dict[str, Any], context: ToolContext):
         del arguments, context
@@ -194,15 +201,22 @@ class McpTool:
 
     async def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         del context
-        result = await self.session.call_tool(self.remote_name, arguments)
+        result = await self.client.call_tool(self.remote_name, arguments)
         parts: list[str] = []
         for item in result.content:
             if getattr(item, "type", None) == "text":
                 parts.append(getattr(item, "text", ""))
             else:
-                parts.append(item.model_dump_json())
-        structured = getattr(result, "structuredContent", None)
-        if self.output_schema is not None:
+                parts.append(item.model_dump_json(by_alias=True))
+
+        structured = getattr(result, "structured_content", None)
+        is_error = bool(getattr(result, "is_error", False))
+
+        # MCP SDK v2 validates negotiated protocol responses itself. Keep this
+        # local check as defense-in-depth and to preserve ToolResult metadata.
+        # Tool-level error results are intentionally exempt from output-schema
+        # validation by the MCP specification.
+        if self.output_schema is not None and not is_error:
             try:
                 validate(instance=structured, schema=self.output_schema)
             except ValidationError as exc:
@@ -212,16 +226,19 @@ class McpTool:
                     is_error=True,
                     metadata={"output_schema_valid": False},
                 )
+
         if structured is not None and not parts:
             parts.append(json.dumps(structured, ensure_ascii=False))
+
         metadata: dict[str, Any] = {}
         if structured is not None:
             metadata["structured_content"] = structured
-        if self.output_schema is not None:
+        if self.output_schema is not None and not is_error:
             metadata["output_schema_valid"] = True
+
         return ToolResult(
             "\n".join(parts) or "(no output)",
-            is_error=bool(result.isError),
+            is_error=is_error,
             metadata=metadata,
         )
 

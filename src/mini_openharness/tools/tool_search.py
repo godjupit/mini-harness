@@ -134,7 +134,7 @@ class BM25ToolSearch:
             return 0.0
         return sum(len(document) for document in documents) / len(documents)
 
-    def search(self, query: str, *, top_k: int = 5) -> list[SearchHit]:
+    def search(self, query: str, *, top_k: int = 4) -> list[SearchHit]:
         query_terms = tokenize(query)
         if not query_terms or not self._tools:
             return []

@@ -323,6 +323,7 @@ class AgentLoop:
                 streamed = False
                 try:
                     stream_method = getattr(self.provider, "stream", None)
+                    # “Parse the model’s streaming response into different event types and yield each event downstream as it arrives.”
                     if callable(stream_method):
                         async for provider_event in stream_method(
                             self.messages,

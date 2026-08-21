@@ -263,6 +263,9 @@ class ToolRegistry:
         self._descriptors: dict[str, ToolDescriptor] = {}
         self._inferred_descriptors: set[str] = set()
 
+    def items(self) -> tuple[tuple[str, Tool], ...]:
+        return tuple(self._tools.items())
+
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
             raise ValueError(f"Tool already registered: {tool.name}")
@@ -274,15 +277,29 @@ class ToolRegistry:
             self._descriptors[tool.name] = _legacy_descriptor(tool)
             self._inferred_descriptors.add(tool.name)
 
-    def schemas(self) -> list[dict[str, Any]]:
+    def schemas(self, names: set[str] | None = None) -> list[dict[str, Any]]:
+        """Return model-facing schemas for all or a selected set of tools."""
+        selected = (
+            self._tools.items()
+            if names is None
+            else ((name, self._tools[name]) for name in self._tools if name in names)
+        )
         return [
             {
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.parameters,
             }
-            for tool in self._tools.values()
+            for _, tool in selected
         ]
+
+    def default_exposed_names(self) -> set[str]:
+        """Return tools visible before dynamic MCP tool discovery."""
+        return {
+            name
+            for name in self._tools
+            if self.descriptor(name).source != "mcp"
+        }
 
     def subset(self, names: tuple[str, ...]) -> ToolRegistry:
         registry = ToolRegistry()

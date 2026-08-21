@@ -85,6 +85,9 @@ class RunState:
     resource_locks: ResourceLockManager
     tool_slots: asyncio.Semaphore
     file_snapshots: FileSnapshotStore
+    # Tools exposed to the model during this run. MCP tools are added here only
+    # after tool_search returns a matching registered tool.
+    active_tool_names: set[str] = field(default_factory=set)
     last_tool_batch: str | None = None
     repeated_tool_batches: int = 0
 
@@ -227,6 +230,7 @@ class AgentLoop:
             resource_locks=ResourceLockManager(),
             tool_slots=asyncio.Semaphore(self.max_concurrent_tools),
             file_snapshots=FileSnapshotStore(),
+            active_tool_names=self.tools.default_exposed_names(),
         )
         self._active_run = state
         execution = runner(state)
@@ -311,7 +315,7 @@ class AgentLoop:
                             "step": step,
                             "attempt": model_attempt,
                             "messages": [message.to_dict() for message in self.messages],
-                            "tools": self.tools.schemas(),
+                            "tools": self._visible_tool_schemas(state),
                         },
                     )
 
@@ -322,7 +326,7 @@ class AgentLoop:
                     if callable(stream_method):
                         async for provider_event in stream_method(
                             self.messages,
-                            self.tools.schemas(),
+                            self._visible_tool_schemas(state),
                             cancel_event=state.cancel_event,
                         ):
                             if isinstance(provider_event, ProviderReasoningDelta):
@@ -408,7 +412,10 @@ class AgentLoop:
                             elif isinstance(provider_event, ProviderComplete):
                                 reply = provider_event.reply
                     else:
-                        reply = await self.provider.complete(self.messages, self.tools.schemas())
+                        reply = await self.provider.complete(
+                            self.messages,
+                            self._visible_tool_schemas(state),
+                        )
                 except ProviderCancelledError as exc:
                     yield self._cancelled_event(str(exc))
                     return
@@ -608,6 +615,7 @@ class AgentLoop:
                 if artifact_path is not None:
                     stored_result.metadata["artifact_path"] = str(artifact_path)
                     stored_result.metadata["original_chars"] = len(result.output)
+                self._apply_tool_runtime_effect(call, stored_result, state)
                 self._append_tool_result(call.id, call.name, stored_result)
                 data = {
                     "id": call.id,
@@ -634,6 +642,30 @@ class AgentLoop:
         if self.tracer:
             self.tracer.finish(status="failed", data={"reason": error})
         raise MaxStepsExceeded(error)
+
+    def _visible_tool_schemas(self, state: RunState) -> list[dict[str, Any]]:
+        """Return only the tools currently exposed to the model."""
+        return self.tools.schemas(state.active_tool_names)
+
+    def _apply_tool_runtime_effect(
+        self,
+        call: ToolCall,
+        result: ToolResult,
+        state: RunState,
+    ) -> None:
+        """Expose matching MCP tools after a successful tool_search call."""
+        if result.is_error or call.name != "tool_search":
+            return
+
+        matched_tools = result.metadata.get("matched_tools", [])
+        if not isinstance(matched_tools, list):
+            return
+
+        for name in matched_tools:
+            if not isinstance(name, str) or name not in dict(self.tools.items()):
+                continue
+            if self.tools.descriptor(name).source == "mcp":
+                state.active_tool_names.add(name)
 
     async def _execute_timed(
         self,

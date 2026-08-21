@@ -23,6 +23,7 @@ from mini_openharness.tools.read_file import (
     ReadFileTool,
 )
 from mini_openharness.tools.write_file import WriteFileTool
+from mini_openharness.tools.tool_search import ToolSearchTool
 
 
 def default_tools() -> ToolRegistry:
@@ -35,6 +36,7 @@ def default_tools() -> ToolRegistry:
     registry.register(EditFileTool())
     registry.register(MemoryWriteTool())
     registry.register(MemoryReadTool())
+    registry.register(ToolSearchTool(registry))
     return registry
 
 
@@ -59,6 +61,7 @@ __all__ = [
     "ToolFailure",
     "ToolRegistry",
     "ToolResult",
+    "ToolSearchTool",
     "WriteFileTool",
     "default_tools",
 ]

@@ -32,6 +32,7 @@ class McpServerConfig:
     headers: dict[str, str] = field(default_factory=dict)
     oauth: McpOAuthConfig | None = None
     trust_tool_annotations: bool = False
+    protocol_mode: str = "auto"
 
 
 class McpManager:
@@ -76,6 +77,11 @@ class McpManager:
                 if not url:
                     raise ValueError(f"MCP server {server_name!r} OAuth requires an HTTP url")
                 _validate_oauth_server_url(str(url), server_name)
+            protocol_mode = str(raw.get("protocolMode", "auto"))
+            if protocol_mode not in {"auto", "legacy"}:
+                raise ValueError(
+                    f"MCP server {server_name!r} protocolMode must be 'auto' or 'legacy'"
+                )
             configs[server_name] = McpServerConfig(
                 command=(
                     str(command).replace("{python}", sys.executable) if command else None
@@ -87,6 +93,7 @@ class McpManager:
                 headers=headers,
                 oauth=oauth,
                 trust_tool_annotations=bool(raw.get("trustToolAnnotations", False)),
+                protocol_mode=protocol_mode,
             )
         return cls(configs)
 
@@ -128,7 +135,9 @@ class McpManager:
                     )
 
                 # Client v2 negotiates modern (2026-07-28) vs legacy MCP for us.
-                client = await stack.enter_async_context(Client(transport))
+                client = await stack.enter_async_context(
+                    Client(transport, mode=config.protocol_mode)
+                )
 
                 for tool in (await client.list_tools()).tools:
                     adapter = McpTool(

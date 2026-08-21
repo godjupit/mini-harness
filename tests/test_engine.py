@@ -103,6 +103,53 @@ def test_same_agent_loop_rejects_overlapping_runs_and_recovers_after_close(tmp_p
     ]
 
 
+def test_tool_search_exposes_matching_mcp_tool_on_next_model_turn(tmp_path):
+    class RemoteTool:
+        name = "mcp__demo__search"
+        description = "search the demo service"
+        parameters = {"type": "object", "additionalProperties": False}
+        descriptor = ToolDescriptor(source="mcp", source_id="demo", effect="remote")
+
+        async def run(self, arguments, context):
+            del arguments, context
+            return ToolResult("remote result")
+
+    provider = ScriptedProvider(
+        [
+            ModelReply(
+                tool_calls=(
+                    ToolCall(
+                        "search-call",
+                        "tool_search",
+                        {"query": "demo search"},
+                    ),
+                )
+            ),
+            ModelReply(
+                tool_calls=(ToolCall("remote-call", "mcp__demo__search", {}),)
+            ),
+            ModelReply(content="done"),
+        ]
+    )
+    tools = default_tools()
+    tools.register(RemoteTool())
+    loop = AgentLoop(
+        provider=provider,
+        tools=tools,
+        workspace=tmp_path,
+        approval_handler=approve_all_handler(),
+    )
+
+    events = collect(loop, "search demo")
+
+    assert events[-1].kind == "done"
+    first_names = {schema["name"] for schema in provider.requests[0][1]}
+    second_names = {schema["name"] for schema in provider.requests[1][1]}
+    assert "tool_search" in first_names
+    assert "mcp__demo__search" not in first_names
+    assert "mcp__demo__search" in second_names
+
+
 def test_run_guard_is_released_after_exception(tmp_path):
     provider = ScriptedProvider(
         [

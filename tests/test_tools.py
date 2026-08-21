@@ -40,6 +40,26 @@ def approve_all_handler() -> HumanApprovalHandler:
     return HumanApprovalHandler(approve_all)
 
 
+def test_tool_schemas_can_filter_registered_tools_and_default_hides_mcp(tmp_path):
+    class RemoteTool:
+        name = "mcp__demo__search"
+        description = "search the demo service"
+        parameters = {"type": "object"}
+        descriptor = ToolDescriptor(source="mcp", source_id="demo", effect="remote")
+
+        async def run(self, arguments, context):
+            del arguments, context
+            return ToolResult("ok")
+
+    registry = default_tools()
+    registry.register(RemoteTool())
+
+    assert "tool_search" in registry.default_exposed_names()
+    assert "mcp__demo__search" not in registry.default_exposed_names()
+    assert [item["name"] for item in registry.schemas({"tool_search"})] == ["tool_search"]
+    assert [item["name"] for item in registry.schemas()] [-1] == "mcp__demo__search"
+
+
 def allow_all_engine(workspace: Path) -> PermissionEngine:
     return PermissionEngine(
         PermissionContext(

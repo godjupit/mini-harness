@@ -150,6 +150,7 @@ class ReadRangeCache:
 @dataclass(frozen=True)
 class ToolContext:
     workspace: Path
+    memory_dir: Path | None = None
     permission_engine: PermissionEngine | None = None
     approval_handler: ApprovalHandler | None = None
     tracer: TraceSink | None = None

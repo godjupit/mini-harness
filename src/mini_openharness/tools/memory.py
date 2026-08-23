@@ -1,4 +1,4 @@
-"""memory tools: write and read explicit long-term memory in the workspace."""
+"""Memory tools backed by the current Agent App's configured memory directory."""
 
 from __future__ import annotations
 
@@ -104,10 +104,14 @@ def _upsert_index(memory_dir: Path, filename: str, title: str, content: str) -> 
     index_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def _memory_dir(context: ToolContext) -> Path:
+    return (context.memory_dir or context.workspace / "memdir").resolve()
+
+
 class MemoryWriteTool:
     name = "memory_write"
     description = (
-        "Save a long-term memory into the workspace memdir/ folder. "
+        "Save a long-term memory into this Agent App's configured memory directory. "
         "Call this immediately when the user explicitly asks you to remember "
         "something, or states a durable fact that should survive across sessions. "
         "The memory is written to memdir/{type}_{topic}.md (e.g. user_role.md, "
@@ -146,7 +150,8 @@ class MemoryWriteTool:
                 f"topic {topic!r} cannot be turned into a safe filename",
                 is_error=True,
             )
-        target = _safe_path(context.workspace, f"memdir/{filename}")
+        memory_dir = _memory_dir(context)
+        target = _safe_path(memory_dir, filename)
         target.parent.mkdir(parents=True, exist_ok=True)
         title = _topic_title(memory_type, topic)
         description = _summary(content)
@@ -160,7 +165,7 @@ class MemoryWriteTool:
         )
         await asyncio.to_thread(_upsert_index, target.parent, filename, title, content)
         return ToolResult(
-            f"Saved to memdir/{filename}; index updated.",
+            f"Saved memory {filename}; index updated.",
             metadata={
                 "type": memory_type,
                 "topic": topic,
@@ -175,14 +180,15 @@ class MemoryWriteTool:
         filename = _topic_filename(memory_type, topic)
         if memory_type not in MEMORY_TYPES or filename is None:
             return (ResourceAccess("*", "write", tree=True),)
-        target = _safe_path(context.workspace, f"memdir/{filename}")
+        memory_dir = _memory_dir(context)
+        target = _safe_path(memory_dir, filename)
         return (ResourceAccess(f"fs:{target}", "write"),)
 
 
 class MemoryReadTool:
     name = "memory_read"
     description = (
-        "Load one topic memory file from the workspace memdir/ folder on demand, "
+        "Load one topic file from this Agent App's configured memory directory on demand, "
         "for example memory_read(file='permissions.md'). Only the memdir/MEMORY.md "
         "index is injected at session start; call this tool when the current "
         "question actually needs a topic listed there. Do not read every memory "
@@ -213,9 +219,10 @@ class MemoryReadTool:
                 "file must be a plain .md filename inside memdir/",
                 is_error=True,
             )
-        target = _safe_path(context.workspace, f"memdir/{filename}")
+        memory_dir = _memory_dir(context)
+        target = _safe_path(memory_dir, filename)
         if not target.is_file():
-            return ToolResult(f"Memory file not found: memdir/{filename}", is_error=True)
+            return ToolResult(f"Memory file not found: {filename}", is_error=True)
         text = await asyncio.to_thread(target.read_text, encoding="utf-8")
         return ToolResult(text.strip() or "(empty memory file)")
 
@@ -230,5 +237,6 @@ class MemoryReadTool:
             or not filename.endswith(".md")
         ):
             return (ResourceAccess("*", "read", tree=True),)
-        target = _safe_path(context.workspace, f"memdir/{filename}")
+        memory_dir = _memory_dir(context)
+        target = _safe_path(memory_dir, filename)
         return (ResourceAccess(f"fs:{target}", "read"),)

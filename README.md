@@ -210,6 +210,88 @@ wqb --permission-config examples/permissions.json --workspace . "Update the docs
 
 Rule patterns use `fnmatch`-style matching. Unmatched requests still fall through to the runtime default and non-bypassable safety checks.
 
+## Agent Kernel / Profile / App architecture
+
+The repository separates reusable mechanics from product-specific behavior:
+
+```text
+Agent Kernel
+  AgentLoop / Provider / MCP / Session / Trace / Permission
+                         │
+                         ▼
+Agent Profile
+  name / system prompt / tool factory / MCP / permissions / steps / output
+  skills directory / memory directory
+                         │
+                         ▼
+Agent App
+  apps/coding_agent.py / a product-owned app
+```
+
+`AgentRuntimeBuilder` assembles the kernel services around a profile;
+`AgentApp` binds that profile to the shared CLI/session lifecycle. A domain App
+therefore does not inherit Coding Agent tools or behavior unless its profile
+explicitly selects them.
+
+```python
+from mini_openharness import (
+    MARKDOWN_OUTPUT,
+    AgentApp,
+    AgentProfile,
+    PermissionPolicy,
+)
+from mini_openharness.tools import ToolRegistry, ToolSearchTool
+
+def domain_tools() -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(ToolSearchTool(registry))
+    return registry
+
+profile = AgentProfile(
+    name="domain",
+    system_prompt="You are a domain assistant. Use MCP results as facts.",
+    tool_factory=domain_tools,
+    prompt_mode="replace",
+    mcp_config="agent/config/mcp.json",
+    permission_policy=PermissionPolicy.HUMAN_APPROVAL,
+    max_steps=12,
+    output_protocol=MARKDOWN_OUTPUT,
+    enable_skills=True,
+    enable_memory_prompt=True,
+    skills_dir="agent/assets/skills",
+    memory_dir="agent/assets/memory",
+)
+
+raise SystemExit(AgentApp(profile).run())
+```
+
+Use `prompt_mode="append"` only when a role intentionally extends the Coding
+Agent instructions. Tool factories must return a fresh registry for each
+runtime, which keeps mutable MCP registration and tool visibility isolated.
+`OutputProtocol` can additionally declare `application/json` plus a JSON Schema;
+its contract is injected into the model system context.
+
+Each App can own an isolated Skill catalog and long-term memory store. Skills
+use the `<skills_dir>/<name>/SKILL.md` layout. Memory uses
+`<memory_dir>/MEMORY.md` as its index and stores individual topic files beside
+it. `enable_memory_prompt=True` both injects the index and exposes
+`memory_read`/`memory_write`, even when the App's tool factory does not include
+the Coding Agent's default tools. `--skills-dir` and `--memory-dir` override the
+profile paths for one invocation; profiles without either path keep the
+workspace defaults (`skills/` and `memdir/`).
+
+Run the concrete applications directly:
+
+```bash
+python apps/coding_agent.py --workspace ../my-project "修复登录错误"
+```
+
+Product-specific apps should live with their product repository and import the
+installed `mini_openharness` package. Declare one `AgentProfile` and pass it to
+`AgentApp`; no copy of `AgentLoop` or provider/MCP/session setup is needed.
+Because runtime data defaults to `<workspace>/.mini-oh/`, sessions, traces, and
+artifacts stay with the product being operated instead of polluting this framework.
+
 ## Subagent delegation
 
 Mini Harness exposes an `agent` tool to the main model. A subagent gets its own `AgentLoop`, a specialized system prompt, a turn limit, and only the tools declared by its definition.
@@ -372,7 +454,7 @@ wqb resume --latest
 wqb --mcp-config examples/mcp.json --workspace . "Inspect available MCP tools."
 ```
 
-Supports stdio and Streamable HTTP transports, input/output schema validation, structured content preservation, conservative `readOnlyHint` handling, and OAuth flows with local token persistence. Remote tools are not implicitly trusted merely because they are reachable.
+Supports stdio and Streamable HTTP transports, input/output schema validation, structured content preservation, conservative `readOnlyHint` handling, and OAuth 2.1 authorization-code flows with PKCE. For OAuth-enabled HTTP servers, the MCP SDK discovers RFC 9728 Protected Resource Metadata from the server's `401` challenge, discovers the Authorization Server, requests a resource-bound access token, refreshes it when needed, and persists credentials in an owner-readable token file. The harness does not mint an MCP access token itself.
 
 ### Skills
 
@@ -428,10 +510,15 @@ wqb \
 
 ```text
 mini-harness/
+├── apps/
+│   └── coding_agent.py       # Coding product entry + explicit profile
 ├── src/mini_openharness/
+│   ├── agent_app.py          # profile-to-application binding
+│   ├── agent_profile.py      # role, tools, permissions, output contract
+│   ├── runtime.py            # shared runtime builder and lifecycle owner
 │   ├── engine.py              # agent state machine and tool orchestration
 │   ├── provider.py            # Responses + Chat-compatible providers
-│   ├── tools.py               # registry, descriptors, locks, file tools
+│   ├── tools/                 # registry, descriptors, locks, file tools
 │   ├── permissions/           # safety, rules, engine, approval handlers
 │   ├── multiagent.py          # subagent definitions, registry, delegation tool
 │   ├── hooks.py               # lifecycle hook registry and executor
@@ -439,15 +526,12 @@ mini-harness/
 │   ├── trace.py               # JSONL tracing, replay, pruning
 │   ├── session.py             # persistent sessions and resume logic
 │   ├── skills.py              # progressive skill loading
-│   ├── mcp.py                 # MCP integration
-│   ├── mcp_auth.py            # HTTP MCP OAuth support
+│   ├── mcp/                   # MCP integration and HTTP OAuth support
 │   ├── sandbox.py             # bwrap-sandboxed host shell
 │   ├── models.py              # messages and tool-call data structures
 │   └── cli.py                 # `wqb` command-line interface
 ├── tests/                     # runtime and protocol tests
 ├── examples/                  # permissions, hooks, MCP, reviewer demos
-├── docs/                      # guided code-reading notes
-├── TECHNICAL_DESIGN.md        # design rationale and implementation details
 ├── pyproject.toml
 └── LICENSE
 ```
@@ -481,8 +565,6 @@ Tests cover the agent loop, tools, permissions, auto-review, hooks, providers, c
 - Default subagents are lightweight delegated loops, not autonomous distributed workers
 - No TUI, plugin marketplace, or remote multi-user execution service
 - Permission rules are intentionally simple glob-based rules, not a full policy language
-
-For deeper implementation notes, see [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md).
 
 ## License
 

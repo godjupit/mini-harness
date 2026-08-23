@@ -68,6 +68,10 @@ class McpManager:
                         f"MCP server {server_name!r} requires environment variable {env_name}"
                     )
                 headers[str(header)] = value
+            for header, env_name in raw.get("optionalHeadersEnv", {}).items():
+                value = os.environ.get(str(env_name))
+                if value is not None:
+                    headers[str(header)] = value
             oauth = _oauth_config(
                 raw.get("oauth"),
                 config_path=config_path,

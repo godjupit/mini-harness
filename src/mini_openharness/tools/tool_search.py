@@ -12,16 +12,22 @@ from typing import Any, Iterable
 from mini_openharness.tools.base import ToolContext, ToolDescriptor, ToolRegistry, ToolResult
 
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*")
+_ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*")
+_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
 
 
 def tokenize(text: str) -> list[str]:
-    """Tokenize text while retaining snake_case terms and their parts."""
+    """Tokenize ASCII terms plus individual CJK characters.
+
+    Character tokens let a query such as ``杭州民宿`` discover a description
+    containing ``搜索民宿`` even when Chinese text does not contain spaces.
+    """
     result: list[str] = []
-    for token in _TOKEN_RE.findall(text.lower()):
+    for token in _ASCII_TOKEN_RE.findall(text.lower()):
         result.append(token)
         if "_" in token:
             result.extend(part for part in token.split("_") if part)
+    result.extend(_CJK_CHAR_RE.findall(text))
     return result
 
 

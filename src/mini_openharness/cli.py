@@ -16,6 +16,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from mini_openharness.agent_profile import AgentProfile, PermissionPolicy
 from mini_openharness.compaction import (
     DEFAULT_KEEP_RECENT_TOKENS,
     ArtifactStore,
@@ -40,6 +41,7 @@ from mini_openharness.provider import (
     OpenAICompatibleProvider,
     OpenAIResponsesProvider,
 )
+from mini_openharness.runtime import AgentRuntimeBuilder
 from mini_openharness.sandbox import (
     BwrapShell,
     SandboxUnavailableError,
@@ -53,7 +55,7 @@ from mini_openharness.session import (
     strip_dangling_tool_calls,
 )
 from mini_openharness.skills import LoadSkillTool, SkillCatalog
-from mini_openharness.tools import default_tools
+from mini_openharness.tools import MemoryReadTool, MemoryWriteTool, default_tools
 from mini_openharness.trace import TraceStore, TraceWriter
 from mini_openharness.tokens import build_token_counter
 
@@ -157,7 +159,12 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input-cost", type=float, default=0.0, help="USD per million tokens")
     parser.add_argument("--output-cost", type=float, default=0.0, help="USD per million tokens")
     parser.add_argument("--skills-dir", help="Directory containing <name>/SKILL.md skills")
+    parser.add_argument("--memory-dir", help="Directory containing this Agent App's memory")
     parser.add_argument("--mcp-config", help="JSON file containing stdio/HTTP mcpServers")
+    parser.add_argument(
+        "--system-prompt-file",
+        help="Optional UTF-8 file appended to the built-in system prompt",
+    )
     parser.add_argument("--trace-dir", help="JSONL trace directory")
     parser.add_argument("--no-trace", action="store_true", help="Disable run tracing")
     parser.add_argument(
@@ -214,9 +221,9 @@ def _session_dir(args: argparse.Namespace) -> Path:
     return Path(args.session_dir or workspace / ".mini-oh" / "sessions").resolve()
 
 
-def _memory_prompt(workspace: str | Path) -> str:
+def _memory_prompt(memory_dir: str | Path) -> str:
     """Return the memory index for the system prompt, or '' when absent."""
-    memory_file = Path(workspace) / "memdir" / "MEMORY.md"
+    memory_file = Path(memory_dir) / "MEMORY.md"
     try:
         if not memory_file.is_file():
             return ""
@@ -230,7 +237,7 @@ def _memory_prompt(workspace: str | Path) -> str:
         return ""
 
 
-async def _run(args: argparse.Namespace) -> int:
+async def _run(args: argparse.Namespace, profile: AgentProfile | None = None) -> int:
     workspace = Path(args.workspace).resolve()
     prompt = args.prompt
     session_log = None
@@ -239,7 +246,11 @@ async def _run(args: argparse.Namespace) -> int:
         session_started = time.perf_counter()
         session_log = SessionLog(
             _session_dir(args),
-            metadata={"first_prompt": prompt, "workspace": str(workspace)},
+            metadata={
+                "first_prompt": prompt,
+                "workspace": str(workspace),
+                "agent_profile": profile.name if profile is not None else "coding-default",
+            },
         )
         session_init_ms = (time.perf_counter() - session_started) * 1000
         global _ACTIVE_SESSION
@@ -251,10 +262,11 @@ async def _run(args: argparse.Namespace) -> int:
         trace_prompt=prompt,
         run_events=lambda loop: loop.run(prompt),
         session_init_ms=session_init_ms,
+        profile=profile,
     )
 
 
-async def _interactive(args: argparse.Namespace) -> int:
+async def _interactive(args: argparse.Namespace, profile: AgentProfile | None = None) -> int:
     """Continuous REPL: one runtime / AgentLoop / Session for many prompts."""
     workspace = Path(args.workspace).resolve()
     session_log = None
@@ -263,7 +275,12 @@ async def _interactive(args: argparse.Namespace) -> int:
         session_started = time.perf_counter()
         session_log = SessionLog(
             _session_dir(args),
-            metadata={"first_prompt": "(interactive)", "interactive": True},
+            metadata={
+                "first_prompt": "(interactive)",
+                "interactive": True,
+                "workspace": str(workspace),
+                "agent_profile": profile.name if profile is not None else "coding-default",
+            },
         )
         session_init_ms = (time.perf_counter() - session_started) * 1000
         global _ACTIVE_SESSION
@@ -278,6 +295,7 @@ async def _interactive(args: argparse.Namespace) -> int:
             args,
             session_log=session_log,
             trace_prompt="(interactive session)",
+            profile=profile,
         )
         if tracer is not None:
             tracer.emit(
@@ -424,10 +442,7 @@ def _read_line(
 
 def _visual_lines(text: str) -> int:
     width = shutil.get_terminal_size((80, 24)).columns
-    return sum(
-        max(1, (len(line) + width - 1) // width)
-        for line in (text or "").split("\n")
-    )
+    return sum(max(1, (len(line) + width - 1) // width) for line in (text or "").split("\n"))
 
 
 def _redraw(out_fd: int, prompt: str, text: str, up_lines: int = 0) -> None:
@@ -443,7 +458,7 @@ def _redraw(out_fd: int, prompt: str, text: str, up_lines: int = 0) -> None:
     os.write(out_fd, f"\r\x1b[J{prompt}{text}".encode("utf-8"))
 
 
-async def _resume_command(args: argparse.Namespace) -> int:
+async def _resume_command(args: argparse.Namespace, profile: AgentProfile | None = None) -> int:
     store = SessionStore(_session_dir(args))
     latest = store.latest()
     session_id = args.session_id or (latest.session_id if latest else None)
@@ -476,6 +491,7 @@ async def _resume_command(args: argparse.Namespace) -> int:
         trace_prompt=first_prompt or "(resumed session)",
         run_events=lambda loop: loop.resume(),
         session_init_ms=session_init_ms,
+        profile=profile,
     )
 
 
@@ -487,6 +503,7 @@ async def _drive_session(
     trace_prompt: str,
     run_events: Any,
     session_init_ms: float | None = None,
+    profile: AgentProfile | None = None,
 ) -> int:
     global _ACTIVE_SESSION
     loop = None
@@ -500,6 +517,7 @@ async def _drive_session(
             session_log=session_log,
             messages=messages,
             trace_prompt=trace_prompt,
+            profile=profile,
         )
         if tracer is not None and session_init_ms is not None:
             tracer.emit(
@@ -564,6 +582,25 @@ async def _build_runtime(
     session_log: SessionLog | None,
     messages: list[Message] | None = None,
     trace_prompt: str,
+    profile: AgentProfile | None = None,
+) -> tuple[AgentLoop, TraceWriter | None, McpManager | None, Any]:
+    runtime = await AgentRuntimeBuilder(profile).build(
+        args,
+        session_log=session_log,
+        messages=messages,
+        trace_prompt=trace_prompt,
+        assembler=_assemble_runtime,
+    )
+    return runtime.loop, runtime.tracer, runtime.mcp_manager, runtime.provider
+
+
+async def _assemble_runtime(
+    args: argparse.Namespace,
+    *,
+    session_log: SessionLog | None,
+    messages: list[Message] | None = None,
+    trace_prompt: str,
+    profile: AgentProfile | None = None,
 ) -> tuple[AgentLoop, TraceWriter | None, McpManager | None, Any]:
     workspace = Path(args.workspace).resolve()
     trace_dir = Path(args.trace_dir or workspace / ".mini-oh" / "traces")
@@ -579,6 +616,7 @@ async def _build_runtime(
                 "workspace": str(workspace),
                 "provider": provider_name,
                 "model": args.model if not args.demo else "demo",
+                "agent_profile": profile.name if profile is not None else "coding-default",
             },
         )
 
@@ -594,7 +632,11 @@ async def _build_runtime(
             )
         phase_started = time.perf_counter()
 
-    skills = SkillCatalog(args.skills_dir or workspace / "skills")
+    profile_skills_dir = profile.skills_dir if profile is not None else None
+    skills_dir = args.skills_dir or profile_skills_dir or workspace / "skills"
+    skills = SkillCatalog(skills_dir)
+    profile_memory_dir = profile.memory_dir if profile is not None else None
+    memory_dir = Path(args.memory_dir or profile_memory_dir or workspace / "memdir").resolve()
     system_parts = [
         (
             """You are Mini Harness, a concise coding agent operating in a workspace.
@@ -710,11 +752,28 @@ RESPONSE DISCIPLINE
 * When the task is complete, return the final result instead of performing additional tool calls."""
         ),
     ]
-    skill_prompt = skills.prompt()
+    if profile is not None:
+        if profile.prompt_mode == "replace":
+            system_parts.clear()
+        system_parts.append(profile.system_prompt.strip())
+        system_parts.append(profile.output_protocol.prompt_fragment())
+    skills_enabled = profile is None or profile.enable_skills
+    skill_prompt = skills.prompt() if skills_enabled else ""
     if skill_prompt:
         system_parts.append(skill_prompt)
     phase("skills")
-    memory_prompt = _memory_prompt(workspace)
+    if args.system_prompt_file:
+        prompt_path = Path(args.system_prompt_file).resolve()
+        try:
+            custom_prompt = prompt_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise SystemExit(f"cannot read system prompt file {prompt_path}: {exc}") from exc
+        if not custom_prompt:
+            raise SystemExit(f"system prompt file is empty: {prompt_path}")
+        system_parts.append(custom_prompt)
+    phase("custom_system_prompt")
+    memory_enabled = profile is None or profile.enable_memory_prompt
+    memory_prompt = _memory_prompt(memory_dir) if memory_enabled else ""
     if memory_prompt:
         system_parts.append(memory_prompt)
     phase("memory")
@@ -742,8 +801,15 @@ RESPONSE DISCIPLINE
     if context_window is None:
         context_window = getattr(provider, "context_window_tokens", None)
 
-    tools = default_tools()
-    if args.sandbox_shell:
+    tools = profile.build_tools() if profile is not None else default_tools()
+    if memory_enabled:
+        registered_tools = {name for name, _ in tools.items()}
+        if "memory_write" not in registered_tools:
+            tools.register(MemoryWriteTool())
+        if "memory_read" not in registered_tools:
+            tools.register(MemoryReadTool())
+    sandbox_enabled = args.sandbox_shell and (profile is None or profile.enable_sandbox_shell)
+    if sandbox_enabled:
         sandbox = BwrapShell(workspace)
         try:
             sandbox.ensure_available()
@@ -751,22 +817,26 @@ RESPONSE DISCIPLINE
             print(f"warning: sandbox_shell disabled: {exc}", file=sys.stderr)
         else:
             tools.register(SandboxedShellTool(sandbox))
-    if skills.list():
+    if skills_enabled and skills.list():
         tools.register(LoadSkillTool(skills))
-    tools.register(
-        build_agent_tool(
-            provider=provider,
-            tools=tools,
-            workspace=workspace,
-            parent_session=session_log,
+    subagents_enabled = profile is None or profile.enable_subagents
+    if subagents_enabled:
+        tools.register(
+            build_agent_tool(
+                provider=provider,
+                tools=tools,
+                workspace=workspace,
+                parent_session=session_log,
+            )
         )
-    )
     phase("tools")
-    mcp_manager = McpManager.from_file(args.mcp_config) if args.mcp_config else None
+    mcp_config = args.mcp_config or (profile.mcp_config if profile is not None else None)
+    mcp_manager = McpManager.from_file(mcp_config) if mcp_config else None
     phase("mcp_config")
-    permission_engine = PermissionEngine(_permission_context(args))
+    auto_review = _auto_review_enabled(args, profile)
+    permission_engine = PermissionEngine(_permission_context(args, profile, auto_review))
     hooks = load_hook_registry(args.hooks_config) if args.hooks_config else None
-    if args.auto_review:
+    if auto_review:
         approval = AgentApprovalHandler(_build_reviewer(args, provider))
     else:
         approval = HumanApprovalHandler(_approval_callback(args))
@@ -774,8 +844,9 @@ RESPONSE DISCIPLINE
         provider=provider,
         tools=tools,
         workspace=workspace,
+        memory_dir=memory_dir,
         system_prompt="\n\n".join(system_parts),
-        max_steps=args.max_steps,
+        max_steps=profile.max_steps if profile and profile.max_steps else args.max_steps,
         permission_engine=permission_engine,
         approval_handler=approval,
         tracer=tracer,
@@ -818,11 +889,7 @@ def _sessions_command(args: argparse.Namespace) -> int:
     store = SessionStore(Path(args.session_dir or Path.cwd() / ".mini-oh" / "sessions"))
     summaries = store.list()
     if args.json:
-        print(
-            json.dumps(
-                [asdict(item) | {"path": str(item.path)} for item in summaries], indent=2
-            )
-        )
+        print(json.dumps([asdict(item) | {"path": str(item.path)} for item in summaries], indent=2))
     else:
         for item in summaries:
             print(
@@ -841,13 +908,29 @@ def _print_provider_hint(args: argparse.Namespace, event: AgentEvent) -> None:
         )
 
 
-def _permission_context(args: argparse.Namespace) -> PermissionContext:
+def _auto_review_enabled(
+    args: argparse.Namespace,
+    profile: AgentProfile | None,
+) -> bool:
+    if profile is None or profile.permission_policy == PermissionPolicy.INHERIT:
+        return bool(args.auto_review)
+    return profile.permission_policy == PermissionPolicy.AUTO_REVIEW
+
+
+def _permission_context(
+    args: argparse.Namespace,
+    profile: AgentProfile | None = None,
+    auto_review: bool | None = None,
+) -> PermissionContext:
     rules = build_default_rules()
-    if args.permission_config:
-        rules = load_rules_from_json(args.permission_config)
-    mode = (
-        PermissionMode.AUTO_REVIEW if args.auto_review else PermissionMode.DEFAULT
+    permission_config = args.permission_config or (
+        profile.permission_config if profile is not None else None
     )
+    if permission_config:
+        rules = load_rules_from_json(permission_config)
+    if auto_review is None:
+        auto_review = _auto_review_enabled(args, profile)
+    mode = PermissionMode.AUTO_REVIEW if auto_review else PermissionMode.DEFAULT
     return PermissionContext(
         mode=mode,
         rules=rules,
@@ -996,13 +1079,8 @@ def _print_event(event: AgentEvent) -> None:
         print(f"→ {_tool_start_summary(event)}")
     elif event.kind == "tool_end":
         marker = "✗" if event.data["is_error"] else "✓"
-        display_name = (
-            "shell" if event.data["name"] == "sandbox_shell" else event.data["name"]
-        )
-        print(
-            f"{marker} {display_name} ({event.data['elapsed_ms']}ms): "
-            f"{_tool_end_summary(event)}"
-        )
+        display_name = "shell" if event.data["name"] == "sandbox_shell" else event.data["name"]
+        print(f"{marker} {display_name} ({event.data['elapsed_ms']}ms): {_tool_end_summary(event)}")
     elif event.kind == "compact":
         print(
             f"compacted context: {event.data['before_tokens']} → "
@@ -1034,8 +1112,7 @@ def _tool_end_summary(event: AgentEvent) -> str:
         count = sum(
             1
             for line in event.message.splitlines()
-            if line and not line.startswith("(empty")
-            and not line.startswith("(no files")
+            if line and not line.startswith("(empty") and not line.startswith("(no files")
         )
         detail = tool_input.get("path", ".")
         if name == "find_files":
@@ -1065,16 +1142,18 @@ def _tool_start_summary(event: AgentEvent) -> str:
         return f"{name} {detail}"
     if name == "sandbox_shell":
         command = tool_input.get("command")
-        preview = (command if isinstance(command, str) else str(command)).replace(
-            "\n", " "
-        )
+        preview = (command if isinstance(command, str) else str(command)).replace("\n", " ")
         if len(preview) > 80:
             preview = preview[:80] + "…"
         return f"shell {preview}"
     return f"{name} {tool_input}"
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    profile: AgentProfile | None = None,
+) -> int:
     _load_environment()
     arguments = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -1088,15 +1167,17 @@ def main(argv: list[str] | None = None) -> int:
         if command == "sessions":
             return _sessions_command(build_sessions_parser().parse_args(arguments[1:]))
         if command == "resume":
-            return asyncio.run(_resume_command(build_resume_parser().parse_args(arguments[1:])))
+            return asyncio.run(
+                _resume_command(build_resume_parser().parse_args(arguments[1:]), profile)
+            )
         if command == "continue":
             return asyncio.run(
-                _resume_command(build_resume_parser().parse_args(arguments[1:]))
+                _resume_command(build_resume_parser().parse_args(arguments[1:]), profile)
             )
         args = build_run_parser().parse_args(arguments)
         if args.prompt:
-            return asyncio.run(_run(args))
-        return asyncio.run(_interactive(args))
+            return asyncio.run(_run(args, profile))
+        return asyncio.run(_interactive(args, profile))
     except KeyboardInterrupt:
         _print_resume_hint()
         print("cancelled", file=sys.stderr)

@@ -9,15 +9,18 @@ from types import SimpleNamespace
 import pytest
 
 import mini_openharness.cli as cli
+from mini_openharness.agent_profile import AgentProfile, PermissionPolicy
 from mini_openharness.cli import _load_environment, build_run_parser
 from mini_openharness.engine import AgentEvent
 from mini_openharness.models import ModelReply
 from mini_openharness.permissions import (
     PermissionBehavior,
     PermissionDecision,
+    PermissionEngine,
     PermissionRequest,
 )
 from mini_openharness.provider import ProviderError
+from mini_openharness.tools import ToolRegistry, ToolSearchTool
 
 
 class RecordingDemoProvider:
@@ -123,9 +126,7 @@ def test_cli_provider_error_returns_nonzero_and_hints_on_responses_404(
 
 
 def test_cli_runtime_registers_the_agent_tool(tmp_path):
-    args = build_run_parser().parse_args(
-        ["--demo", "--workspace", str(tmp_path), "--no-trace"]
-    )
+    args = build_run_parser().parse_args(["--demo", "--workspace", str(tmp_path), "--no-trace"])
 
     async def build():
         loop, tracer, mcp_manager, provider = await cli._build_runtime(
@@ -164,6 +165,177 @@ def test_runtime_system_prompt_has_goal_discipline(tmp_path):
             await cli._close_runtime(mcp_manager, provider)
 
     asyncio.run(build())
+
+
+def test_runtime_appends_custom_system_prompt_file(tmp_path):
+    prompt_file = tmp_path / "homestay.md"
+    prompt_file.write_text("Use real homestay search results only.", encoding="utf-8")
+    args = build_run_parser().parse_args(
+        [
+            "--demo",
+            "--workspace",
+            str(tmp_path),
+            "--no-trace",
+            "--no-session",
+            "--system-prompt-file",
+            str(prompt_file),
+        ]
+    )
+
+    async def build():
+        loop, tracer, mcp_manager, provider = await cli._build_runtime(
+            args,
+            session_log=None,
+            trace_prompt="probe",
+        )
+        try:
+            assert "Use real homestay search results only." in loop.messages[0].content
+        finally:
+            await cli._close_runtime(mcp_manager, provider)
+
+    asyncio.run(build())
+
+
+def test_agent_profile_replaces_coding_prompt_and_selects_tools(tmp_path):
+    def profile_tools():
+        registry = ToolRegistry()
+        registry.register(ToolSearchTool(registry))
+        return registry
+
+    profile = AgentProfile(
+        name="homestay",
+        system_prompt="You are a homestay assistant.",
+        tool_factory=profile_tools,
+        permission_policy=PermissionPolicy.HUMAN_APPROVAL,
+        max_steps=7,
+    )
+    args = build_run_parser().parse_args(
+        ["--demo", "--workspace", str(tmp_path), "--no-trace", "--no-session"]
+    )
+
+    async def build():
+        loop, tracer, mcp_manager, provider = await cli._build_runtime(
+            args,
+            session_log=None,
+            trace_prompt="probe",
+            profile=profile,
+        )
+        try:
+            system = loop.messages[0].content
+            assert system.startswith("You are a homestay assistant.")
+            assert "You are Mini Harness" not in system
+            assert "OUTPUT PROTOCOL: markdown" in system
+            assert {name for name, _ in loop.tools.items()} == {"tool_search"}
+            assert loop.max_steps == 7
+            assert loop.permission_engine.context.mode.value == "default"
+        finally:
+            await cli._close_runtime(mcp_manager, provider)
+
+    asyncio.run(build())
+
+
+def test_agent_profile_uses_isolated_skills_and_memory(tmp_path):
+    skills_dir = tmp_path / "assets" / "skills"
+    skill_dir = skills_dir / "booking"
+    memory_dir = tmp_path / "assets" / "memory"
+    skill_dir.mkdir(parents=True)
+    memory_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: booking\ndescription: Confirm a booking.\n---\n\n# Booking\n",
+        encoding="utf-8",
+    )
+    (memory_dir / "MEMORY.md").write_text(
+        "# Memory Index\n\n- [Guest](user_guest.md) — Prefers quiet rooms.\n",
+        encoding="utf-8",
+    )
+
+    profile = AgentProfile(
+        name="homestay",
+        system_prompt="You are a homestay assistant.",
+        tool_factory=ToolRegistry,
+        enable_skills=True,
+        enable_memory_prompt=True,
+        skills_dir=str(skills_dir),
+        memory_dir=str(memory_dir),
+    )
+    args = build_run_parser().parse_args(
+        ["--demo", "--workspace", str(tmp_path), "--no-trace", "--no-session"]
+    )
+
+    async def build():
+        loop, tracer, mcp_manager, provider = await cli._build_runtime(
+            args,
+            session_log=None,
+            trace_prompt="probe",
+            profile=profile,
+        )
+        try:
+            system = loop.messages[0].content
+            assert "booking: Confirm a booking." in system
+            assert "Prefers quiet rooms." in system
+            assert loop.memory_dir == memory_dir.resolve()
+            assert {name for name, _ in loop.tools.items()} == {
+                "load_skill",
+                "memory_read",
+                "memory_write",
+            }
+        finally:
+            await cli._close_runtime(mcp_manager, provider)
+
+    asyncio.run(build())
+
+
+def test_profile_permission_config_allows_order_creation_after_business_confirmation(tmp_path):
+    config = tmp_path / "homestay-permissions.json"
+    config.write_text(
+        """{
+  "rules": [
+    {"tool": "mcp__homestay__create_homestay_order", "action": "allow"},
+    {"tool": "*", "action": "allow"}
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+    profile = AgentProfile(
+        name="homestay",
+        system_prompt="You are a homestay assistant.",
+        tool_factory=ToolRegistry,
+        permission_policy=PermissionPolicy.HUMAN_APPROVAL,
+        permission_config=str(config),
+    )
+    args = build_run_parser().parse_args(["--demo", "--workspace", str(tmp_path)])
+    context = cli._permission_context(args, profile)
+    engine = PermissionEngine(context)
+
+    create = engine.authorize(
+        PermissionRequest(
+            tool_name="mcp__homestay__create_homestay_order",
+            input={},
+            source="mcp",
+            effect="remote",
+        )
+    )
+    payment = engine.authorize(
+        PermissionRequest(
+            tool_name="mcp__homestay__confirm_demo_payment",
+            input={},
+            source="mcp",
+            effect="remote",
+        )
+    )
+    search = engine.authorize(
+        PermissionRequest(
+            tool_name="mcp__homestay__search_homestays",
+            input={},
+            source="mcp",
+            effect="remote",
+        )
+    )
+
+    assert create.behavior == PermissionBehavior.ALLOW
+    assert payment.behavior == PermissionBehavior.ALLOW
+    assert search.behavior == PermissionBehavior.ALLOW
 
 
 def test_reviewer_prompt_includes_request_details(tmp_path, capsys):
@@ -272,9 +444,7 @@ def test_no_prompt_enters_interactive_repl(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "DemoProvider", RecordingDemoProvider)
     monkeypatch.setattr("builtins.input", lambda prompt="": "/exit")
 
-    code = cli.main(
-        ["--demo", "--workspace", str(tmp_path), "--no-trace", "--no-session"]
-    )
+    code = cli.main(["--demo", "--workspace", str(tmp_path), "--no-trace", "--no-session"])
 
     assert code == 0
     out = capsys.readouterr().out

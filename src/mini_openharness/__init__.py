@@ -1,5 +1,12 @@
 """Mini OpenHarness: the smallest useful coding-agent runtime."""
 
+from mini_openharness.agent_app import AgentApp
+from mini_openharness.agent_profile import (
+    MARKDOWN_OUTPUT,
+    AgentProfile,
+    OutputProtocol,
+    PermissionPolicy,
+)
 from mini_openharness.engine import AgentEvent, AgentLoop, RunAlreadyActiveError
 from mini_openharness.multiagent import (
     AgentDefinition,
@@ -14,6 +21,7 @@ from mini_openharness.provider import (
     OpenAICompatibleProvider,
     OpenAIResponsesProvider,
 )
+from mini_openharness.runtime import AgentRuntime, AgentRuntimeBuilder
 from mini_openharness.sandbox import BwrapShell, SandboxedShellTool
 from mini_openharness.skills import SkillCatalog
 from mini_openharness.tools import (
@@ -36,6 +44,13 @@ from mini_openharness.trace import (
 
 __all__ = [
     "AgentEvent",
+    "AgentApp",
+    "AgentProfile",
+    "AgentRuntime",
+    "AgentRuntimeBuilder",
+    "MARKDOWN_OUTPUT",
+    "OutputProtocol",
+    "PermissionPolicy",
     "AgentLoop",
     "RunAlreadyActiveError",
     "AgentDefinition",

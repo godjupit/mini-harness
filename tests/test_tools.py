@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,7 @@ from mini_openharness.tools import (
     ToolResult,
     default_tools,
 )
+from mini_openharness.tools.tool_search import tokenize
 
 
 async def approve_all(request, decision):
@@ -58,6 +60,15 @@ def test_tool_schemas_can_filter_registered_tools_and_default_hides_mcp(tmp_path
     assert "mcp__demo__search" not in registry.default_exposed_names()
     assert [item["name"] for item in registry.schemas({"tool_search"})] == ["tool_search"]
     assert [item["name"] for item in registry.schemas()] [-1] == "mcp__demo__search"
+
+
+def test_tool_search_tokenizes_chinese_for_mcp_discovery():
+    tokens = tokenize("帮我找杭州民宿")
+
+    assert "杭" in tokens
+    assert "州" in tokens
+    assert "民" in tokens
+    assert "宿" in tokens
 
 
 def allow_all_engine(workspace: Path) -> PermissionEngine:
@@ -454,7 +465,7 @@ def test_memory_write_appends_content_and_upserts_index_without_duplicates(tmp_p
         assert not result.is_error
 
     topic_text = (tmp_path / "memdir" / "user_response_style.md").read_text(encoding="utf-8")
-    assert topic_text.count("- 2026-08-19:") == 2
+    assert topic_text.count(f"- {date.today().isoformat()}:") == 2
     assert 'description: "prefers thorough explanations"' in topic_text
     assert "type: user" in topic_text.split("---", 2)[1]
     index = (tmp_path / "memdir" / "MEMORY.md").read_text(encoding="utf-8")
@@ -478,7 +489,7 @@ def test_memory_write_is_allowed_by_default_rules_and_appends(tmp_path):
 
     assert not first.is_error and not second.is_error
     text = (tmp_path / "memdir" / "user_response_style.md").read_text(encoding="utf-8")
-    assert text.count("- 2026-08-19: prefers concise replies") == 2
+    assert text.count(f"- {date.today().isoformat()}: prefers concise replies") == 2
 
 
 def test_memory_write_rejects_unknown_type_empty_content_and_unsafe_topic(tmp_path):
@@ -541,6 +552,32 @@ def test_memory_read_is_allowed_by_default_rules(tmp_path):
 
     assert not result.is_error
     assert "streaming notes" in result.output
+
+
+def test_memory_tools_use_configured_app_directory(tmp_path):
+    workspace = tmp_path / "workspace"
+    memory_dir = tmp_path / "agent_assets" / "homestay" / "memory"
+    workspace.mkdir()
+    context = ToolContext(workspace, memory_dir=memory_dir)
+    tools = default_tools()
+
+    written = execute(
+        tools,
+        "memory_write",
+        {"type": "project", "topic": "payment", "content": "Use demo payment."},
+        context,
+    )
+    loaded = execute(
+        tools,
+        "memory_read",
+        {"file": "project_payment.md"},
+        context,
+    )
+
+    assert written.is_error is False
+    assert "Use demo payment." in loaded.output
+    assert (memory_dir / "project_payment.md").is_file()
+    assert not (workspace / "memdir").exists()
 
 
 def test_memory_read_rejects_missing_escapes_and_non_markdown(tmp_path):

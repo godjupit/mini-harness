@@ -109,6 +109,7 @@ class AgentLoop:
         provider: ModelProvider,
         tools: ToolRegistry,
         workspace: str | Path,
+        memory_dir: str | Path | None = None,
         system_prompt: str = "You are a concise coding assistant. Inspect before editing.",
         max_steps: int = 12,
         permission_engine: PermissionEngine | None = None,
@@ -136,6 +137,11 @@ class AgentLoop:
         self.provider = provider
         self.tools = tools
         self.workspace = Path(workspace).resolve()
+        self.memory_dir = (
+            Path(memory_dir).resolve()
+            if memory_dir is not None
+            else self.workspace / "memdir"
+        )
         self.max_steps = max_steps
         self.permission_engine = permission_engine
         self.approval_handler = approval_handler
@@ -268,6 +274,7 @@ class AgentLoop:
     def _make_context(self, state: RunState) -> ToolContext:
         return ToolContext(
             self.workspace,
+            memory_dir=self.memory_dir,
             permission_engine=self.permission_engine,
             approval_handler=self.approval_handler,
             tracer=self.tracer,

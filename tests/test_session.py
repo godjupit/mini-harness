@@ -446,6 +446,8 @@ def test_cli_run_session_dir_places_session_file(tmp_path):
     record = SessionStore(session_dir).read(files[0].stem)
     assert record.messages[0].role == "user"
     assert record.messages[0].content == "hello"
+    assert record.meta["workspace"] == str(tmp_path)
+    assert record.meta["agent_profile"] == "coding-default"
     assert cli._ACTIVE_SESSION is None
 
 

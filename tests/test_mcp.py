@@ -180,6 +180,19 @@ def test_http_mcp_oauth_config_and_env_headers(tmp_path, monkeypatch):
     assert remote.oauth.scopes == "tools:read"
 
 
+def test_optional_mcp_header_is_omitted_when_its_environment_variable_is_missing(tmp_path):
+    config = tmp_path / "mcp.json"
+    config.write_text(
+        '{"mcpServers":{"remote":{"url":"http://127.0.0.1:8091/mcp",'
+        '"optionalHeadersEnv":{"X-Optional":"MCP_OPTIONAL_HEADER"}}}}',
+        encoding="utf-8",
+    )
+
+    manager = McpManager.from_file(config)
+
+    assert manager.configs["remote"].headers == {}
+
+
 def test_oauth_token_storage_is_atomic_and_owner_only(tmp_path):
     storage = FileOAuthStorage(tmp_path / "oauth" / "tokens.json")
 
@@ -230,9 +243,7 @@ def test_loopback_oauth_callback_captures_code_and_state():
         port = sock.getsockname()[1]
 
     async def exercise():
-        flow = LoopbackOAuthFlow(
-            f"http://127.0.0.1:{port}/callback", open_browser=False
-        )
+        flow = LoopbackOAuthFlow(f"http://127.0.0.1:{port}/callback", open_browser=False)
         await flow.redirect_handler("https://auth.example/authorize")
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
@@ -258,9 +269,7 @@ def test_oauth_refuses_authorization_server_without_pkce_s256(tmp_path):
         "https://mcp.example.com/mcp",
         McpOAuthConfig(token_file=tmp_path / "token.json", open_browser=False),
     )
-    provider.context.oauth_metadata = SimpleNamespace(
-        code_challenge_methods_supported=["plain"]
-    )
+    provider.context.oauth_metadata = SimpleNamespace(code_challenge_methods_supported=["plain"])
 
     with pytest.raises(OAuthFlowError, match="PKCE S256"):
         asyncio.run(provider._perform_authorization_code_grant())
@@ -300,9 +309,7 @@ def test_real_streamable_http_mcp_transport(tmp_path):
 
         config = tmp_path / "mcp.json"
         config.write_text(
-            '{"mcpServers":{"http":{"url":"http://127.0.0.1:'
-            + str(port)
-            + '/mcp"}}}',
+            '{"mcpServers":{"http":{"url":"http://127.0.0.1:' + str(port) + '/mcp"}}}',
             encoding="utf-8",
         )
 

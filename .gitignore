@@ -9,9 +9,5 @@ build/
 dist/
 interview-qa/
 .claude
-swebench-run/
 logs/
-swebench-run10
-swebench-run
-docs
-scripts
+swebench-run*/

@@ -424,10 +424,15 @@ wqb \
 
 ```text
 mini-harness/
+├── apps/
+│   └── coding_agent.py       # Coding Agent 入口与 Profile
 ├── src/mini_openharness/
+│   ├── agent_app.py          # Profile 到应用入口的绑定
+│   ├── agent_profile.py      # 角色、工具、权限与输出契约
+│   ├── runtime.py            # 共享运行时装配
 │   ├── engine.py              # agent 状态机与工具编排
 │   ├── provider.py            # Responses + Chat 兼容 provider
-│   ├── tools.py               # 注册表、描述符、锁、文件工具
+│   ├── tools/                 # 注册表、描述符、锁、文件工具
 │   ├── permissions/           # safety、rules、engine、approval handlers
 │   ├── multiagent.py          # 子 Agent 定义、注册表、委派工具
 │   ├── hooks.py               # 生命周期 hook 注册表与执行器
@@ -435,15 +440,12 @@ mini-harness/
 │   ├── trace.py               # JSONL trace、回放、剪枝
 │   ├── session.py             # 持久会话与 resume 逻辑
 │   ├── skills.py              # 渐进式 skill 加载
-│   ├── mcp.py                 # MCP 集成
-│   ├── mcp_auth.py            # HTTP MCP OAuth 支持
+│   ├── mcp/                   # MCP 集成与 HTTP OAuth
 │   ├── sandbox.py             # bwrap 沙箱宿主 shell
 │   ├── models.py              # 消息与工具调用数据结构
 │   └── cli.py                 # `wqb` 命令行入口
 ├── tests/                     # 运行时与协议测试
 ├── examples/                  # permissions、hooks、MCP、reviewer 演示
-├── docs/                      # 引导式代码阅读笔记
-├── TECHNICAL_DESIGN.md        # 设计原理与实现细节
 ├── pyproject.toml
 └── LICENSE
 ```
@@ -477,8 +479,6 @@ ruff check .
 - 默认子 Agent 是轻量委派循环，不是自主分布式 worker
 - 没有 TUI、插件市场或远程多用户执行服务
 - 权限规则刻意保持简单的 glob 规则，而非完整策略语言
-
-更深入的设计说明见 [TECHNICAL_DESIGN.md](TECHNICAL_DESIGN.md)。
 
 ## License
 

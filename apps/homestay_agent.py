@@ -10,6 +10,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
+APP_ROOT = PROJECT_ROOT / "apps" / "homestay"
+DATA_ROOT = APP_ROOT / "data"
 sys.path = [entry for entry in sys.path if Path(entry or ".").resolve() != PROJECT_ROOT]
 sys.path.insert(0, str(SRC_ROOT))
 
@@ -35,7 +37,7 @@ def homestay_mcp_config() -> str:
     configured = Path(
         os.environ.get(
             "HOMESTAY_MCP_CONFIG",
-            str(PROJECT_ROOT / "examples" / "homestay-mcp.json"),
+            str(APP_ROOT / "config" / "homestay-mcp.json"),
         )
     )
     if not configured.is_absolute():
@@ -44,7 +46,7 @@ def homestay_mcp_config() -> str:
 
 
 def homestay_workspace() -> Path:
-    """Keep Homestay runtime data with the Gin LookLook project by default."""
+    """Resolve the Gin LookLook workspace used by Homestay MCP operations."""
     configured = os.environ.get("HOMESTAY_WORKSPACE")
     if configured:
         return Path(configured).expanduser().resolve()
@@ -54,32 +56,39 @@ def homestay_workspace() -> Path:
 
 HOMESTAY_PROFILE = AgentProfile(
     name="homestay",
-    system_prompt=(PROJECT_ROOT / "examples" / "homestay-system-prompt.md").read_text(
+    system_prompt=(APP_ROOT / "config" / "system-prompt.md").read_text(
         encoding="utf-8"
     ),
     tool_factory=build_homestay_tools,
     prompt_mode="replace",
     mcp_config=homestay_mcp_config(),
     permission_policy=PermissionPolicy.HUMAN_APPROVAL,
-    permission_config=str(PROJECT_ROOT / "examples" / "homestay-permissions.json"),
+    permission_config=str(APP_ROOT / "config" / "homestay-permissions.json"),
     max_steps=12,
     output_protocol=MARKDOWN_OUTPUT,
     enable_skills=True,
     enable_memory_prompt=True,
-    skills_dir=str(PROJECT_ROOT / "agent_assets" / "homestay" / "skills"),
-    memory_dir=str(PROJECT_ROOT / "agent_assets" / "homestay" / "memory"),
+    skills_dir=str(APP_ROOT / "skills"),
+    memory_dir=str(APP_ROOT / "memory"),
 )
 
 APP = AgentApp(HOMESTAY_PROFILE)
 
 
+def app_arguments(arguments: list[str]) -> list[str]:
+    """Apply Homestay-owned workspace and data paths before user overrides."""
+    return [
+        "--workspace",
+        str(homestay_workspace()),
+        "--session-dir",
+        str(DATA_ROOT / "sessions"),
+        "--trace-dir",
+        str(DATA_ROOT / "traces"),
+        "--artifact-dir",
+        str(DATA_ROOT / "artifacts"),
+        *arguments,
+    ]
+
+
 if __name__ == "__main__":
-    raise SystemExit(
-        APP.run(
-            [
-                "--workspace",
-                str(homestay_workspace()),
-                *sys.argv[1:],
-            ]
-        )
-    )
+    raise SystemExit(APP.run(app_arguments(sys.argv[1:])))

@@ -288,11 +288,12 @@ python apps/homestay_agent.py "帮我找杭州西湖附近的民宿"
 ```
 
 Each concrete app declares one `AgentProfile` and passes it to `AgentApp`; no
-copy of `AgentLoop` or provider/MCP/session setup is needed. The Homestay app
-keeps its Python entry and resources in this repository but uses `gin-looklook`
-as its default workspace. Sessions, traces, and artifacts therefore stay with
-the operated product instead of polluting the framework repository. Set
-`HOMESTAY_WORKSPACE` to override that location.
+copy of `AgentLoop` or provider/MCP/session setup is needed. Coding and Homestay
+use the same `apps/<name>/{config,skills,memory,data}` layout. Their entrypoints
+explicitly keep Session, Trace, and Artifact files in the matching App's
+`data/` directory instead of the generic `.mini-oh` default. The Homestay MCP
+business workspace still defaults to the sibling `gin-looklook` repository;
+set `HOMESTAY_WORKSPACE` to override it.
 
 ## Subagent delegation
 
@@ -514,7 +515,9 @@ wqb \
 mini-harness/
 ├── apps/
 │   ├── coding_agent.py       # Coding product entry + explicit profile
-│   └── homestay_agent.py     # Homestay product entry + explicit profile
+│   ├── homestay_agent.py     # Homestay product entry + explicit profile
+│   ├── coding/               # config, Skills, Memory, and local runtime data
+│   └── homestay/             # same App-owned layout
 ├── src/mini_openharness/
 │   ├── agent_app.py          # profile-to-application binding
 │   ├── agent_profile.py      # role, tools, permissions, output contract

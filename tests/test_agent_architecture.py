@@ -111,16 +111,42 @@ def test_coding_and_homestay_apps_are_explicit_profiles():
     assert coding.APP.profile.enable_sandbox_shell is True
     assert coding.APP.profile.enable_subagents is True
     assert coding.APP.profile.permission_policy == PermissionPolicy.AUTO_REVIEW
-    assert coding.APP.profile.skills_dir.endswith("agent_assets/coding/skills")
-    assert coding.APP.profile.memory_dir.endswith("agent_assets/coding/memory")
+    assert coding.APP.profile.skills_dir.endswith("apps/coding/skills")
+    assert coding.APP.profile.memory_dir.endswith("apps/coding/memory")
+    assert coding.DATA_ROOT == root / "apps" / "coding" / "data"
+    coding_arguments = coding.app_arguments(["--workspace", "/tmp/project", "hello"])
+    assert coding_arguments[-1] == "hello"
+    assert coding_arguments[coding_arguments.index("--session-dir") + 1].endswith(
+        "apps/coding/data/sessions"
+    )
+    assert coding_arguments[coding_arguments.index("--trace-dir") + 1].endswith(
+        "apps/coding/data/traces"
+    )
+    assert coding_arguments[coding_arguments.index("--artifact-dir") + 1].endswith(
+        "apps/coding/data/artifacts"
+    )
 
     assert homestay.APP.profile.name == "homestay"
     assert homestay.APP.profile.prompt_mode == "replace"
-    assert homestay.APP.profile.mcp_config.endswith("examples/homestay-mcp.json")
+    assert homestay.APP.profile.mcp_config.endswith(
+        "apps/homestay/config/homestay-mcp.json"
+    )
     assert homestay.APP.profile.permission_policy == PermissionPolicy.HUMAN_APPROVAL
     assert homestay.APP.profile.permission_config.endswith("homestay-permissions.json")
-    assert homestay.APP.profile.skills_dir.endswith("agent_assets/homestay/skills")
-    assert homestay.APP.profile.memory_dir.endswith("agent_assets/homestay/memory")
+    assert homestay.APP.profile.skills_dir.endswith("apps/homestay/skills")
+    assert homestay.APP.profile.memory_dir.endswith("apps/homestay/memory")
+    assert homestay.DATA_ROOT == root / "apps" / "homestay" / "data"
+    arguments = homestay.app_arguments(["hello"])
+    assert arguments[-1] == "hello"
+    assert arguments[arguments.index("--session-dir") + 1].endswith(
+        "apps/homestay/data/sessions"
+    )
+    assert arguments[arguments.index("--trace-dir") + 1].endswith(
+        "apps/homestay/data/traces"
+    )
+    assert arguments[arguments.index("--artifact-dir") + 1].endswith(
+        "apps/homestay/data/artifacts"
+    )
     assert homestay.homestay_workspace() == root.parent / "gin-looklook"
     skills = SkillCatalog(homestay.APP.profile.skills_dir)
     assert {skill.name for skill in skills.list()} >= {

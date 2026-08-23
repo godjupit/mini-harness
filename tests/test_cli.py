@@ -167,6 +167,34 @@ def test_runtime_system_prompt_has_goal_discipline(tmp_path):
     asyncio.run(build())
 
 
+def test_runtime_uses_explicit_artifact_directory(tmp_path):
+    artifact_dir = tmp_path / "agent-data" / "artifacts"
+    args = build_run_parser().parse_args(
+        [
+            "--demo",
+            "--workspace",
+            str(tmp_path),
+            "--artifact-dir",
+            str(artifact_dir),
+            "--no-trace",
+            "--no-session",
+        ]
+    )
+
+    async def build():
+        loop, tracer, mcp_manager, provider = await cli._build_runtime(
+            args,
+            session_log=None,
+            trace_prompt="probe",
+        )
+        try:
+            assert loop.artifact_store.root == artifact_dir.resolve()
+        finally:
+            await cli._close_runtime(mcp_manager, provider)
+
+    asyncio.run(build())
+
+
 def test_runtime_appends_custom_system_prompt_file(tmp_path):
     prompt_file = tmp_path / "homestay.md"
     prompt_file.write_text("Use real homestay search results only.", encoding="utf-8")

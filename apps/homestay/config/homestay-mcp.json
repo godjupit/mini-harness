@@ -4,7 +4,7 @@
       "url": "http://127.0.0.1:8091/mcp",
       "oauth": {
         "redirectUri": "http://127.0.0.1:8765/callback",
-        "tokenFile": "../../gin-looklook/.mini-oh/oauth/homestay.json",
+        "tokenFile": "../data/oauth/homestay.json",
         "scopes": "homestays:read orders:read orders:write payments:write",
         "clientName": "Gin LookLook Homestay Agent",
         "openBrowser": true

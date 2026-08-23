@@ -156,6 +156,7 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--max-inline-output", type=int, default=8_000)
+    parser.add_argument("--artifact-dir", help="Directory for offloaded tool outputs")
     parser.add_argument("--input-cost", type=float, default=0.0, help="USD per million tokens")
     parser.add_argument("--output-cost", type=float, default=0.0, help="USD per million tokens")
     parser.add_argument("--skills-dir", help="Directory containing <name>/SKILL.md skills")
@@ -858,7 +859,7 @@ RESPONSE DISCIPLINE
             token_counter=token_counter,
         ),
         artifact_store=ArtifactStore(
-            workspace / ".mini-oh" / "artifacts",
+            Path(args.artifact_dir or workspace / ".mini-oh" / "artifacts").resolve(),
             max_inline_chars=args.max_inline_output,
         ),
         input_cost_per_million=args.input_cost,

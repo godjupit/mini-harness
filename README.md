@@ -225,7 +225,7 @@ Agent Profile
                          │
                          ▼
 Agent App
-  apps/coding_agent.py / a product-owned app
+  apps/coding_agent.py / apps/homestay_agent.py
 ```
 
 `AgentRuntimeBuilder` assembles the kernel services around a profile;
@@ -284,13 +284,15 @@ Run the concrete applications directly:
 
 ```bash
 python apps/coding_agent.py --workspace ../my-project "修复登录错误"
+python apps/homestay_agent.py "帮我找杭州西湖附近的民宿"
 ```
 
-Product-specific apps should live with their product repository and import the
-installed `mini_openharness` package. Declare one `AgentProfile` and pass it to
-`AgentApp`; no copy of `AgentLoop` or provider/MCP/session setup is needed.
-Because runtime data defaults to `<workspace>/.mini-oh/`, sessions, traces, and
-artifacts stay with the product being operated instead of polluting this framework.
+Each concrete app declares one `AgentProfile` and passes it to `AgentApp`; no
+copy of `AgentLoop` or provider/MCP/session setup is needed. The Homestay app
+keeps its Python entry and resources in this repository but uses `gin-looklook`
+as its default workspace. Sessions, traces, and artifacts therefore stay with
+the operated product instead of polluting the framework repository. Set
+`HOMESTAY_WORKSPACE` to override that location.
 
 ## Subagent delegation
 
@@ -511,7 +513,8 @@ wqb \
 ```text
 mini-harness/
 ├── apps/
-│   └── coding_agent.py       # Coding product entry + explicit profile
+│   ├── coding_agent.py       # Coding product entry + explicit profile
+│   └── homestay_agent.py     # Homestay product entry + explicit profile
 ├── src/mini_openharness/
 │   ├── agent_app.py          # profile-to-application binding
 │   ├── agent_profile.py      # role, tools, permissions, output contract

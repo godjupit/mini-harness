@@ -1,0 +1,56 @@
+{
+  "rules": [
+    {
+      "tool": "mcp__homestay__health",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__homestay__search_homestays",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__homestay__get_homestay_detail",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__homestay__check_homestay_availability",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__homestay__quote_homestay_stay",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__homestay__list_featured_homestays",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__homestay__list_recommended_homestays",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__homestay__list_my_orders",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__homestay__get_my_order_status",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__homestay__get_my_order_detail",
+      "action": "allow"
+    },
+    {
+      "tool": "mcp__homestay__create_homestay_order",
+      "action": "ask"
+    },
+    {
+      "tool": "mcp__homestay__confirm_demo_payment",
+      "action": "ask"
+    },
+    {
+      "tool": "mcp__homestay__cancel_my_order",
+      "action": "ask"
+    }
+  ]
+}

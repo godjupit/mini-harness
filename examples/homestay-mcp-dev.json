@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "homestay": {
+      "url": "http://127.0.0.1:8091/mcp",
+      "headersEnv": {
+        "Authorization": "MCP_DEV_AUTHORIZATION"
+      },
+      "protocolMode": "auto",
+      "trustToolAnnotations": false
+    }
+  }
+}

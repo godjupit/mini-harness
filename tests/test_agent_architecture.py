@@ -12,6 +12,7 @@ from mini_openharness.agent_profile import (
     OutputProtocol,
     PermissionPolicy,
 )
+from mini_openharness.skills import SkillCatalog
 from mini_openharness.tools import ToolRegistry
 from mini_openharness.runtime import AgentRuntimeBuilder
 
@@ -101,9 +102,10 @@ def test_runtime_builder_uses_frontend_adapter_without_importing_business_apps()
     assert captured["trace_prompt"] == "hello"
 
 
-def test_coding_app_is_an_explicit_profile():
+def test_coding_and_homestay_apps_are_explicit_profiles():
     root = Path(__file__).resolve().parents[1]
     coding = load_app(root / "apps" / "coding_agent.py", "test_coding_agent_app")
+    homestay = load_app(root / "apps" / "homestay_agent.py", "test_homestay_agent_app")
 
     assert coding.APP.profile.name == "coding"
     assert coding.APP.profile.enable_sandbox_shell is True
@@ -111,3 +113,20 @@ def test_coding_app_is_an_explicit_profile():
     assert coding.APP.profile.permission_policy == PermissionPolicy.AUTO_REVIEW
     assert coding.APP.profile.skills_dir.endswith("agent_assets/coding/skills")
     assert coding.APP.profile.memory_dir.endswith("agent_assets/coding/memory")
+
+    assert homestay.APP.profile.name == "homestay"
+    assert homestay.APP.profile.prompt_mode == "replace"
+    assert homestay.APP.profile.mcp_config.endswith("examples/homestay-mcp.json")
+    assert homestay.APP.profile.permission_policy == PermissionPolicy.HUMAN_APPROVAL
+    assert homestay.APP.profile.permission_config.endswith("homestay-permissions.json")
+    assert homestay.APP.profile.skills_dir.endswith("agent_assets/homestay/skills")
+    assert homestay.APP.profile.memory_dir.endswith("agent_assets/homestay/memory")
+    assert homestay.homestay_workspace() == root.parent / "gin-looklook"
+    skills = SkillCatalog(homestay.APP.profile.skills_dir)
+    assert {skill.name for skill in skills.list()} >= {
+        "booking-workflow",
+        "extend-one-night",
+        "find-and-compare",
+        "stay-planning",
+        "manage-my-orders",
+    }

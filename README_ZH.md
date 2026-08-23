@@ -425,7 +425,8 @@ wqb \
 ```text
 mini-harness/
 ├── apps/
-│   └── coding_agent.py       # Coding Agent 入口与 Profile
+│   ├── coding_agent.py       # Coding Agent 入口与 Profile
+│   └── homestay_agent.py     # Homestay Agent 入口与 Profile
 ├── src/mini_openharness/
 │   ├── agent_app.py          # Profile 到应用入口的绑定
 │   ├── agent_profile.py      # 角色、工具、权限与输出契约

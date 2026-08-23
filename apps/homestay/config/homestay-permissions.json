@@ -13,6 +13,10 @@
       "action": "allow"
     },
     {
+      "tool": "mcp__homestay__compare_homestays",
+      "action": "allow"
+    },
+    {
       "tool": "mcp__homestay__check_homestay_availability",
       "action": "allow"
     },

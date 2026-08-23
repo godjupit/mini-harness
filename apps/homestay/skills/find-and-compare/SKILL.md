@@ -7,7 +7,7 @@ description: 搜索、筛选并比较民宿；适用于“推荐几个”“哪�
 
 1. 先提取城市、预算（每晚）、人数、日期、偏好标签和最低评分。缺少城市或偏好时，可先调用 `list_recommended_homestays`，不要编造条件。
 2. 条件明确后调用 `search_homestays`；每次最多展示 3 个最匹配结果，写明房源 ID、每晚价格、评分、容量和标签。
-3. 用户要求比较或有日期时，对候选房源调用 `get_homestay_detail`。日期和人数完整时，再调用 `quote_homestay_stay`，比较总价与可订状态。
+3. 用户要求比较两个或三个候选房源时，优先调用 `compare_homestays`。用户要求查看更多细节或有日期时，对候选房源调用 `get_homestay_detail`。日期和人数完整时，再调用 `quote_homestay_stay`，比较总价与可订状态。
 4. 比较必须基于工具结果，明确区分“当前可订”和“下单时仍会复核”。不要把搜索结果当作已锁房。
 5. 用户选定房源后，转入 `booking-workflow` Skill；在用户明确确认创建订单前，绝不调用 `create_homestay_order`。
 

@@ -204,9 +204,8 @@ Reviewer 只会收到工具、效应、path/command、workspace、参数和权�
 }
 ```
 
-```bash
-wqb --permission-config examples/permissions.json --workspace . "Update the docs."
-```
+将上述 JSON 保存到实际使用它的 App 或部署配置中，再通过
+`--permission-config` 传入。
 
 规则模式使用 `fnmatch` 风格匹配；未命中的请求仍会落入运行时默认策略和不可绕过的安全检查。
 
@@ -310,12 +309,7 @@ Hooks 是模型无法关闭的可信运行时扩展。
 
 stop hook 可以作为验证闸门：如果它阻止完成，输出会作为反馈返回给模型，让模型修复后再次尝试。
 
-```bash
-wqb \
-  --hooks-config examples/hooks-verification.json \
-  --workspace . \
-  "Implement the change and make the tests pass."
-```
+将 hook 配置保存在拥有该验证命令的 App 中，再通过 `--hooks-config` 传入。
 
 命令式 hooks 直接用 `argv` 执行（不经 Shell），以 workspace 为工作目录，支持显式超时与 fail-open/fail-closed。
 
@@ -368,9 +362,18 @@ wqb resume --latest
 
 ### MCP
 
+Coding App 已内置可选的 GitHub MCP 集成。设置
+`GITHUB_PERSONAL_ACCESS_TOKEN` 并确保 Docker 可用后，运行：
+
 ```bash
-wqb --mcp-config examples/mcp.json --workspace . "Inspect available MCP tools."
+python apps/coding_agent.py \
+  --mcp-config apps/coding/config/github-mcp.json \
+  --workspace ../my-project \
+  "Inspect the open issues."
 ```
+
+HTTP OAuth MCP 配置具有应用专属性：回调地址、token 路径、scope 和凭据都应
+保存在拥有该集成的 App 中。
 
 支持 stdio 与 Streamable HTTP 传输、输入/输出 schema 校验、结构化内容保留、保守的 `readOnlyHint` 处理，以及带本地 token 持久化的 OAuth 流程。远程工具不会因为“可达”就被隐式信任。
 
@@ -448,7 +451,6 @@ mini-harness/
 │   ├── models.py              # 消息与工具调用数据结构
 │   └── cli.py                 # `wqb` 命令行入口
 ├── tests/                     # 运行时与协议测试
-├── examples/                  # permissions、hooks、MCP、reviewer 演示
 ├── pyproject.toml
 └── LICENSE
 ```

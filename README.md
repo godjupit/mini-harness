@@ -204,9 +204,8 @@ The reviewer receives the tool, effect, path/command, workspace, arguments, and 
 }
 ```
 
-```bash
-wqb --permission-config examples/permissions.json --workspace . "Update the docs."
-```
+Save the JSON as a configuration file owned by the App or deployment that uses
+it, then pass that file with `--permission-config`.
 
 Rule patterns use `fnmatch`-style matching. Unmatched requests still fall through to the runtime default and non-bypassable safety checks.
 
@@ -395,12 +394,8 @@ Hooks are trusted runtime extensions the model cannot opt out of.
 
 A stop hook can act as a verification gate: if it blocks completion, its output returns to the model as feedback so the agent can fix the problem and try again.
 
-```bash
-wqb \
-  --hooks-config examples/hooks-verification.json \
-  --workspace . \
-  "Implement the change and make the tests pass."
-```
+Save the hook configuration with the App that owns the verification command,
+then pass it with `--hooks-config`.
 
 Command hooks execute with `argv` directly (no shell), use the workspace as the working directory, and support explicit timeout and fail-open/fail-closed behavior.
 
@@ -453,9 +448,18 @@ wqb resume --latest
 
 ### MCP
 
+The Coding App includes an opt-in GitHub MCP integration. Set
+`GITHUB_PERSONAL_ACCESS_TOKEN` and use Docker, then run:
+
 ```bash
-wqb --mcp-config examples/mcp.json --workspace . "Inspect available MCP tools."
+python apps/coding_agent.py \
+  --mcp-config apps/coding/config/github-mcp.json \
+  --workspace ../my-project \
+  "Inspect the open issues."
 ```
+
+HTTP OAuth MCP configuration is application-specific: keep its callback URL,
+token path, scopes, and credentials with the App that owns the integration.
 
 Supports stdio and Streamable HTTP transports, input/output schema validation, structured content preservation, conservative `readOnlyHint` handling, and OAuth 2.1 authorization-code flows with PKCE. For OAuth-enabled HTTP servers, the MCP SDK discovers RFC 9728 Protected Resource Metadata from the server's `401` challenge, discovers the Authorization Server, requests a resource-bound access token, refreshes it when needed, and persists credentials in an owner-readable token file. The harness does not mint an MCP access token itself.
 
@@ -537,7 +541,6 @@ mini-harness/
 │   ├── models.py              # messages and tool-call data structures
 │   └── cli.py                 # `wqb` command-line interface
 ├── tests/                     # runtime and protocol tests
-├── examples/                  # permissions, hooks, MCP, reviewer demos
 ├── pyproject.toml
 └── LICENSE
 ```

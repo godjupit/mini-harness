@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from mini_openharness.errors.tools import FileChangedDuringEditError
 from mini_openharness.tools.base import (
     ResourceAccess,
     ToolContext,
@@ -124,7 +125,7 @@ class EditFileTool:
                 mode,
                 current_hash,
             )
-        except _FileChangedDuringEdit:
+        except FileChangedDuringEditError:
             return ToolResult.fail(
                 f"File changed while the edit was being prepared: {raw_path}",
                 code="file_changed",
@@ -153,10 +154,6 @@ class EditFileTool:
         return (ResourceAccess(f"fs:{path}", "write"),)
 
 
-class _FileChangedDuringEdit(RuntimeError):
-    pass
-
-
 def _atomic_replace_bytes(
     path: Path,
     data: bytes,
@@ -177,7 +174,7 @@ def _atomic_replace_bytes(
         temporary.chmod(mode)
         latest_hash = hashlib.sha256(path.read_bytes()).hexdigest()
         if latest_hash != expected_sha256:
-            raise _FileChangedDuringEdit
+            raise FileChangedDuringEditError
         os.replace(temporary, path)
         _fsync_directory(path.parent)
     finally:

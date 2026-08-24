@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from mini_openharness.engine import AgentLoop, MaxStepsExceeded, RunAlreadyActiveError
+from mini_openharness.engine import AgentLoop
+from mini_openharness.errors import MaxStepsExceeded, RunAlreadyActiveError
 from mini_openharness.models import Message, ModelReply, ToolCall
 from mini_openharness.permissions import (
     HumanApprovalHandler,

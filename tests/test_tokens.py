@@ -8,7 +8,7 @@ import pytest
 
 from mini_openharness.compaction import ContextCompactor, estimate_tokens
 from mini_openharness.models import Message, ToolCall
-from mini_openharness.tokens import (
+from mini_openharness.utils.tokens import (
     HeuristicCounter,
     TiktokenCounter,
     build_token_counter,

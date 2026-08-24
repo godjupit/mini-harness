@@ -22,7 +22,9 @@ from mini_openharness.compaction import (
     ArtifactStore,
     ContextCompactor,
 )
-from mini_openharness.engine import AgentEvent, AgentLoop, MaxStepsExceeded
+from mini_openharness.engine import AgentEvent, AgentLoop
+from mini_openharness.errors.engine import MaxStepsExceeded
+from mini_openharness.errors.sandbox import SandboxUnavailableError
 from mini_openharness.hooks import load_hook_registry
 from mini_openharness.mcp.mcp import McpManager
 from mini_openharness.models import Message
@@ -44,7 +46,6 @@ from mini_openharness.provider import (
 from mini_openharness.runtime import AgentRuntimeBuilder
 from mini_openharness.sandbox import (
     BwrapShell,
-    SandboxUnavailableError,
     SandboxedShellTool,
 )
 from mini_openharness.session import (
@@ -57,7 +58,7 @@ from mini_openharness.session import (
 from mini_openharness.skills import LoadSkillTool, SkillCatalog
 from mini_openharness.tools import MemoryReadTool, MemoryWriteTool, default_tools
 from mini_openharness.trace import TraceStore, TraceWriter
-from mini_openharness.tokens import build_token_counter
+from mini_openharness.utils.tokens import build_token_counter
 
 
 def _positive_int(value: str) -> int:

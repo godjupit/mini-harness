@@ -9,48 +9,20 @@ from typing import Any, AsyncIterator, Protocol
 
 import httpx
 
+from mini_openharness.errors.provider import (
+    ProviderAuthenticationError,
+    ProviderCancelledError,
+    ProviderContextWindowError,
+    ProviderError,
+    ProviderInvalidResponseError,
+    ProviderNetworkError,
+    ProviderOutputTruncatedError,
+    ProviderRateLimitError,
+    ProviderServerError,
+    ProviderTimeoutError,
+)
 from mini_openharness.models import Message, ModelReply, ToolCall
-from mini_openharness.tokens import HeuristicCounter, TokenCounter
-
-
-class ProviderError(RuntimeError):
-    """Base class for normalized provider failures."""
-
-
-class ProviderAuthenticationError(ProviderError):
-    pass
-
-
-class ProviderRateLimitError(ProviderError):
-    pass
-
-
-class ProviderTimeoutError(ProviderError):
-    pass
-
-
-class ProviderNetworkError(ProviderError):
-    pass
-
-
-class ProviderServerError(ProviderError):
-    pass
-
-
-class ProviderContextWindowError(ProviderError):
-    """The request input exceeded the provider context window."""
-
-
-class ProviderInvalidResponseError(ProviderError):
-    pass
-
-
-class ProviderOutputTruncatedError(ProviderInvalidResponseError):
-    """The provider stopped before producing a complete assistant turn."""
-
-
-class ProviderCancelledError(ProviderError):
-    pass
+from mini_openharness.utils.tokens import HeuristicCounter, TokenCounter
 
 
 @dataclass(frozen=True)

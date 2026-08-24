@@ -8,20 +8,23 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Literal
+from typing import Any, AsyncIterator, Literal
 from uuid import uuid4
 
 from mini_openharness.compaction import ArtifactStore, ContextCompactor
+from mini_openharness.errors.engine import MaxStepsExceeded, RunAlreadyActiveError
+from mini_openharness.errors.provider import (
+    ProviderCancelledError,
+    ProviderContextWindowError,
+    ProviderError,
+)
 from mini_openharness.hooks import HookEvent, HookExecutor, HookRegistry
 from mini_openharness.models import Message, ModelReply, ToolCall
 from mini_openharness.permissions import ApprovalHandler, PermissionEngine
 from mini_openharness.session import SessionLog
 from mini_openharness.provider import (
     ModelProvider,
-    ProviderCancelledError,
     ProviderComplete,
-    ProviderContextWindowError,
-    ProviderError,
     ProviderReasoningDelta,
     ProviderRetry,
     ProviderTextDelta,
@@ -37,6 +40,8 @@ from mini_openharness.tools import (
     ToolResult,
 )
 from mini_openharness.trace import TraceSink
+from mini_openharness.utils.model_trace import ModelTraceRecorder
+from mini_openharness.utils.model_timing import ModelAttemptTiming
 
 
 EventKind = Literal[
@@ -92,14 +97,6 @@ class RunState:
     repeated_tool_batches: int = 0
 
 
-class MaxStepsExceeded(RuntimeError):
-    pass
-
-
-class RunAlreadyActiveError(RuntimeError):
-    pass
-
-
 class AgentLoop:
     """Own state and repeat model -> permission -> tools -> model until done."""
 
@@ -146,6 +143,7 @@ class AgentLoop:
         self.permission_engine = permission_engine
         self.approval_handler = approval_handler
         self.tracer = tracer
+        self._model_trace = ModelTraceRecorder(tracer)
         self.compactor = compactor
         self.artifact_store = artifact_store
         self.input_cost_per_million = input_cost_per_million
@@ -200,7 +198,7 @@ class AgentLoop:
             self.session.append_message(message)
 
     async def run(self, prompt: str) -> AsyncIterator[AgentEvent]:
-        execution = self._drive(lambda state: self._run(prompt, state))
+        execution = self._manage_run(prompt)
         try:
             async for event in execution:
                 yield event
@@ -213,16 +211,18 @@ class AgentLoop:
         The conversation must be preloaded through AgentLoop(messages=...); the
         loop resumes from wherever the transcript stopped.
         """
-        execution = self._drive(self._resume_run)
+        execution = self._manage_run()
         try:
             async for event in execution:
                 yield event
         finally:
             await execution.aclose()
 
-    async def _drive(
-        self, runner: Callable[[RunState], AsyncIterator[AgentEvent]]
+    # manage loop state
+    async def _manage_run(
+        self, prompt: str | None = None
     ) -> AsyncIterator[AgentEvent]:
+        """Create per-run state and start a new or resumed agent run."""
         if self._active_run is not None:
             raise RunAlreadyActiveError(
                 "This AgentLoop already has an active run; use a separate instance for concurrency"
@@ -239,7 +239,11 @@ class AgentLoop:
             active_tool_names=self.tools.default_exposed_names(),
         )
         self._active_run = state
-        execution = runner(state)
+        execution = (
+            self._resume_turn(state)
+            if prompt is None
+            else self._start_new_turn(prompt, state)
+        )
         try:
             async for event in execution:
                 yield event
@@ -250,7 +254,10 @@ class AgentLoop:
                 if self._active_run is state:
                     self._active_run = None
 
-    async def _run(self, prompt: str, state: RunState) -> AsyncIterator[AgentEvent]:
+    # exec user message
+    async def _start_new_turn(
+        self, prompt: str, state: RunState
+    ) -> AsyncIterator[AgentEvent]:
         prompt_hooks = await self.hook_executor.execute(
             HookEvent.USER_PROMPT_SUBMIT,
             {"prompt": prompt},
@@ -268,7 +275,9 @@ class AgentLoop:
         self.messages.append(user_message)
         self._persist(user_message)
         context = self._make_context(state)
-        async for event in self._loop(context, state, max_steps=self.max_steps):
+        async for event in self._run_agent_loop(
+            context, state, max_steps=self.max_steps
+        ):
             yield event
 
     def _make_context(self, state: RunState) -> ToolContext:
@@ -282,14 +291,16 @@ class AgentLoop:
             file_snapshots=state.file_snapshots,
         )
 
-    async def _resume_run(self, state: RunState) -> AsyncIterator[AgentEvent]:
+    async def _resume_turn(self, state: RunState) -> AsyncIterator[AgentEvent]:
         used_steps = sum(1 for message in self.messages if message.role == "assistant")
         remaining_steps = max(1, self.max_steps - used_steps)
         context = self._make_context(state)
-        async for event in self._loop(context, state, max_steps=remaining_steps):
+        async for event in self._run_agent_loop(
+            context, state, max_steps=remaining_steps
+        ):
             yield event
 
-    async def _loop(
+    async def _run_agent_loop(
         self,
         context: ToolContext,
         state: RunState,
@@ -309,26 +320,21 @@ class AgentLoop:
             model_attempt = 0
             while True:
                 model_attempt += 1
-                step_started = time.monotonic()
-                first_activity_ms: float | None = None
-                first_reasoning_ms: float | None = None
-                first_text_ms: float | None = None
-                first_tool_call_ms: float | None = None
+                timing = ModelAttemptTiming()
+                # send model start event for cli ans sessions
                 yield AgentEvent("model_start", data={"step": step, "attempt": model_attempt})
-                if self.tracer:
-                    self.tracer.emit(
-                        "model_request",
-                        {
-                            "step": step,
-                            "attempt": model_attempt,
-                            "messages": [message.to_dict() for message in self.messages],
-                            "tools": self._visible_tool_schemas(state),
-                        },
-                    )
+                self._model_trace.record_request(
+                    step=step,
+                    attempt=model_attempt,
+                    messages=self.messages,
+                    tools=self._visible_tool_schemas(state),
+                )
 
                 reply: ModelReply | None = None
                 streamed = False
                 try:
+
+                    # get value of stream method
                     stream_method = getattr(self.provider, "stream", None)
                     # “Parse the model’s streaming response into different event types and yield each event downstream as it arrives.”
                     if callable(stream_method):
@@ -338,55 +344,29 @@ class AgentLoop:
                             cancel_event=state.cancel_event,
                         ):
                             if isinstance(provider_event, ProviderReasoningDelta):
-                                elapsed_ms = (time.monotonic() - step_started) * 1000
-                                if first_activity_ms is None:
-                                    first_activity_ms = elapsed_ms
-                                if first_reasoning_ms is None:
-                                    first_reasoning_ms = elapsed_ms
+                                timing.mark_reasoning()
                                 yield AgentEvent(
                                     "reasoning_delta",
                                     provider_event.delta,
                                     {"step": step},
                                 )
                             elif isinstance(provider_event, ProviderTextDelta):
-                                elapsed_ms = (time.monotonic() - step_started) * 1000
-                                if first_activity_ms is None:
-                                    first_activity_ms = elapsed_ms
-                                if first_text_ms is None:
-                                    first_text_ms = elapsed_ms
-                                    ttft_data = {
-                                        "step": step,
-                                        "attempt": model_attempt,
-                                        "ttft_ms": round(
-                                            first_activity_ms
-                                            if first_activity_ms is not None
-                                            else first_text_ms,
-                                            1,
-                                        ),
-                                        "first_activity_ms": (
-                                            round(first_activity_ms, 1)
-                                            if first_activity_ms is not None
-                                            else None
-                                        ),
-                                        "first_text_ms": round(first_text_ms, 1),
-                                    }
-                                    if self.tracer:
-                                        self.tracer.emit("first_token", ttft_data)
+                                ttft_data = timing.mark_text(
+                                    step=step,
+                                    attempt=model_attempt,
+                                )
+                                if ttft_data is not None:
+                                    self._model_trace.record_first_token(ttft_data)
                                     yield AgentEvent("first_token", data=ttft_data)
                                 streamed = True
-                                if self.tracer:
-                                    self.tracer.emit(
-                                        "assistant_delta", {"text": provider_event.text}
-                                    )
+                                self._model_trace.record_assistant_delta(
+                                    provider_event.text
+                                )
                                 yield AgentEvent(
                                     "assistant_delta", provider_event.text, {"step": step}
                                 )
                             elif isinstance(provider_event, ProviderToolCallStart):
-                                elapsed_ms = (time.monotonic() - step_started) * 1000
-                                if first_activity_ms is None:
-                                    first_activity_ms = elapsed_ms
-                                if first_tool_call_ms is None:
-                                    first_tool_call_ms = elapsed_ms
+                                timing.mark_tool_call()
                                 yield AgentEvent(
                                     "tool_call_start",
                                     data={
@@ -397,9 +377,7 @@ class AgentLoop:
                                     },
                                 )
                             elif isinstance(provider_event, ProviderToolCallDelta):
-                                elapsed_ms = (time.monotonic() - step_started) * 1000
-                                if first_activity_ms is None:
-                                    first_activity_ms = elapsed_ms
+                                timing.mark_activity()
                                 yield AgentEvent(
                                     "tool_call_delta",
                                     data={
@@ -468,35 +446,11 @@ class AgentLoop:
                 yield AgentEvent("error", error, {"step": step})
                 return
 
-            total_ms = (time.monotonic() - step_started) * 1000
-            ttft_ms = first_activity_ms if first_activity_ms is not None else total_ms
-            generation_ms = max(0.0, total_ms - ttft_ms)
             response_data = {
                 "step": step,
                 "attempt": model_attempt,
                 "model": getattr(self.provider, "model", None),
-                "ttft_ms": round(ttft_ms, 1),
-                "generation_ms": round(generation_ms, 1),
-                "first_activity_ms": (
-                    round(first_activity_ms, 1) if first_activity_ms is not None else None
-                ),
-                "first_reasoning_ms": (
-                    round(first_reasoning_ms, 1)
-                    if first_reasoning_ms is not None
-                    else None
-                ),
-                "first_text_ms": (
-                    round(first_text_ms, 1) if first_text_ms is not None else None
-                ),
-                "first_tool_call_ms": (
-                    round(first_tool_call_ms, 1)
-                    if first_tool_call_ms is not None
-                    else None
-                ),
-                "total_ms": round(total_ms, 1),
-                "request_to_first_token_ms": round(ttft_ms, 1),
-                "first_to_last_token_ms": round(generation_ms, 1),
-                "request_total_ms": round(total_ms, 1),
+                **timing.response_data(),
                 "visible_output_chars": len(reply.content),
                 "reported_output_tokens": reply.output_tokens,
                 "input_tokens": reply.input_tokens,
@@ -586,7 +540,7 @@ class AgentLoop:
                 if self.tracer:
                     self.tracer.emit("loop_guard", guard_data)
                 yield AgentEvent("loop_guard", reason, guard_data)
-                timed_results = [
+                tool_results_with_timings = [
                     (
                         ToolResult.fail(
                             reason,
@@ -599,52 +553,65 @@ class AgentLoop:
                     for _ in reply.tool_calls
                 ]
             else:
-                timed_results = await self._execute_all(reply.tool_calls, context, state)
-            if timed_results is None:
+                tool_results_with_timings = await self._execute_all(
+                    reply.tool_calls, context, state
+                )
+
+            if tool_results_with_timings is None:
                 yield self._cancelled_event()
                 return
-            for call, (result, elapsed_ms) in zip(reply.tool_calls, timed_results):
-                inline_output, artifact_path = self._offload(call, result.output)
-                stored_failure = result.failure
-                if stored_failure is not None and inline_output != result.output:
-                    stored_failure = ToolFailure(
-                        code=stored_failure.code,
-                        stage=stored_failure.stage,
-                        message=inline_output,
-                        retryable=stored_failure.retryable,
-                        detail=dict(stored_failure.detail),
+            for call, (result, elapsed_ms) in zip(
+                reply.tool_calls, tool_results_with_timings
+            ):
+                model_visible_output, full_output_path = (
+                    self._condense_tool_output_if_needed(call, result.output)
+                )
+                failure_for_model = result.failure
+                if (
+                    failure_for_model is not None
+                    and model_visible_output != result.output
+                ):
+                    failure_for_model = ToolFailure(
+                        code=failure_for_model.code,
+                        stage=failure_for_model.stage,
+                        message=model_visible_output,
+                        retryable=failure_for_model.retryable,
+                        detail=dict(failure_for_model.detail),
                     )
-                stored_result = ToolResult(
-                    inline_output,
+                result_for_model = ToolResult(
+                    model_visible_output,
                     result.is_error,
                     dict(result.metadata),
-                    stored_failure,
+                    failure_for_model,
                 )
-                if artifact_path is not None:
-                    stored_result.metadata["artifact_path"] = str(artifact_path)
-                    stored_result.metadata["original_chars"] = len(result.output)
-                self._apply_tool_runtime_effect(call, stored_result, state)
-                self._append_tool_result(call.id, call.name, stored_result)
+                if full_output_path is not None:
+                    result_for_model.metadata["artifact_path"] = str(full_output_path)
+                    result_for_model.metadata["original_chars"] = len(result.output)
+
+                self._apply_tool_runtime_effect(call, result_for_model, state)
+                self._append_tool_result(call.id, call.name, result_for_model)
                 data = {
                     "id": call.id,
                     "name": call.name,
                     "input": call.arguments,
                     **self.tools.attribution(call.name),
-                    "is_error": stored_result.is_error,
+                    "is_error": result_for_model.is_error,
                     "elapsed_ms": elapsed_ms,
-                    "output": stored_result.output,
-                    **stored_result.metadata,
+                    "output": result_for_model.output,
+                    **result_for_model.metadata,
                 }
-                if stored_result.failure is not None:
-                    data["failure"] = stored_result.failure.to_dict()
+                if result_for_model.failure is not None:
+                    data["failure"] = result_for_model.failure.to_dict()
                 if self.tracer:
                     self.tracer.emit("tool_end", data)
                     if (
                         self.tools.descriptor(call.name).source == "skill"
-                        and not stored_result.is_error
+                        and not result_for_model.is_error
                     ):
-                        self.tracer.emit("skill_loaded", {"name": call.arguments.get("name")})
-                yield AgentEvent("tool_end", stored_result.output, data)
+                        self.tracer.emit(
+                            "skill_loaded", {"name": call.arguments.get("name")}
+                        )
+                yield AgentEvent("tool_end", result_for_model.output, data)
 
         error = f"Agent did not finish within {self.max_steps} steps"
         if self.tracer:
@@ -857,9 +824,11 @@ class AgentLoop:
         async def execute_batch():
             # Every call starts concurrently; hierarchical read/write resource locks
             # serialize only conflicting effects while gather preserves result order.
-            return await asyncio.gather(
-                *(self._execute_timed(call, context, state) for call in calls)
-            )
+            tasks = []
+            for call in calls:
+                tasks.append(self._execute_timed(call, context, state))
+            
+            return await asyncio.gather(*tasks)
 
         gather_task = asyncio.create_task(execute_batch())
         cancel_task = asyncio.create_task(state.cancel_event.wait())
@@ -890,16 +859,25 @@ class AgentLoop:
             state.repeated_tool_batches = 1
         return state.repeated_tool_batches
 
-    def _offload(self, call: ToolCall, output: str) -> tuple[str, Path | None]:
+    def _condense_tool_output_if_needed(
+        self, call: ToolCall, output: str
+    ) -> tuple[str, Path | None]:
+        """Keep small outputs inline and offload oversized outputs to an artifact."""
         if self.artifact_store is None:
             return output, None
         if self._is_artifact_path(call):
             limit = self.artifact_store.max_inline_chars
-            inline = output[:limit] + "\n...[artifact file; content stays in the original artifact]"
-            return inline, None
+            model_visible_output = (
+                output[:limit]
+                + "\n...[artifact file; content stays in the original artifact]"
+            )
+            return model_visible_output, None
         if call.name == "read_file":
             # read_file paginates its own output; source reads are never offloaded.
             return output, None
+        if not self.artifact_store.exceeds_inline_limit(output):
+            return output, None
+
         run_id = self.tracer.run_id if self.tracer else "untraced"
         return self.artifact_store.offload(run_id=run_id, tool_call_id=call.id, output=output)
 

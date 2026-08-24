@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_openharness.models import Message
-from mini_openharness.tokens import HeuristicCounter, TokenCounter
+from mini_openharness.utils.tokens import HeuristicCounter, TokenCounter
 
 
 SUMMARY_PREFIX = "[Compacted conversation summary]"
@@ -231,8 +231,14 @@ class ArtifactStore:
         self.root = Path(root).resolve()
         self.max_inline_chars = max_inline_chars
 
-    def offload(self, *, run_id: str, tool_call_id: str, output: str) -> tuple[str, Path | None]:
-        if len(output) <= self.max_inline_chars:
+    def exceeds_inline_limit(self, output: str) -> bool:
+        """Return whether output is too large to keep entirely in model context."""
+        return len(output) > self.max_inline_chars
+
+    def offload(
+        self, *, run_id: str, tool_call_id: str, output: str
+    ) -> tuple[str, Path | None]:
+        if not self.exceeds_inline_limit(output):
             return output, None
         directory = self.root / run_id
         directory.mkdir(parents=True, exist_ok=True)

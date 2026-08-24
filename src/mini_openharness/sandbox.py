@@ -9,13 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mini_openharness.errors.sandbox import SandboxUnavailableError
 from mini_openharness.permissions.safety import check_shell_safety
 from mini_openharness.permissions.types import PermissionBehavior
 from mini_openharness.tools import ResourceAccess, ToolContext, ToolDescriptor, ToolResult
-
-
-class SandboxUnavailableError(RuntimeError):
-    pass
 
 
 @dataclass

@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 from uuid import uuid4
 
+from mini_openharness.errors.trace import TraceWriteError
+
 
 @dataclass(frozen=True)
 class TraceEvent:
@@ -32,10 +34,6 @@ class TraceSink(Protocol):
     def finish(
         self, *, status: str, data: Mapping[str, Any] | None = None
     ) -> TraceEvent: ...
-
-
-class TraceWriteError(RuntimeError):
-    pass
 
 
 class LocalJsonlTraceSink:

@@ -7,7 +7,13 @@ from mini_openharness.agent_profile import (
     OutputProtocol,
     PermissionPolicy,
 )
-from mini_openharness.engine import AgentEvent, AgentLoop, RunAlreadyActiveError
+from mini_openharness.engine import AgentEvent, AgentLoop
+from mini_openharness.errors import (
+    MaxStepsExceeded,
+    MiniOpenHarnessError,
+    RunAlreadyActiveError,
+    TraceWriteError,
+)
 from mini_openharness.multiagent import (
     AgentDefinition,
     AgentManager,
@@ -38,7 +44,6 @@ from mini_openharness.trace import (
     LocalJsonlTraceSink,
     MemoryTraceSink,
     TraceSink,
-    TraceWriteError,
     TraceWriter,
 )
 
@@ -52,6 +57,8 @@ __all__ = [
     "OutputProtocol",
     "PermissionPolicy",
     "AgentLoop",
+    "MaxStepsExceeded",
+    "MiniOpenHarnessError",
     "RunAlreadyActiveError",
     "AgentDefinition",
     "AgentManager",
